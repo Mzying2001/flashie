@@ -49,8 +49,6 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
 - **Fake registry keys**: Uses real `HKEY` handles (opened read-only on existing keys) tracked in a table, because Windows internals dereference `HKEY` as a pointer — sentinel values cause access violations.
 - **`LoggingClassFactory`**: Wraps the real Flash class factory to log `CreateInstance` calls and probe interface support. Needed because MSHTML calls `pCF->CreateInstance()` directly on the vtable, bypassing COM hooks.
 - **`mms.cfg`**: Flash configuration file that disables EOL uninstall, auto-update, and the allowlist check.
-- **User-Agent**: Set to include "MSIE 11.0" via `UrlMkSetSessionOption` so sites serve IE-compatible content.
-
 ## Debugging
 
 All diagnostic output uses `OutputDebugStringW` with `[FlashIE]` prefix. View with Visual Studio debugger Output window or Sysinternals DebugView.
