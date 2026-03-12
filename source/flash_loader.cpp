@@ -1,9 +1,9 @@
 #include "flash_loader.h"
+#include "debug.h"
 #include <shlwapi.h>
 #include <shlobj.h>      // SHGetFolderPathW, CSIDL_APPDATA
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>
 #include <intrin.h>
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
@@ -51,17 +51,6 @@ typedef BOOL (WINAPI *FN_SetFileAttributesW)(LPCWSTR, DWORD);
 typedef BOOL (WINAPI *FN_FindNextFileW)(HANDLE, LPWIN32_FIND_DATAW);
 typedef BOOL (WINAPI *FN_MoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
 typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(LPCOLESTR, LPCLSID);
-
-// Debug tracing helper — output visible in Visual Studio Output or DebugView
-static void DbgTrace(const wchar_t* fmt, ...)
-{
-    wchar_t buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
-    va_end(ap);
-    OutputDebugStringW(buf);
-}
 
 // Static member
 IClassFactory* FlashLoader::s_pFlashFactory = nullptr;

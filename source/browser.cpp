@@ -1,5 +1,5 @@
 #include "browser.h"
-#include <stdio.h>
+#include "debug.h"
 #include <urlmon.h>    // UrlMkSetSessionOption
 
 // ===============================================================
@@ -246,12 +246,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         if (pDispParams->cArgs >= 7) {
             VARIANT* pURL = &pDispParams->rgvarg[5];
             if (pURL->vt == (VT_VARIANT | VT_BYREF)) pURL = pURL->pvarVal;
-            if (pURL->vt == VT_BSTR) {
-                wchar_t buf[512];
-                _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                    L"[FlashIE] BEFORENAVIGATE2: %s\n", pURL->bstrVal);
-                OutputDebugStringW(buf);
-            }
+            if (pURL->vt == VT_BSTR)
+                DbgTrace(L"[FlashIE] BEFORENAVIGATE2: %s\n", pURL->bstrVal);
         }
         return S_OK;
     }
@@ -261,12 +257,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         if (pDispParams->cArgs >= 2) {
             VARIANT* pURL = &pDispParams->rgvarg[0];
             if (pURL->vt == (VT_VARIANT | VT_BYREF)) pURL = pURL->pvarVal;
-            if (pURL->vt == VT_BSTR) {
-                wchar_t buf[512];
-                _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                    L"[FlashIE] DOCUMENTCOMPLETE: %s\n", pURL->bstrVal);
-                OutputDebugStringW(buf);
-            }
+            if (pURL->vt == VT_BSTR)
+                DbgTrace(L"[FlashIE] DOCUMENTCOMPLETE: %s\n", pURL->bstrVal);
         }
         return S_OK;
     }
