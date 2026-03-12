@@ -323,6 +323,8 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 
     ConnectEvents();
 
+    m_pWebBrowser->put_Silent(VARIANT_TRUE);
+
     m_pWebBrowser->put_Left(rc.left);
     m_pWebBrowser->put_Top(rc.top);
     m_pWebBrowser->put_Width(rc.right - rc.left);
