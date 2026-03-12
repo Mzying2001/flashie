@@ -10,6 +10,8 @@ static constexpr int TOOLBAR_HEIGHT = 32;
 static constexpr int BUTTON_WIDTH   = 60;
 static constexpr int BUTTON_HEIGHT  = 24;
 static constexpr int MARGIN         = 4;
+static constexpr int WINDOW_MIN_CX  = 500;
+static constexpr int WINDOW_MIN_CY  = 350;
 
 enum ControlID {
     ID_BACK = 1001,
@@ -108,6 +110,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = WINDOW_MIN_CX;
+        mmi->ptMinTrackSize.y = WINDOW_MIN_CY;
+        return 0;
+    }
+
     case WM_SIZE: {
         LayoutControls(LOWORD(lParam), HIWORD(lParam));
         return 0;
@@ -162,7 +171,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     RegisterClassExW(&wc);
 
     g_hwndMain = CreateWindowExW(0, L"FlashIEWindow", L"FlashIE",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         nullptr, nullptr, hInstance, nullptr);
 
