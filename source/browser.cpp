@@ -122,7 +122,7 @@ COleSite::~COleSite()
 STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
 {
     if (riid == IID_IUnknown) {
-        *ppv = static_cast<IServiceProvider*>(this);
+        *ppv = static_cast<IDocHostUIHandler*>(this);
     } else if (riid == IID_IOleClientSite) {
         *ppv = static_cast<IOleClientSite*>(m_pClientSite);
         m_pClientSite->AddRef();
@@ -135,10 +135,6 @@ STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IDocHostUIHandler*>(this);
     } else if (riid == IID_IDispatch || riid == DIID_DWebBrowserEvents2) {
         *ppv = static_cast<IDispatch*>(this);
-    } else if (riid == IID_IServiceProvider) {
-        *ppv = static_cast<IServiceProvider*>(this);
-    } else if (riid == IID_IInternetSecurityManager) {
-        *ppv = static_cast<IInternetSecurityManager*>(this);
     } else {
         *ppv = nullptr;
         return E_NOINTERFACE;
@@ -155,20 +151,6 @@ STDMETHODIMP_(ULONG) COleSite::Release()
     return ref;
 }
 
-// IServiceProvider
-STDMETHODIMP COleSite::QueryService(REFGUID guidService, REFIID riid, void** ppv)
-{
-    *ppv = nullptr;
-    if (guidService == SID_SInternetSecurityManager &&
-        riid == IID_IInternetSecurityManager) {
-        OutputDebugStringW(L"[FlashIE] QueryService: SID_SInternetSecurityManager -> returning our ISM\n");
-        *ppv = static_cast<IInternetSecurityManager*>(this);
-        AddRef();
-        return S_OK;
-    }
-    return E_NOINTERFACE;
-}
-
 // IDocHostUIHandler
 STDMETHODIMP COleSite::ShowContextMenu(DWORD, POINT*, IUnknown*, IDispatch*)
 {
@@ -177,7 +159,6 @@ STDMETHODIMP COleSite::ShowContextMenu(DWORD, POINT*, IUnknown*, IDispatch*)
 
 STDMETHODIMP COleSite::GetHostInfo(DOCHOSTUIINFO* pInfo)
 {
-    OutputDebugStringW(L"[FlashIE] GetHostInfo called\n");
     pInfo->cbSize = sizeof(DOCHOSTUIINFO);
     pInfo->dwFlags = DOCHOSTUIFLAG_NO3DBORDER;
     pInfo->dwDoubleClick = DOCHOSTUIDBLCLK_DEFAULT;
@@ -202,29 +183,7 @@ STDMETHODIMP COleSite::GetIDsOfNames(REFIID, OLECHAR**, UINT, LCID, DISPID*)
 STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARAMS* pDispParams,
                                VARIANT* pvarResult, EXCEPINFO*, UINT*)
 {
-    // Log DISPIDs to diagnose navigation bug
-    {
-        static int s_invokeLogCount = 0;
-        if (s_invokeLogCount < 500) {
-            s_invokeLogCount++;
-            wchar_t buf[256];
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                L"[FlashIE] Invoke: dispid=%d (0x%X) wFlags=0x%X cArgs=%u pvarResult=%p\n",
-                dispid, dispid, wFlags, pDispParams ? pDispParams->cArgs : 0, pvarResult);
-            OutputDebugStringW(buf);
-        }
-    }
     switch (dispid) {
-
-    // Ambient property: download control flags (matches OOBE pattern)
-    case DISPID_AMBIENT_DLCONTROL: {
-        if (pvarResult) {
-            V_VT(pvarResult) = VT_I4;
-            V_I4(pvarResult) = DLCTL_DLIMAGES | DLCTL_VIDEOS | DLCTL_BGSOUNDS
-                             | DLCTL_SILENT;
-        }
-        return S_OK;
-    }
 
     case DISPID_NAVIGATECOMPLETE2: {
         // rgvarg[1] = pDisp (IDispatch of the frame), rgvarg[0] = URL
@@ -263,8 +222,7 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
     }
 
     case DISPID_NEWWINDOW2: {
-        // Params (reverse order): rgvarg[0]=Cancel, rgvarg[1]=ppDisp
-        // Cancel the new window — NewWindow3 (which has the URL) handles navigation on IE8+.
+        // Cancel the new window — NewWindow3 handles navigation on IE8+.
         if (pDispParams->cArgs >= 2) {
             if (pDispParams->rgvarg[0].vt == (VT_BOOL | VT_BYREF))
                 *pDispParams->rgvarg[0].pboolVal = VARIANT_TRUE;
@@ -275,20 +233,16 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
     case DISPID_NEWWINDOW3: {
         // Params (reverse): rgvarg[0]=bstrUrl, [1]=bstrUrlContext, [2]=dwFlags, [3]=Cancel, [4]=ppDisp
         if (pDispParams->cArgs >= 5 && m_pBrowserHost) {
-            // Cancel the new window
             if (pDispParams->rgvarg[3].vt == (VT_BOOL | VT_BYREF))
                 *pDispParams->rgvarg[3].pboolVal = VARIANT_TRUE;
-            // Navigate to the URL in the current window
             if (pDispParams->rgvarg[0].vt == VT_BSTR && pDispParams->rgvarg[0].bstrVal)
                 m_pBrowserHost->Navigate(pDispParams->rgvarg[0].bstrVal);
         }
         return S_OK;
     }
 
-    // Navigation lifecycle events — log for diagnostics
     case 250: // DISPID_BEFORENAVIGATE2
     {
-        // rgvarg: [6]=pDisp, [5]=URL, [4]=Flags, [3]=TargetFrameName, [2]=PostData, [1]=Headers, [0]=Cancel
         if (pDispParams->cArgs >= 7) {
             VARIANT* pURL = &pDispParams->rgvarg[5];
             if (pURL->vt == (VT_VARIANT | VT_BYREF)) pURL = pURL->pvarVal;
@@ -313,159 +267,14 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
                     L"[FlashIE] DOCUMENTCOMPLETE: %s\n", pURL->bstrVal);
                 OutputDebugStringW(buf);
             }
-
-            // If about:blank completed as part of a reset, now navigate to the real URL.
-            if (m_pBrowserHost && m_pBrowserHost->m_resetting && m_pBrowserHost->m_pendingUrl[0]) {
-                wchar_t target[2048];
-                wcsncpy_s(target, _countof(target), m_pBrowserHost->m_pendingUrl, _TRUNCATE);
-                m_pBrowserHost->m_pendingUrl[0] = L'\0';
-                m_pBrowserHost->m_resetting = false;
-
-                wchar_t buf3[512];
-                _snwprintf_s(buf3, _countof(buf3), _TRUNCATE,
-                    L"[FlashIE] Reset complete, now navigating to: %s\n", target);
-                OutputDebugStringW(buf3);
-
-                VARIANT vURL;
-                VariantInit(&vURL);
-                vURL.vt = VT_BSTR;
-                vURL.bstrVal = SysAllocString(target);
-                VARIANT vEmpty;
-                VariantInit(&vEmpty);
-                m_pBrowserHost->m_pWebBrowser->Navigate2(&vURL, &vEmpty, &vEmpty, &vEmpty, &vEmpty);
-                VariantClear(&vURL);
-                return S_OK;
-            }
-
-            // Probe: can we execute scripts via execScript on this document?
-            if (m_pBrowserHost && m_pBrowserHost->m_pWebBrowser) {
-                IDispatch* pDoc = nullptr;
-                if (SUCCEEDED(m_pBrowserHost->m_pWebBrowser->get_Document(&pDoc)) && pDoc) {
-                    IHTMLDocument2* pHtml = nullptr;
-                    if (SUCCEEDED(pDoc->QueryInterface(IID_IHTMLDocument2, reinterpret_cast<void**>(&pHtml))) && pHtml) {
-                        // Check readyState
-                        BSTR bstrState = nullptr;
-                        pHtml->get_readyState(&bstrState);
-                        if (bstrState) {
-                            wchar_t buf2[256];
-                            _snwprintf_s(buf2, _countof(buf2), _TRUNCATE,
-                                L"[FlashIE] Document readyState: %s\n", bstrState);
-                            OutputDebugStringW(buf2);
-                            SysFreeString(bstrState);
-                        }
-
-                        // Try execScript via IHTMLWindow2 to test script engine
-                        IHTMLWindow2* pWin = nullptr;
-                        if (SUCCEEDED(pHtml->get_parentWindow(&pWin)) && pWin) {
-                            BSTR bstrCode = SysAllocString(L"document.title = 'EXECSCRIPT_OK_' + new Date().getTime()");
-                            BSTR bstrLang = SysAllocString(L"javascript");
-                            VARIANT vResult;
-                            VariantInit(&vResult);
-                            HRESULT hrExec = pWin->execScript(bstrCode, bstrLang, &vResult);
-                            {
-                                wchar_t buf2[256];
-                                _snwprintf_s(buf2, _countof(buf2), _TRUNCATE,
-                                    L"[FlashIE] execScript hr=0x%08X\n", hrExec);
-                                OutputDebugStringW(buf2);
-                            }
-                            VariantClear(&vResult);
-                            SysFreeString(bstrCode);
-                            SysFreeString(bstrLang);
-                            pWin->Release();
-                        }
-                        pHtml->Release();
-                    }
-                    pDoc->Release();
-                }
-            }
         }
         return S_OK;
     }
-
-    case 253: // DISPID_DOWNLOADBEGIN
-        OutputDebugStringW(L"[FlashIE] DOWNLOADBEGIN\n");
-        return S_OK;
-    case 254: // DISPID_DOWNLOADCOMPLETE
-        OutputDebugStringW(L"[FlashIE] DOWNLOADCOMPLETE\n");
-        return S_OK;
 
     default:
         break;
     }
     return DISP_E_MEMBERNOTFOUND;
-}
-
-// IInternetSecurityManager — allow everything.
-// Map ALL URLs to the Internet zone (zone 3).  This prevents zone
-// elevation blocks when navigating from http:// to file:// URLs.
-// If we defer to the default handler, file:// URLs get Local Machine
-// zone (0), and IE blocks scripts when navigating from Internet (3)
-// to Local Machine (0) — a privilege elevation.
-STDMETHODIMP COleSite::MapUrlToZone(LPCWSTR pwszUrl, DWORD* pdwZone, DWORD)
-{
-    // Always log non-baidu URLs; log baidu URLs only first 30 times
-    if (pwszUrl) {
-        bool isBaidu = (wcsstr(pwszUrl, L"baidu") != nullptr);
-        static int s_baiduCount = 0;
-        if (!isBaidu || s_baiduCount++ < 10) {
-            wchar_t buf[512];
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                L"[FlashIE] MapUrlToZone: url=%s -> zone=3\n",
-                pwszUrl);
-            OutputDebugStringW(buf);
-        }
-    }
-    if (pdwZone)
-        *pdwZone = URLZONE_INTERNET;
-    return S_OK;
-}
-
-STDMETHODIMP COleSite::GetSecurityId(LPCWSTR pwszUrl, BYTE* pbSecurityId, DWORD* pcbSecurityId, DWORD_PTR dwReserved)
-{
-    // Return a FIXED security ID for ALL URLs.
-    // Format: zone (4 bytes LE) + domain string (null-terminated).
-    // By using the same ID for every URL, MSHTML treats all pages as
-    // same-origin, preventing cross-domain script blocking when
-    // navigating between different protocols/domains (e.g. https → file).
-    // Returning INET_E_DEFAULT_ACTION here caused MSHTML to generate
-    // different IDs per URL, which blocked scripts after cross-origin nav.
-    static const BYTE s_secId[] = {
-        0x03, 0x00, 0x00, 0x00,                     // URLZONE_INTERNET (3)
-        'f', 'l', 'a', 's', 'h', 'i', 'e', 0x00    // domain "flashie"
-    };
-
-    if (!pbSecurityId || !pcbSecurityId)
-        return E_INVALIDARG;
-
-    if (*pcbSecurityId < sizeof(s_secId)) {
-        *pcbSecurityId = sizeof(s_secId);
-        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    }
-
-    memcpy(pbSecurityId, s_secId, sizeof(s_secId));
-    *pcbSecurityId = sizeof(s_secId);
-    return S_OK;
-}
-
-STDMETHODIMP COleSite::ProcessUrlAction(LPCWSTR pwszUrl, DWORD dwAction, BYTE* pPolicy,
-                                          DWORD cbPolicy, BYTE* pContext, DWORD cbContext,
-                                          DWORD dwFlags, DWORD dwReserved)
-{
-    // Always log non-baidu URLs; log baidu URLs only first 20 times
-    if (pwszUrl) {
-        bool isBaidu = (wcsstr(pwszUrl, L"baidu") != nullptr);
-        static int s_baiduCount = 0;
-        if (!isBaidu || s_baiduCount++ < 10) {
-            wchar_t buf[512];
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                L"[FlashIE] ProcessUrlAction: action=0x%08X url=%s\n",
-                dwAction, pwszUrl);
-            OutputDebugStringW(buf);
-        }
-    }
-    if (pPolicy && cbPolicy >= sizeof(DWORD))
-        *reinterpret_cast<DWORD*>(pPolicy) = URLPOLICY_ALLOW;
-    return S_OK;
 }
 
 // ===============================================================
@@ -526,31 +335,10 @@ void BrowserHost::Navigate(const wchar_t* url)
 {
     if (!m_pWebBrowser) return;
 
-    // If this is already about:blank (initial load or reset), navigate directly.
-    if (_wcsicmp(url, L"about:blank") == 0) {
-        m_pendingUrl[0] = L'\0';
-        m_resetting = false;
-        VARIANT vURL;
-        VariantInit(&vURL);
-        vURL.vt = VT_BSTR;
-        vURL.bstrVal = SysAllocString(url);
-        VARIANT vEmpty;
-        VariantInit(&vEmpty);
-        m_pWebBrowser->Navigate2(&vURL, &vEmpty, &vEmpty, &vEmpty, &vEmpty);
-        VariantClear(&vURL);
-        return;
-    }
-
-    // Store the target URL and navigate to about:blank first to reset security context.
-    wcsncpy_s(m_pendingUrl, _countof(m_pendingUrl), url, _TRUNCATE);
-    m_resetting = true;
-
-    OutputDebugStringW(L"[FlashIE] Navigate: resetting via about:blank first\n");
-
     VARIANT vURL;
     VariantInit(&vURL);
     vURL.vt = VT_BSTR;
-    vURL.bstrVal = SysAllocString(L"about:blank");
+    vURL.bstrVal = SysAllocString(url);
     VARIANT vEmpty;
     VariantInit(&vEmpty);
     m_pWebBrowser->Navigate2(&vURL, &vEmpty, &vEmpty, &vEmpty, &vEmpty);

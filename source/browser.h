@@ -6,20 +6,6 @@
 #include <exdisp.h>
 #include <exdispid.h>
 #include <mshtmhst.h>
-#include <mshtml.h>
-#include <urlmon.h>
-#include <mshtmdid.h>
-
-// DLCTL flags (from mshtmdid.h)
-#ifndef DLCTL_DLIMAGES
-#define DLCTL_DLIMAGES          0x00000010
-#define DLCTL_VIDEOS            0x00000020
-#define DLCTL_BGSOUNDS          0x00000040
-#define DLCTL_NO_SCRIPTS        0x00000080
-#define DLCTL_NO_DLACTIVEXCTLS  0x00000400
-#define DLCTL_NO_RUNACTIVEXCTLS 0x00000200
-#define DLCTL_SILENT            0x40000000
-#endif
 
 class COleSite;
 class BrowserHost;
@@ -100,10 +86,8 @@ private:
 // ---------------------------------------------------------------
 // COleSite - main COM identity
 // ---------------------------------------------------------------
-class COleSite : public IServiceProvider,
-                 public IDocHostUIHandler,
-                 public IDispatch,
-                 public IInternetSecurityManager
+class COleSite : public IDocHostUIHandler,
+                 public IDispatch
 {
     friend class COleClientSite;
     friend class COleInPlaceSite;
@@ -118,9 +102,6 @@ public:
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
     STDMETHODIMP_(ULONG) AddRef() override;
     STDMETHODIMP_(ULONG) Release() override;
-
-    // IServiceProvider
-    STDMETHODIMP QueryService(REFGUID guidService, REFIID riid, void** ppv) override;
 
     // IDocHostUIHandler
     STDMETHODIMP ShowContextMenu(DWORD, POINT*, IUnknown*, IDispatch*) override;
@@ -146,18 +127,6 @@ public:
     STDMETHODIMP GetIDsOfNames(REFIID, OLECHAR**, UINT, LCID, DISPID*) override;
     STDMETHODIMP Invoke(DISPID, REFIID, LCID, WORD, DISPPARAMS*,
                         VARIANT*, EXCEPINFO*, UINT*) override;
-
-    // IInternetSecurityManager
-    STDMETHODIMP SetSecuritySite(IInternetSecurityMgrSite*) override { return S_OK; }
-    STDMETHODIMP GetSecuritySite(IInternetSecurityMgrSite**) override { return E_NOTIMPL; }
-    STDMETHODIMP MapUrlToZone(LPCWSTR pwszUrl, DWORD* pdwZone, DWORD dwFlags) override;
-    STDMETHODIMP GetSecurityId(LPCWSTR, BYTE*, DWORD*, DWORD_PTR) override;
-    STDMETHODIMP ProcessUrlAction(LPCWSTR, DWORD, BYTE*, DWORD,
-                                  BYTE*, DWORD, DWORD, DWORD) override;
-    STDMETHODIMP QueryCustomPolicy(LPCWSTR, REFGUID, BYTE**, DWORD*,
-                                   BYTE*, DWORD, DWORD) override { return INET_E_DEFAULT_ACTION; }
-    STDMETHODIMP SetZoneMapping(DWORD, LPCWSTR, DWORD) override { return INET_E_DEFAULT_ACTION; }
-    STDMETHODIMP GetZoneMappings(DWORD, IEnumString**, DWORD) override { return INET_E_DEFAULT_ACTION; }
 
 private:
     ULONG              m_ref = 1;
@@ -213,9 +182,6 @@ private:
     void*                    m_navCtx = nullptr;
     TitleChangeCallback      m_titleCallback = nullptr;
     void*                    m_titleCtx = nullptr;
-
-    wchar_t                  m_pendingUrl[2048] = {};
-    bool                     m_resetting = false;
 
     void ConnectEvents();
     void DisconnectEvents();
