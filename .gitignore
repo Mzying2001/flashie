@@ -67,3 +67,7 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# IDE / tool directories
+.claude/
+.vscode/
