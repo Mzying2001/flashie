@@ -1,4 +1,5 @@
 #include "browser.h"
+#include "debug.h"
 
 // ===============================================================
 // COleClientSite
@@ -133,6 +134,10 @@ STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IDocHostUIHandler*>(this);
     } else if (riid == IID_IDispatch || riid == DIID_DWebBrowserEvents2) {
         *ppv = static_cast<IDispatch*>(this);
+    } else if (riid == IID_IServiceProvider) {
+        *ppv = static_cast<IServiceProvider*>(this);
+    } else if (riid == IID_IInternetHostSecurityManager) {
+        *ppv = static_cast<IInternetHostSecurityManager*>(this);
     } else {
         *ppv = nullptr;
         return E_NOINTERFACE;
@@ -243,6 +248,38 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         break;
     }
     return DISP_E_MEMBERNOTFOUND;
+}
+
+// IServiceProvider
+STDMETHODIMP COleSite::QueryService(REFGUID guidService, REFIID riid, void** ppv)
+{
+    DbgTrace(L"[FlashIE] COleSite::QueryService srv={%08X-...} riid={%08X-...}\n",
+             guidService.Data1, riid.Data1);
+    if (guidService == IID_IInternetHostSecurityManager)
+        return QueryInterface(riid, ppv);
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+}
+
+// IInternetHostSecurityManager
+STDMETHODIMP COleSite::GetSecurityId(BYTE*, DWORD* pcbSecurityId, DWORD_PTR)
+{
+    if (pcbSecurityId) *pcbSecurityId = 0;
+    return S_OK;
+}
+
+STDMETHODIMP COleSite::ProcessUrlAction(DWORD dwAction, BYTE* pPolicy, DWORD cbPolicy,
+                                         BYTE*, DWORD, DWORD, DWORD)
+{
+    DbgTrace(L"[FlashIE] COleSite::ProcessUrlAction action=0x%X\n", dwAction);
+    if (pPolicy && cbPolicy >= sizeof(DWORD))
+        *(DWORD*)pPolicy = URLPOLICY_ALLOW;
+    return S_OK;
+}
+
+STDMETHODIMP COleSite::QueryCustomPolicy(REFGUID, BYTE**, DWORD*, BYTE*, DWORD, DWORD)
+{
+    return INET_E_DEFAULT_ACTION;
 }
 
 // ===============================================================

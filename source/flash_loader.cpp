@@ -7,6 +7,7 @@
 #include <intrin.h>
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
+#include <objsafe.h>    // IObjectSafety
 
 // Flash Player ActiveX CLSID: {D27CDB6E-AE6D-11CF-96B8-444553540000}
 static const CLSID CLSID_ShockwaveFlash =
@@ -54,6 +55,9 @@ typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(LPCOLESTR, LPCLSID);
 
 // Static member
 IClassFactory* FlashLoader::s_pFlashFactory = nullptr;
+
+// Forward declaration: installs IObjectSafety hook on Flash's QueryInterface
+static void MaybeHookFlashQI(IUnknown* pObj);
 
 // ===================================================================
 // Logging IClassFactory wrapper — intercepts CreateInstance calls
@@ -103,6 +107,7 @@ public:
                 { IID_IPersistPropertyBag, L"IPersistPropertyBag" },
                 { IID_IOleControl, L"IOleControl" },
                 { IID_IQuickActivate, L"IQuickActivate" },
+                { IID_IObjectSafety, L"IObjectSafety" },
             };
             for (int i = 0; i < _countof(probes); i++) {
                 void* pTest = nullptr;
@@ -110,6 +115,8 @@ public:
                 DbgTrace(L"[FlashIE] FlashObj::QI %s -> 0x%08X\n", probes[i].name, hrQI);
                 if (pTest) static_cast<IUnknown*>(pTest)->Release();
             }
+            // Hook Flash's QueryInterface to inject IObjectSafety support
+            MaybeHookFlashQI(pObj);
         }
         return hr;
     }
@@ -117,6 +124,41 @@ public:
         return m_real->LockServer(fLock);
     }
 };
+
+// ===================================================================
+// Static IObjectSafety implementation for Flash objects.
+// MSHTML checks IObjectSafety::SetInterfaceSafetyOptions on ActiveX
+// controls; Flash's EOL build removed IObjectSafety entirely, so
+// MSHTML treats it as unsafe and skips IPersistPropertyBag::Load.
+// This singleton is returned by our hooked QI to make Flash "safe".
+// ===================================================================
+class FlashObjectSafety : public IObjectSafety {
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IObjectSafety) {
+            *ppv = this;
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+
+    STDMETHODIMP GetInterfaceSafetyOptions(REFIID, DWORD* pdwSupportedOptions,
+                                            DWORD* pdwEnabledOptions) override {
+        if (pdwSupportedOptions)
+            *pdwSupportedOptions = INTERFACESAFE_FOR_UNTRUSTED_CALLER | INTERFACESAFE_FOR_UNTRUSTED_DATA;
+        if (pdwEnabledOptions)
+            *pdwEnabledOptions = INTERFACESAFE_FOR_UNTRUSTED_CALLER | INTERFACESAFE_FOR_UNTRUSTED_DATA;
+        return S_OK;
+    }
+    STDMETHODIMP SetInterfaceSafetyOptions(REFIID, DWORD, DWORD) override {
+        return S_OK;
+    }
+};
+
+static FlashObjectSafety s_flashSafety;
 
 static LoggingClassFactory* s_pLoggingFactory = nullptr;
 
@@ -143,6 +185,7 @@ enum FakeKeyType {
     FK_PROGID_CLSID,     // HKCR\ShockwaveFlash.ShockwaveFlash\CLSID
     FK_PROGID_CURVER,    // HKCR\ShockwaveFlash.ShockwaveFlash\CurVer
     FK_INSTALLED_VER,    // HKCR\CLSID\{...}\InstalledVersion
+    FK_IMPL_CATEGORY,    // ...\Implemented Categories\{CATID_SafeFor*}
 };
 
 struct FakeKeyEntry {
@@ -339,6 +382,8 @@ static InlineHook s_hookMoveFileW;
 static InlineHook s_hookMoveFileExW;
 static InlineHook s_hookDeleteFileW;
 static InlineHook s_hookCLSIDFromProgID;
+static InlineHook s_hookFlashQI;
+typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(void*, REFIID, void**);
 
 // Path to our local mms.cfg (next to Flash.ocx)
 static wchar_t g_szMmsCfgPath[MAX_PATH] = {};
@@ -559,6 +604,35 @@ static bool SubKeyEndsWith(LPCWSTR lpSubKey, LPCWSTR suffix)
     return _wcsicmp(lpSubKey + keyLen - sufLen, suffix) == 0;
 }
 
+// ===================================================================
+// Hooked Flash QI — intercepts IObjectSafety queries on Flash objects
+// ===================================================================
+static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void** ppv)
+{
+    if (IsEqualIID(riid, IID_IObjectSafety)) {
+        *ppv = static_cast<IObjectSafety*>(&s_flashSafety);
+        DbgTrace(L"[FlashIE] Flash::QI(IObjectSafety) -> HOOKED safe\n");
+        return S_OK;
+    }
+    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hookFlashQI.pTrampoline);
+    return origQI(pThis, riid, ppv);
+}
+
+// ===================================================================
+// MaybeHookFlashQI — called from LoggingClassFactory::CreateInstance
+// ===================================================================
+static void MaybeHookFlashQI(IUnknown* pObj)
+{
+    if (s_hookFlashQI.active) return;
+    void** vtable = *reinterpret_cast<void***>(pObj);
+    void* pFlashQI = vtable[0];
+    if (InstallDetour(pFlashQI, reinterpret_cast<void*>(Hooked_FlashQI), s_hookFlashQI)) {
+        DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: OK (addr=%p)\n", pFlashQI);
+    } else {
+        DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED\n");
+    }
+}
+
 // Flash CLSID string for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
 static const wchar_t FLASH_CLSID_UPPER[] = L"D27CDB6E-AE6D-11CF-96B8-444553540000";
@@ -595,6 +669,8 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             subType = FK_PROGID_CURVER;
         else if (_wcsicmp(lpSubKey, L"InstalledVersion") == 0)
             subType = FK_INSTALLED_VER;
+        else if (_wcsnicmp(lpSubKey, L"Implemented Categories\\", 23) == 0)
+            subType = FK_IMPL_CATEGORY;
 
         if (subType != FK_NONE) {
             HKEY h = AllocFakeKey(subType);
@@ -832,6 +908,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
             return ERROR_FILE_NOT_FOUND;
 
         case FK_CONTROL:
+        case FK_IMPL_CATEGORY:
             return ERROR_FILE_NOT_FOUND;
 
         case FK_VERSION:
@@ -1972,6 +2049,7 @@ void FlashLoader::Deactivate()
         RemoveDetour(s_hookMoveFileW);
         RemoveDetour(s_hookMoveFileExW);
         RemoveDetour(s_hookDeleteFileW);
+        RemoveDetour(s_hookFlashQI);
         m_hooked = false;
     }
 
