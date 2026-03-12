@@ -163,7 +163,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     g_hwndMain = CreateWindowExW(0, L"FlashIEWindow", L"FlashIE",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(g_hwndMain, nCmdShow);
@@ -171,10 +171,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        // Enter key in address bar triggers navigation
-        if (msg.hwnd == g_hwndAddress && msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
-            DoNavigate();
-            continue;
+        // Address bar keyboard shortcuts
+        if (msg.hwnd == g_hwndAddress && msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                DoNavigate();
+                continue;
+            }
+            if (msg.wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                SendMessageW(g_hwndAddress, EM_SETSEL, 0, -1);
+                continue;
+            }
         }
         // Let WebBrowser handle keyboard input only when focus is in browser area
         if (g_pBrowser) {
