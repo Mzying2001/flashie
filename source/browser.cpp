@@ -1,6 +1,4 @@
 #include "browser.h"
-#include "debug.h"
-#include <urlmon.h>    // UrlMkSetSessionOption
 
 // ===============================================================
 // COleClientSite
@@ -241,28 +239,6 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         return S_OK;
     }
 
-    case 250: // DISPID_BEFORENAVIGATE2
-    {
-        if (pDispParams->cArgs >= 7) {
-            VARIANT* pURL = &pDispParams->rgvarg[5];
-            if (pURL->vt == (VT_VARIANT | VT_BYREF)) pURL = pURL->pvarVal;
-            if (pURL->vt == VT_BSTR)
-                DbgTrace(L"[FlashIE] BEFORENAVIGATE2: %s\n", pURL->bstrVal);
-        }
-        return S_OK;
-    }
-
-    case 259: // DISPID_DOCUMENTCOMPLETE
-    {
-        if (pDispParams->cArgs >= 2) {
-            VARIANT* pURL = &pDispParams->rgvarg[0];
-            if (pURL->vt == (VT_VARIANT | VT_BYREF)) pURL = pURL->pvarVal;
-            if (pURL->vt == VT_BSTR)
-                DbgTrace(L"[FlashIE] DOCUMENTCOMPLETE: %s\n", pURL->bstrVal);
-        }
-        return S_OK;
-    }
-
     default:
         break;
     }
@@ -275,15 +251,6 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
 
 bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 {
-    // Set User-Agent to include "MSIE 11.0" so sites serve IE-compatible
-    // content.  IE11 Edge mode's default UA omits "MSIE", causing many
-    // Chinese Flash game sites (4399, 17roco) to serve non-IE fallback
-    // pages that may show "no Flash installed" overlays.
-    {
-        const char ua[] = "Mozilla/5.0 (compatible; MSIE 11.0; Windows NT 10.0; WOW64; Trident/7.0)";
-        UrlMkSetSessionOption(URLMON_OPTION_USERAGENT, (void*)ua, (DWORD)strlen(ua), 0);
-    }
-
     m_pSite = new COleSite();
     m_pSite->m_hWnd = hwndParent;
     m_pSite->m_pBrowserHost = this;
