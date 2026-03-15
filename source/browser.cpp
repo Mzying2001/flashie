@@ -244,6 +244,29 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         return S_OK;
     }
 
+    case DISPID_BEFORENAVIGATE2: {
+        // Block Flash-detection redirects that replace the game iframe with
+        // "install Flash" pages. Win10 MSHTML blocks JS->Flash IDispatch,
+        // causing detection scripts (flashopen_cpp.js) to think Flash is missing.
+        // The game is actually loaded and running — just block the redirect.
+        if (pDispParams->cArgs >= 7) {
+            VARIANT* pURL = &pDispParams->rgvarg[5];
+            if (pURL->vt == (VT_VARIANT | VT_BYREF))
+                pURL = pURL->pvarVal;
+            if (pURL && pURL->vt == VT_BSTR && pURL->bstrVal) {
+                if (wcsstr(pURL->bstrVal, L"noInstallFlash") ||
+                    wcsstr(pURL->bstrVal, L"blockflashtip")) {
+                    VARIANT* pCancel = &pDispParams->rgvarg[0];
+                    if (pCancel->vt == (VT_BOOL | VT_BYREF))
+                        *pCancel->pboolVal = VARIANT_TRUE;
+                    DbgTrace(L"[FlashIE] BLOCKED Flash-block redirect: %s\n",
+                             pURL->bstrVal);
+                }
+            }
+        }
+        return S_OK;
+    }
+
     default:
         break;
     }
