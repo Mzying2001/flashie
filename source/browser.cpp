@@ -245,10 +245,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
     }
 
     case DISPID_BEFORENAVIGATE2: {
-        // Block Flash-detection redirects that replace the game iframe with
-        // "install Flash" pages. Win10 MSHTML blocks JS->Flash IDispatch,
-        // causing detection scripts (flashopen_cpp.js) to think Flash is missing.
-        // The game is actually loaded and running — just block the redirect.
+        // Block Flash-detection redirects that replace game iframes with
+        // "install Flash" pages (e.g. 4399's noInstallFlashIE.html).
         if (pDispParams->cArgs >= 7) {
             VARIANT* pURL = &pDispParams->rgvarg[5];
             if (pURL->vt == (VT_VARIANT | VT_BYREF))

@@ -8,8 +8,6 @@
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
-#include <dispex.h>     // IDispatchEx
-#include <string>       // std::wstring for ExternalInterface XML
 
 // Flash Player ActiveX CLSID: {D27CDB6E-AE6D-11CF-96B8-444553540000}
 static const CLSID CLSID_ShockwaveFlash =
@@ -110,8 +108,6 @@ public:
                 { IID_IOleControl, L"IOleControl" },
                 { IID_IQuickActivate, L"IQuickActivate" },
                 { IID_IObjectSafety, L"IObjectSafety" },
-                { IID_IDispatch, L"IDispatch" },
-                { IID_IDispatchEx, L"IDispatchEx" },
             };
             for (int i = 0; i < _countof(probes); i++) {
                 void* pTest = nullptr;
@@ -142,19 +138,17 @@ public:
 // causes MSHTML to reject the safety assertion and block scripting.
 // ===================================================================
 class FlashSafetyTearoff : public IObjectSafety {
-    IUnknown* m_pFlash; // controlling unknown — the Flash object
+    IUnknown* m_pFlash;
 public:
     explicit FlashSafetyTearoff(IUnknown* pFlash) : m_pFlash(pFlash) {}
     ~FlashSafetyTearoff() { if (m_pFlash) m_pFlash->Release(); }
 
-    // IUnknown — delegate to Flash object to maintain COM identity
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (riid == IID_IObjectSafety) {
             *ppv = static_cast<IObjectSafety*>(this);
             m_pFlash->AddRef();
             return S_OK;
         }
-        // All other QIs (including IID_IUnknown) go to Flash — same COM identity
         return m_pFlash->QueryInterface(riid, ppv);
     }
     STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
@@ -164,7 +158,6 @@ public:
         return ref;
     }
 
-    // IObjectSafety — report safe for scripting and initialization
     STDMETHODIMP GetInterfaceSafetyOptions(REFIID, DWORD* pdwSupportedOptions,
                                             DWORD* pdwEnabledOptions) override {
         if (pdwSupportedOptions)
@@ -177,228 +170,6 @@ public:
         return S_OK;
     }
 };
-
-// ===================================================================
-// IDispatchEx wrapper for Flash objects — restores ExternalInterface.
-// Flash's EOL build removed IDispatchEx, breaking JS→Flash calls for
-// methods registered via ExternalInterface.addCallback(). This wrapper
-// intercepts unknown method names and routes them through Flash's
-// built-in CallFunction IDispatch method using XML serialization.
-// ===================================================================
-class FlashDispatchExWrapper : public IDispatchEx {
-    IUnknown* m_pFlash;     // controlling unknown
-    IDispatch* m_pDisp;     // Flash's IDispatch
-    DISPID m_dispCallFunc;  // DISPID for Flash's "CallFunction" method
-
-public:
-    // STATIC name→DISPID map shared across ALL wrapper instances AND the
-    // IDispatch hooks. This allows GetIDsOfNames to register dynamic DISPIDs
-    // and Invoke to find the corresponding method names.
-    struct NameEntry { wchar_t name[128]; DISPID dispid; };
-    static NameEntry s_names[64];
-    static int s_nameCount;
-    static DISPID s_nextDispId;
-
-    static DISPID FindOrAddName(LPCOLESTR name) {
-        for (int i = 0; i < s_nameCount; i++)
-            if (_wcsicmp(s_names[i].name, name) == 0) return s_names[i].dispid;
-        if (s_nameCount >= 64) return DISPID_UNKNOWN;
-        wcsncpy_s(s_names[s_nameCount].name, name, _TRUNCATE);
-        s_names[s_nameCount].dispid = s_nextDispId++;
-        return s_names[s_nameCount++].dispid;
-    }
-
-    static const wchar_t* FindName(DISPID id) {
-        for (int i = 0; i < s_nameCount; i++)
-            if (s_names[i].dispid == id) return s_names[i].name;
-        return nullptr;
-    }
-
-    // Convert a VARIANT to ExternalInterface XML argument
-    static void VariantToXml(const VARIANT& v, std::wstring& out) {
-        switch (v.vt) {
-        case VT_BSTR:
-            out += L"<string>";
-            if (v.bstrVal) {
-                // Escape XML special chars
-                for (const wchar_t* p = v.bstrVal; *p; p++) {
-                    if (*p == L'<') out += L"&lt;";
-                    else if (*p == L'>') out += L"&gt;";
-                    else if (*p == L'&') out += L"&amp;";
-                    else if (*p == L'"') out += L"&quot;";
-                    else out += *p;
-                }
-            }
-            out += L"</string>";
-            break;
-        case VT_I4: case VT_I2: case VT_UI4: case VT_UI2:
-        case VT_R4: case VT_R8: {
-            wchar_t buf[64];
-            if (v.vt == VT_R8) swprintf_s(buf, L"%g", v.dblVal);
-            else if (v.vt == VT_R4) swprintf_s(buf, L"%g", (double)v.fltVal);
-            else swprintf_s(buf, L"%d", v.lVal);
-            out += L"<number>"; out += buf; out += L"</number>";
-            break;
-        }
-        case VT_BOOL:
-            out += v.boolVal ? L"<true/>" : L"<false/>";
-            break;
-        case VT_NULL:
-            out += L"<null/>";
-            break;
-        default:
-            out += L"<undefined/>";
-            break;
-        }
-    }
-
-    // Parse Flash's XML return value to VARIANT
-    static void XmlToVariant(BSTR xml, VARIANT* pResult) {
-        if (!xml || !pResult) return;
-        VariantInit(pResult);
-        if (wcsstr(xml, L"<string>")) {
-            const wchar_t* start = wcsstr(xml, L"<string>") + 8;
-            const wchar_t* end = wcsstr(start, L"</string>");
-            if (end) {
-                pResult->vt = VT_BSTR;
-                pResult->bstrVal = SysAllocStringLen(start, (UINT)(end - start));
-            }
-        } else if (wcsstr(xml, L"<number>")) {
-            const wchar_t* start = wcsstr(xml, L"<number>") + 8;
-            pResult->vt = VT_R8;
-            pResult->dblVal = _wtof(start);
-        } else if (wcsstr(xml, L"<true/>")) {
-            pResult->vt = VT_BOOL; pResult->boolVal = VARIANT_TRUE;
-        } else if (wcsstr(xml, L"<false/>")) {
-            pResult->vt = VT_BOOL; pResult->boolVal = VARIANT_FALSE;
-        } else if (wcsstr(xml, L"<null/>")) {
-            pResult->vt = VT_NULL;
-        } else if (wcsstr(xml, L"<undefined/>")) {
-            pResult->vt = VT_EMPTY;
-        }
-    }
-
-public:
-    FlashDispatchExWrapper(IUnknown* pFlash, IDispatch* pDisp)
-        : m_pFlash(pFlash), m_pDisp(pDisp), m_dispCallFunc(DISPID_UNKNOWN)
-    {
-        // Resolve CallFunction DISPID
-        LPOLESTR name = const_cast<LPOLESTR>(L"CallFunction");
-        m_pDisp->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_SYSTEM_DEFAULT, &m_dispCallFunc);
-        DbgTrace(L"[FlashIE] FlashDispatchExWrapper: CallFunction dispid=%d\n", m_dispCallFunc);
-    }
-    ~FlashDispatchExWrapper() {
-        if (m_pDisp) m_pDisp->Release();
-        if (m_pFlash) m_pFlash->Release();
-    }
-
-    // IUnknown — delegate to Flash for COM identity
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IDispatchEx) {
-            *ppv = static_cast<IDispatchEx*>(this);
-            m_pFlash->AddRef();
-            return S_OK;
-        }
-        if (riid == IID_IDispatch) {
-            *ppv = static_cast<IDispatch*>(this);
-            m_pFlash->AddRef();
-            return S_OK;
-        }
-        return m_pFlash->QueryInterface(riid, ppv);
-    }
-    STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
-    STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = m_pFlash->Release();
-        if (ref == 0) delete this;
-        return ref;
-    }
-
-    // IDispatch — delegate to Flash
-    STDMETHODIMP GetTypeInfoCount(UINT* p) override { return m_pDisp->GetTypeInfoCount(p); }
-    STDMETHODIMP GetTypeInfo(UINT i, LCID l, ITypeInfo** p) override { return m_pDisp->GetTypeInfo(i, l, p); }
-    STDMETHODIMP GetIDsOfNames(REFIID r, LPOLESTR* n, UINT c, LCID l, DISPID* d) override {
-        return m_pDisp->GetIDsOfNames(r, n, c, l, d);
-    }
-    STDMETHODIMP Invoke(DISPID d, REFIID r, LCID l, WORD f, DISPPARAMS* p,
-                         VARIANT* res, EXCEPINFO* e, UINT* a) override {
-        return m_pDisp->Invoke(d, r, l, f, p, res, e, a);
-    }
-
-    // IDispatchEx — the key extension
-    STDMETHODIMP GetDispID(BSTR bstrName, DWORD grfdex, DISPID* pid) override {
-        if (!bstrName || !pid) return E_INVALIDARG;
-        // Try Flash's IDispatch first
-        LPOLESTR names[1] = { bstrName };
-        DISPID dispid;
-        HRESULT hr = m_pDisp->GetIDsOfNames(IID_NULL, names, 1, LOCALE_SYSTEM_DEFAULT, &dispid);
-        if (SUCCEEDED(hr)) { *pid = dispid; return S_OK; }
-        // Not a standard Flash method — treat as ExternalInterface callback
-        *pid = FindOrAddName(bstrName);
-        DbgTrace(L"[FlashIE] FlashDispatchEx::GetDispID('%s') -> dynamic %d\n", bstrName, *pid);
-        return S_OK;
-    }
-
-    STDMETHODIMP InvokeEx(DISPID id, LCID lcid, WORD wFlags, DISPPARAMS* pdp,
-                           VARIANT* pvarRes, EXCEPINFO* pei, IServiceProvider*) override {
-        // Standard Flash DISPID — delegate
-        if (id < 0x80010000)
-            return m_pDisp->Invoke(id, IID_NULL, lcid, wFlags, pdp, pvarRes, pei, nullptr);
-
-        // Dynamic DISPID — ExternalInterface call via CallFunction
-        const wchar_t* funcName = FindName(id);
-        if (!funcName || m_dispCallFunc == DISPID_UNKNOWN) return DISP_E_MEMBERNOTFOUND;
-
-        // Build ExternalInterface XML
-        std::wstring xml = L"<invoke name=\"";
-        xml += funcName;
-        xml += L"\" returntype=\"cycl\"><arguments>";
-        if (pdp) {
-            // DISPPARAMS args are in REVERSE order
-            for (int i = (int)pdp->cArgs - 1; i >= 0; i--) {
-                VARIANT* pArg = &pdp->rgvarg[i];
-                VARIANT resolved;
-                VariantInit(&resolved);
-                if (pArg->vt == (VT_VARIANT | VT_BYREF)) pArg = pArg->pvarVal;
-                VariantToXml(*pArg, xml);
-            }
-        }
-        xml += L"</arguments></invoke>";
-
-        // Call Flash's CallFunction(xml)
-        BSTR bstrXml = SysAllocString(xml.c_str());
-        VARIANT varArg; VariantInit(&varArg);
-        varArg.vt = VT_BSTR; varArg.bstrVal = bstrXml;
-        DISPPARAMS params = { &varArg, nullptr, 1, 0 };
-        VARIANT varResult; VariantInit(&varResult);
-        HRESULT hr = m_pDisp->Invoke(m_dispCallFunc, IID_NULL, lcid,
-                                       DISPATCH_METHOD, &params, &varResult, pei, nullptr);
-        SysFreeString(bstrXml);
-
-        DbgTrace(L"[FlashIE] FlashDispatchEx::InvokeEx('%s') CallFunction -> hr=0x%08X\n", funcName, hr);
-
-        // Parse XML result
-        if (SUCCEEDED(hr) && pvarRes) {
-            if (varResult.vt == VT_BSTR && varResult.bstrVal)
-                XmlToVariant(varResult.bstrVal, pvarRes);
-            else
-                *pvarRes = varResult;
-        }
-        VariantClear(&varResult);
-        return hr;
-    }
-
-    STDMETHODIMP DeleteMemberByName(BSTR, DWORD) override { return E_NOTIMPL; }
-    STDMETHODIMP DeleteMemberByDispID(DISPID) override { return E_NOTIMPL; }
-    STDMETHODIMP GetMemberProperties(DISPID, DWORD, DWORD*) override { return E_NOTIMPL; }
-    STDMETHODIMP GetMemberName(DISPID, BSTR*) override { return E_NOTIMPL; }
-    STDMETHODIMP GetNextDispID(DWORD, DISPID, DISPID*) override { return E_NOTIMPL; }
-    STDMETHODIMP GetNameSpaceParent(IUnknown**) override { return E_NOTIMPL; }
-};
-
-// Static members for shared name→DISPID map
-FlashDispatchExWrapper::NameEntry FlashDispatchExWrapper::s_names[64] = {};
-int FlashDispatchExWrapper::s_nameCount = 0;
-DISPID FlashDispatchExWrapper::s_nextDispId = 0x80010000;
 
 static LoggingClassFactory* s_pLoggingFactory = nullptr;
 
@@ -623,11 +394,7 @@ static InlineHook s_hookMoveFileExW;
 static InlineHook s_hookDeleteFileW;
 static InlineHook s_hookCLSIDFromProgID;
 static InlineHook s_hookFlashQI;
-static InlineHook s_hookFlashGetIDsOfNames;
 typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(void*, REFIID, void**);
-typedef HRESULT (STDMETHODCALLTYPE *FN_FlashGetIDsOfNames)(void*, REFIID, LPOLESTR*, UINT, LCID, DISPID*);
-typedef HRESULT (STDMETHODCALLTYPE *FN_FlashInvoke)(void*, DISPID, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*);
-static FN_FlashInvoke s_origFlashInvoke = nullptr; // vtable-patched, not detoured
 
 // Path to our local mms.cfg (next to Flash.ocx)
 static wchar_t g_szMmsCfgPath[MAX_PATH] = {};
@@ -853,11 +620,8 @@ static bool SubKeyEndsWith(LPCWSTR lpSubKey, LPCWSTR suffix)
 // ===================================================================
 static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void** ppv)
 {
-    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hookFlashQI.pTrampoline);
-
     if (IsEqualIID(riid, IID_IObjectSafety)) {
-        // Create a tearoff that delegates IUnknown to the Flash object.
-        // This maintains COM identity so MSHTML trusts the safety assertion.
+        auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hookFlashQI.pTrampoline);
         IUnknown* pFlashUnk = nullptr;
         origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
         if (pFlashUnk) {
@@ -866,122 +630,8 @@ static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void**
             return S_OK;
         }
     }
-
-    if (IsEqualIID(riid, IID_IDispatchEx)) {
-        // Flash's EOL build removed IDispatchEx, breaking ExternalInterface.
-        // Provide a wrapper that bridges ExternalInterface calls through
-        // Flash's CallFunction IDispatch method using XML serialization.
-        IUnknown* pFlashUnk = nullptr;
-        IDispatch* pDisp = nullptr;
-        origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
-        origQI(pThis, IID_IDispatch, reinterpret_cast<void**>(&pDisp));
-        if (pFlashUnk && pDisp) {
-            // Wrapper takes ownership of pFlashUnk ref; pDisp ref is kept by wrapper too
-            *ppv = static_cast<IDispatchEx*>(new FlashDispatchExWrapper(pFlashUnk, pDisp));
-            DbgTrace(L"[FlashIE] Flash::QI(IDispatchEx) -> HOOKED wrapper\n");
-            return S_OK;
-        }
-        if (pFlashUnk) pFlashUnk->Release();
-        if (pDisp) pDisp->Release();
-    }
-
+    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hookFlashQI.pTrampoline);
     return origQI(pThis, riid, ppv);
-}
-
-// ===================================================================
-// Hooked Flash IDispatch — intercepts GetIDsOfNames and Invoke to
-// bridge ExternalInterface calls through Flash's CallFunction method.
-//
-// When GetIDsOfNames fails for a method (ExternalInterface callback),
-// we assign a dynamic DISPID. When Invoke is called with that DISPID,
-// we build ExternalInterface XML and call Flash's CallFunction.
-// ===================================================================
-
-// Cached CallFunction DISPID (resolved once per Flash object type)
-static DISPID s_dispCallFunction = DISPID_UNKNOWN;
-
-static HRESULT STDMETHODCALLTYPE Hooked_FlashGetIDsOfNames(
-    void* pThis, REFIID riid, LPOLESTR* rgszNames, UINT cNames, LCID lcid, DISPID* rgDispId)
-{
-    auto orig = reinterpret_cast<FN_FlashGetIDsOfNames>(s_hookFlashGetIDsOfNames.pTrampoline);
-    HRESULT hr = orig(pThis, riid, rgszNames, cNames, lcid, rgDispId);
-
-    if (cNames > 0 && rgszNames && rgszNames[0]) {
-        if (FAILED(hr) && rgDispId) {
-            // Flash doesn't know this name — it might be an ExternalInterface callback.
-            // Assign a dynamic DISPID so Invoke can route it through CallFunction.
-            DISPID dynId = FlashDispatchExWrapper::FindOrAddName(rgszNames[0]);
-            if (dynId != DISPID_UNKNOWN) {
-                rgDispId[0] = dynId;
-                DbgTrace(L"[FlashIE] Flash::GetIDsOfNames('%s') -> DYNAMIC dispid=%d\n",
-                         rgszNames[0], dynId);
-
-                // Resolve CallFunction DISPID if not yet done
-                if (s_dispCallFunction == DISPID_UNKNOWN) {
-                    LPOLESTR cfName = const_cast<LPOLESTR>(L"CallFunction");
-                    DISPID cfId;
-                    if (SUCCEEDED(orig(pThis, IID_NULL, &cfName, 1, lcid, &cfId)))
-                        s_dispCallFunction = cfId;
-                }
-                return S_OK;
-            }
-        }
-        DbgTrace(L"[FlashIE] Flash::GetIDsOfNames('%s') -> hr=0x%08X dispid=%d\n",
-                 rgszNames[0], hr, (rgDispId && SUCCEEDED(hr)) ? *rgDispId : -1);
-    }
-    return hr;
-}
-
-static HRESULT STDMETHODCALLTYPE Hooked_FlashInvoke(
-    void* pThis, DISPID dispid, REFIID riid, LCID lcid, WORD wFlags,
-    DISPPARAMS* pDispParams, VARIANT* pVarResult, EXCEPINFO* pExcepInfo, UINT* puArgErr)
-{
-    // Check if this is a dynamic DISPID (ExternalInterface callback)
-    const wchar_t* funcName = FlashDispatchExWrapper::FindName(dispid);
-    if (funcName && s_dispCallFunction != DISPID_UNKNOWN) {
-        // Build ExternalInterface XML: <invoke name="funcName" returntype="cycl"><arguments>...</arguments></invoke>
-        std::wstring xml = L"<invoke name=\"";
-        xml += funcName;
-        xml += L"\" returntype=\"cycl\"><arguments>";
-        if (pDispParams) {
-            for (int i = (int)pDispParams->cArgs - 1; i >= 0; i--) {
-                VARIANT* pArg = &pDispParams->rgvarg[i];
-                if (pArg->vt == (VT_VARIANT | VT_BYREF)) pArg = pArg->pvarVal;
-                FlashDispatchExWrapper::VariantToXml(*pArg, xml);
-            }
-        }
-        xml += L"</arguments></invoke>";
-
-        // Call Flash's CallFunction(xml)
-        BSTR bstrXml = SysAllocString(xml.c_str());
-        VARIANT varArg; VariantInit(&varArg);
-        varArg.vt = VT_BSTR; varArg.bstrVal = bstrXml;
-        DISPPARAMS cfParams = { &varArg, nullptr, 1, 0 };
-        VARIANT varResult; VariantInit(&varResult);
-        HRESULT hr = s_origFlashInvoke(pThis, s_dispCallFunction, IID_NULL, lcid,
-                                        DISPATCH_METHOD, &cfParams, &varResult, pExcepInfo, puArgErr);
-        SysFreeString(bstrXml);
-
-        DbgTrace(L"[FlashIE] Flash::Invoke('%s') via CallFunction -> hr=0x%08X\n", funcName, hr);
-
-        // Parse XML result
-        if (SUCCEEDED(hr) && pVarResult) {
-            if (varResult.vt == VT_BSTR && varResult.bstrVal)
-                FlashDispatchExWrapper::XmlToVariant(varResult.bstrVal, pVarResult);
-            else
-                VariantCopy(pVarResult, &varResult);
-        }
-        VariantClear(&varResult);
-        return hr;
-    }
-
-    // Standard Flash DISPID — delegate to original
-    HRESULT hr = s_origFlashInvoke(pThis, dispid, riid, lcid, wFlags, pDispParams, pVarResult, pExcepInfo, puArgErr);
-    if (pVarResult && SUCCEEDED(hr) && pVarResult->vt == VT_BSTR && pVarResult->bstrVal) {
-        DbgTrace(L"[FlashIE] Flash::Invoke(dispid=%d, flags=0x%X) -> hr=0x%08X BSTR=\"%s\"\n",
-                 dispid, wFlags, hr, pVarResult->bstrVal);
-    }
-    return hr;
 }
 
 // ===================================================================
@@ -996,28 +646,6 @@ static void MaybeHookFlashQI(IUnknown* pObj)
         DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: OK (addr=%p)\n", pFlashQI);
     } else {
         DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED\n");
-    }
-
-    // Also hook IDispatch methods to diagnose JS->Flash IDispatch bridge
-    if (!s_hookFlashGetIDsOfNames.active) {
-        IDispatch* pDisp = nullptr;
-        if (SUCCEEDED(pObj->QueryInterface(IID_IDispatch, reinterpret_cast<void**>(&pDisp))) && pDisp) {
-            void** vtDisp = *reinterpret_cast<void***>(pDisp);
-            // IDispatch vtable: [QI, AddRef, Release, GetTypeInfoCount, GetTypeInfo, GetIDsOfNames, Invoke]
-            if (InstallDetour(vtDisp[5], reinterpret_cast<void*>(Hooked_FlashGetIDsOfNames), s_hookFlashGetIDsOfNames))
-                DbgTrace(L"[FlashIE] Hook Flash::GetIDsOfNames: OK\n");
-            // Invoke detour fails (prologue too short), use vtable patching instead
-            if (!s_origFlashInvoke) {
-                DWORD oldProt;
-                if (VirtualProtect(&vtDisp[6], sizeof(void*), PAGE_READWRITE, &oldProt)) {
-                    s_origFlashInvoke = reinterpret_cast<FN_FlashInvoke>(vtDisp[6]);
-                    vtDisp[6] = reinterpret_cast<void*>(Hooked_FlashInvoke);
-                    VirtualProtect(&vtDisp[6], sizeof(void*), oldProt, &oldProt);
-                    DbgTrace(L"[FlashIE] Hook Flash::Invoke: OK (vtable patch)\n");
-                }
-            }
-            pDisp->Release();
-        }
     }
 }
 
@@ -2179,6 +1807,13 @@ void FlashLoader::InstallHooks()
 {
     if (m_hooked || !m_pFactory) return;
 
+    // --- Step 0: Force-load IE DLLs so we can patch and hook them ---
+    // Called BEFORE browser creation so NeutralizeFlashBlock patches
+    // mshtml.dll/ieframe.dll/urlmon.dll early.
+    LoadLibraryW(L"mshtml.dll");
+    LoadLibraryW(L"urlmon.dll");
+    LoadLibraryW(L"ieframe.dll");
+
     // --- Step 1: Neutralize any hardcoded Flash-blocked CLSID lists ---
     NeutralizeFlashBlock();
 
@@ -2438,9 +2073,6 @@ void FlashLoader::Deactivate()
         RemoveDetour(s_hookMoveFileExW);
         RemoveDetour(s_hookDeleteFileW);
         RemoveDetour(s_hookFlashQI);
-        RemoveDetour(s_hookFlashGetIDsOfNames);
-        // s_origFlashInvoke is vtable-patched, not detoured — no RemoveDetour needed
-        // (vtable is in Flash.ocx memory which is unloaded anyway)
         m_hooked = false;
     }
 

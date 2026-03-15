@@ -95,11 +95,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0, TOOLBAR_HEIGHT, rc.right, rc.bottom - TOOLBAR_HEIGHT,
             hwnd, nullptr, hInst, nullptr);
 
+        // Install hooks BEFORE browser creation so NeutralizeFlashBlock patches
+        // mshtml.dll before it initializes (caches navigator.plugins list).
+        // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
+        g_flashLoader.InstallHooks();
+
         g_pBrowser = new BrowserHost();
         RECT rcBrowser = {0, 0, rc.right, rc.bottom - TOOLBAR_HEIGHT};
         if (g_pBrowser->Initialize(g_hwndBrowserArea, rcBrowser)) {
-            // Install hooks AFTER browser creation so mshtml/urlmon are loaded
-            g_flashLoader.InstallHooks();
 
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
