@@ -1,5 +1,10 @@
 #include "browser.h"
 #include "debug.h"
+#include <mshtml.h>
+
+// {86D52E11-94A8-11d0-82AF-00C04FD5AE38}
+static const GUID SID_SContainerDispatch =
+    {0x86D52E11, 0x94A8, 0x11d0, {0x82, 0xAF, 0x00, 0xC0, 0x4F, 0xD5, 0xAE, 0x38}};
 
 // ===============================================================
 // COleClientSite
@@ -278,6 +283,34 @@ STDMETHODIMP COleSite::QueryService(REFGUID guidService, REFIID riid, void** ppv
              guidService.Data1, riid.Data1);
     if (guidService == IID_IInternetHostSecurityManager)
         return QueryInterface(riid, ppv);
+
+    // SID_SContainerDispatch: provide the document's script window dispatch.
+    // Flash uses this to check ExternalInterface.available — without it,
+    // Flash never fires FlashCall events and ExternalInterface is dead.
+    if (guidService == SID_SContainerDispatch && m_pBrowserHost) {
+        IWebBrowser2* pWB = m_pBrowserHost->GetWebBrowser();
+        if (pWB) {
+            IDispatch* pDocDisp = nullptr;
+            pWB->get_Document(&pDocDisp);
+            if (pDocDisp) {
+                IHTMLDocument2* pDoc = nullptr;
+                pDocDisp->QueryInterface(IID_IHTMLDocument2, reinterpret_cast<void**>(&pDoc));
+                pDocDisp->Release();
+                if (pDoc) {
+                    IHTMLWindow2* pWin = nullptr;
+                    pDoc->get_parentWindow(&pWin);
+                    pDoc->Release();
+                    if (pWin) {
+                        HRESULT hr = pWin->QueryInterface(riid, ppv);
+                        pWin->Release();
+                        DbgTrace(L"[FlashIE] SID_SContainerDispatch -> hr=0x%08X\n", hr);
+                        return hr;
+                    }
+                }
+            }
+        }
+    }
+
     *ppv = nullptr;
     return E_NOINTERFACE;
 }

@@ -310,6 +310,28 @@ static int InsnLength(const BYTE* code)
         case 0x25: case 0x2D: case 0x35: case 0x3D:
             return static_cast<int>(p - code) + 4;
 
+        // PUSH imm8 / PUSH imm32
+        case 0x6A:
+            return static_cast<int>(p - code) + 1;
+        case 0x68:
+            return static_cast<int>(p - code) + 4;
+
+        // CALL rel32 / JMP rel32
+        case 0xE8: case 0xE9:
+            return static_cast<int>(p - code) + 4;
+
+        // JMP rel8
+        case 0xEB:
+            return static_cast<int>(p - code) + 1;
+
+        // MOV eax,moffs32 / MOV moffs32,eax
+        case 0xA1: case 0xA3:
+#ifdef _WIN64
+            return static_cast<int>(p - code) + 8;
+#else
+            return static_cast<int>(p - code) + 4;
+#endif
+
         default:
             return 0;
         }
