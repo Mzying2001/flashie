@@ -30,46 +30,99 @@ IClassFactory* FlashLoader::s_pFlashFactory = nullptr;
 
 // =====================================================================
 // Section 2: Function Pointer Typedefs
+//
+// Original function signatures for hooked APIs. Each typedef
+// corresponds to a trampoline used to call the real implementation.
 // =====================================================================
 
-typedef HRESULT (STDAPICALLTYPE *FN_DllGetClassObject)(REFCLSID, REFIID, LPVOID*);
+// --- COM / OLE ---
+
+typedef HRESULT (STDAPICALLTYPE *FN_DllGetClassObject)(
+    REFCLSID rclsid, REFIID riid, LPVOID* ppv);
+
 typedef HRESULT (STDAPICALLTYPE *FN_CoGetClassObject)(
-    REFCLSID, DWORD, LPVOID, REFIID, LPVOID*);
+    REFCLSID rclsid, DWORD dwClsContext, LPVOID pvReserved,
+    REFIID riid, LPVOID* ppv);
+
 typedef HRESULT (STDAPICALLTYPE *FN_CoCreateInstance)(
-    REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
-typedef LSTATUS (WINAPI *FN_RegOpenKeyExW)(
-    HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
-typedef LSTATUS (WINAPI *FN_RegQueryValueExW)(
-    HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY);
+    REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext,
+    REFIID riid, LPVOID* ppv);
+
 typedef HRESULT (STDAPICALLTYPE *FN_CoGetClassObjectFromURL)(
-    REFCLSID, LPCWSTR, DWORD, DWORD, LPCWSTR, LPBINDCTX,
-    DWORD, LPVOID, REFIID, LPVOID*);
+    REFCLSID rclsid, LPCWSTR szCodeURL,
+    DWORD dwFileVersionMS, DWORD dwFileVersionLS,
+    LPCWSTR szContentType, LPBINDCTX pBindCtx,
+    DWORD dwClsContext, LPVOID pvReserved,
+    REFIID riid, LPVOID* ppv);
+
 typedef HRESULT (STDAPICALLTYPE *FN_CoInternetIsFeatureEnabled)(
-    DWORD, DWORD);
-typedef void (WINAPI *FN_GetLocalTime)(LPSYSTEMTIME);
-typedef void (WINAPI *FN_GetSystemTime)(LPSYSTEMTIME);
-typedef void (WINAPI *FN_GetSystemTimeAsFileTime)(LPFILETIME);
+    DWORD dwFeature, DWORD dwFlags);
+
+typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(
+    LPCOLESTR lpszProgID, LPCLSID lpclsid);
+
+// --- Registry ---
+
+typedef LSTATUS (WINAPI *FN_RegOpenKeyExW)(
+    HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions,
+    REGSAM samDesired, PHKEY phkResult);
+
+typedef LSTATUS (WINAPI *FN_RegQueryValueExW)(
+    HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved,
+    LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+
+typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
+
+// --- Time ---
+
+typedef void (WINAPI *FN_GetLocalTime)(LPSYSTEMTIME lpSystemTime);
+typedef void (WINAPI *FN_GetSystemTime)(LPSYSTEMTIME lpSystemTime);
+typedef void (WINAPI *FN_GetSystemTimeAsFileTime)(LPFILETIME lpFileTime);
+
+// --- Windows Lockdown Policy (WLDP) ---
+
 typedef HRESULT (WINAPI *FN_WldpIsClassInApprovedList)(
-    const CLSID*, void*, BOOL*, DWORD);
+    const CLSID* classID, void* hostInfo, BOOL* isApproved, DWORD optionalFlags);
+
 typedef HRESULT (WINAPI *FN_WldpQueryDynamicCodeTrust)(
-    HANDLE, void*, DWORD);
+    HANDLE fileHandle, void* baseImage, DWORD imageSize);
+
+// --- TypeLib ---
+
 typedef HRESULT (WINAPI *FN_LoadRegTypeLib)(
-    REFGUID rguid, WORD wVerMajor, WORD wVerMinor, LCID lcid, ITypeLib** pptlib);
+    REFGUID rguid, WORD wVerMajor, WORD wVerMinor,
+    LCID lcid, ITypeLib** pptlib);
+
 typedef HRESULT (WINAPI *FN_LoadTypeLibEx)(
     LPCOLESTR szFile, REGKIND regkind, ITypeLib** pptlib);
+
+// --- File System ---
+
 typedef HANDLE (WINAPI *FN_CreateFileW)(
-    LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-typedef BOOL (WINAPI *FN_CreateDirectoryW)(LPCWSTR, LPSECURITY_ATTRIBUTES);
-typedef DWORD (WINAPI *FN_GetFileAttributesW)(LPCWSTR);
-typedef BOOL (WINAPI *FN_MoveFileW)(LPCWSTR, LPCWSTR);
-typedef BOOL (WINAPI *FN_MoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
-typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR);
-typedef HANDLE (WINAPI *FN_FindFirstFileW)(LPCWSTR, LPWIN32_FIND_DATAW);
-typedef BOOL (WINAPI *FN_SetFileAttributesW)(LPCWSTR, DWORD);
-typedef BOOL (WINAPI *FN_FindNextFileW)(HANDLE, LPWIN32_FIND_DATAW);
-typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(LPCOLESTR, LPCLSID);
-typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(void*, REFIID, void**);
+    LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+
+typedef BOOL  (WINAPI *FN_CreateDirectoryW)(
+    LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+
+typedef DWORD (WINAPI *FN_GetFileAttributesW)(LPCWSTR lpFileName);
+
+typedef HANDLE (WINAPI *FN_FindFirstFileW)(
+    LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData);
+
+typedef BOOL (WINAPI *FN_MoveFileW)(
+    LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName);
+
+typedef BOOL (WINAPI *FN_MoveFileExW)(
+    LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
+
+typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
+
+// --- Flash object vtable ---
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(
+    void* pThis, REFIID riid, void** ppv);
 
 // =====================================================================
 // Section 3: Instruction Length Decoder
