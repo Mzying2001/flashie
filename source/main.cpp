@@ -158,7 +158,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     // Must be after OleInitialize (COM needs to be initialized).
     if (!g_flashLoader.Activate()) {
         MessageBoxW(nullptr, L"Failed to load Flash.ocx.\n"
-                    L"Ensure Flash.ocx is in the application directory.",
+                    L"Ensure Flash.ocx is in the Flash subdirectory.",
                     L"FlashIE", MB_ICONWARNING);
     }
 

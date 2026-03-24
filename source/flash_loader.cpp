@@ -1602,8 +1602,8 @@ bool FlashLoader::Activate()
     GetModuleFileNameW(nullptr, szDir, MAX_PATH);
     PathRemoveFileSpecW(szDir);
 
-    PathCombineW(g_szOcxPath, szDir, L"Flash.ocx");
-    PathCombineW(g_szMmsCfgPath, szDir, L"mms.cfg");
+    PathCombineW(g_szOcxPath, szDir, L"Flash\\Flash.ocx");
+    PathCombineW(g_szMmsCfgPath, szDir, L"Flash\\mms.cfg");
 
     // Set up local FlashData directory to redirect Flash Player's
     // %APPDATA%\Macromedia\Flash Player writes (LSOs, settings, etc.)
@@ -1639,8 +1639,10 @@ bool FlashLoader::Activate()
     DbgTrace(L"[FlashIE] FlashData dir: %s\n", g_szFlashDataDir);
     DbgTrace(L"[FlashIE] Roaming Flash dir: %s (len=%d)\n", g_szRoamingFlashDir, g_roamingFlashDirLen);
 
-    // Ensure Flash.ocx's dependencies resolve from the exe directory
-    SetDllDirectoryW(szDir);
+    // Ensure Flash.ocx's dependencies resolve from the Flash subdirectory
+    WCHAR szFlashDir[MAX_PATH];
+    PathCombineW(szFlashDir, szDir, L"Flash");
+    SetDllDirectoryW(szFlashDir);
 
     m_hModule = LoadLibraryW(g_szOcxPath);
 

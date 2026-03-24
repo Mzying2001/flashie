@@ -41,15 +41,19 @@ endif()
 
 if(EXISTS "${FLASH_OCX_SOURCE}")
     add_custom_command(TARGET flashie POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:flashie>/Flash"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${FLASH_OCX_SOURCE}"
-            "$<TARGET_FILE_DIR:flashie>/Flash.ocx"
+            "$<TARGET_FILE_DIR:flashie>/Flash/Flash.ocx"
     )
 endif()
 
-# Copy mms.cfg to output directory (Flash EOL bypass config)
+# Copy mms.cfg to Flash subdirectory (Flash EOL bypass config)
 add_custom_command(TARGET flashie POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:flashie>/Flash"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/assets/mms.cfg"
-        "$<TARGET_FILE_DIR:flashie>/mms.cfg"
+        "$<TARGET_FILE_DIR:flashie>/Flash/mms.cfg"
 )
