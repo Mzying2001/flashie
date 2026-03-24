@@ -642,6 +642,97 @@ public:
 };
 
 // =====================================================================
+// PropertyBagWrapper: wraps MSHTML's IPropertyBag to force
+// allowScriptAccess="always" so ExternalInterface works cross-domain.
+// =====================================================================
+class PropertyBagWrapper : public IPropertyBag {
+    IPropertyBag* m_pReal;
+    LONG m_ref;
+public:
+    explicit PropertyBagWrapper(IPropertyBag* pReal) : m_pReal(pReal), m_ref(1) {
+        m_pReal->AddRef();
+    }
+    ~PropertyBagWrapper() { m_pReal->Release(); }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IPropertyBag) {
+            *ppv = static_cast<IPropertyBag*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_ref); }
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG ref = InterlockedDecrement(&m_ref);
+        if (ref == 0) delete this;
+        return ref;
+    }
+
+    STDMETHODIMP Read(LPCOLESTR pszPropName, VARIANT* pVar, IErrorLog* pLog) override {
+        if (pszPropName && _wcsicmp(pszPropName, L"allowScriptAccess") == 0) {
+            VariantInit(pVar);
+            pVar->vt = VT_BSTR;
+            pVar->bstrVal = SysAllocString(L"always");
+            return S_OK;
+        }
+        return m_pReal->Read(pszPropName, pVar, pLog);
+    }
+
+    STDMETHODIMP Write(LPCOLESTR pszPropName, VARIANT* pVar) override {
+        return m_pReal->Write(pszPropName, pVar);
+    }
+};
+
+// =====================================================================
+// FlashPersistPBagTearoff: wraps Flash's IPersistPropertyBag to inject
+// allowScriptAccess="always" during Load.
+// =====================================================================
+class FlashPersistPBagTearoff : public IPersistPropertyBag {
+    IUnknown* m_pFlash;
+    IPersistPropertyBag* m_pReal;
+public:
+    FlashPersistPBagTearoff(IUnknown* pFlash, IPersistPropertyBag* pReal)
+        : m_pFlash(pFlash), m_pReal(pReal) {}
+    ~FlashPersistPBagTearoff() {
+        if (m_pReal) m_pReal->Release();
+        if (m_pFlash) m_pFlash->Release();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IPersistPropertyBag || riid == IID_IPersist) {
+            *ppv = static_cast<IPersistPropertyBag*>(this);
+            m_pFlash->AddRef();
+            return S_OK;
+        }
+        return m_pFlash->QueryInterface(riid, ppv);
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG ref = m_pFlash->Release();
+        if (ref == 0) delete this;
+        return ref;
+    }
+
+    STDMETHODIMP GetClassID(CLSID* pClassID) override {
+        return m_pReal->GetClassID(pClassID);
+    }
+    STDMETHODIMP InitNew() override { return m_pReal->InitNew(); }
+
+    STDMETHODIMP Load(IPropertyBag* pBag, IErrorLog* pLog) override {
+        auto* wrapper = new PropertyBagWrapper(pBag);
+        HRESULT hr = m_pReal->Load(wrapper, pLog);
+        wrapper->Release();
+        return hr;
+    }
+
+    STDMETHODIMP Save(IPropertyBag* pBag, BOOL fClearDirty, BOOL fSaveAll) override {
+        return m_pReal->Save(pBag, fClearDirty, fSaveAll);
+    }
+};
+
+// =====================================================================
 // Section 7: Shared Static State
 // =====================================================================
 
@@ -1256,8 +1347,9 @@ static void WINAPI Hooked_GetSystemTimeAsFileTime(LPFILETIME lpFileTime)
 
 static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void** ppv)
 {
+    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hooks[HK_FlashQI].pTrampoline);
+
     if (IsEqualIID(riid, IID_IObjectSafety)) {
-        auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hooks[HK_FlashQI].pTrampoline);
         IUnknown* pFlashUnk = nullptr;
         origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
         if (pFlashUnk) {
@@ -1266,7 +1358,23 @@ static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void**
             return S_OK;
         }
     }
-    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hooks[HK_FlashQI].pTrampoline);
+
+    if (IsEqualIID(riid, IID_IPersistPropertyBag)) {
+        IPersistPropertyBag* pReal = nullptr;
+        HRESULT hr = origQI(pThis, riid, reinterpret_cast<void**>(&pReal));
+        if (SUCCEEDED(hr) && pReal) {
+            IUnknown* pFlashUnk = nullptr;
+            origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
+            if (pFlashUnk) {
+                *ppv = static_cast<IPersistPropertyBag*>(
+                    new FlashPersistPBagTearoff(pFlashUnk, pReal));
+                return S_OK;
+            }
+            pReal->Release();
+        }
+        return hr;
+    }
+
     return origQI(pThis, riid, ppv);
 }
 
