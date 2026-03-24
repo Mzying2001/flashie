@@ -64,9 +64,6 @@ private:
     static HRESULT STDAPICALLTYPE Hooked_CoInternetIsFeatureEnabled(
         DWORD dwFeature, DWORD dwFlags);
 
-    static void WINAPI Hooked_GetLocalTime(LPSYSTEMTIME lpSystemTime);
-    static void WINAPI Hooked_GetSystemTime(LPSYSTEMTIME lpSystemTime);
-
     static HRESULT WINAPI Hooked_WldpIsClassInApprovedList(
         const CLSID* classID, /*PWLDP_HOST_INFORMATION*/ void* hostInfo,
         BOOL* isApproved, DWORD optionalFlags);

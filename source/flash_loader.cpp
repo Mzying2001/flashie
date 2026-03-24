@@ -8,7 +8,6 @@
 #include <shlobj.h>      // SHGetFolderPathW, CSIDL_APPDATA
 #include <stdint.h>
 #include <string.h>
-#include <intrin.h>
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
@@ -72,12 +71,6 @@ typedef LSTATUS (WINAPI *FN_RegQueryValueExW)(
     LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
 
 typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
-
-// --- Time ---
-
-typedef void (WINAPI *FN_GetLocalTime)(LPSYSTEMTIME lpSystemTime);
-typedef void (WINAPI *FN_GetSystemTime)(LPSYSTEMTIME lpSystemTime);
-typedef void (WINAPI *FN_GetSystemTimeAsFileTime)(LPFILETIME lpFileTime);
 
 // --- Windows Lockdown Policy (WLDP) ---
 
@@ -317,9 +310,6 @@ enum HookId {
     HK_RegCloseKey,
     HK_CoGetClassObjectFromURL,
     HK_CoInternetIsFeatureEnabled,
-    HK_GetLocalTime,
-    HK_GetSystemTime,
-    HK_GetSystemTimeAsFileTime,
     HK_WldpIsClassInApprovedList,
     HK_WldpQueryDynamicCodeTrust,
     HK_LoadRegTypeLib,
@@ -756,10 +746,6 @@ static wchar_t g_szRoamingFlashDir[MAX_PATH] = {};   // %APPDATA%\Macromedia\Fla
 static int g_roamingFlashDirLen = 0;
 static wchar_t g_szRoamingAdobeDir[MAX_PATH] = {};   // %APPDATA%\Adobe\Flash Player
 static int g_roamingAdobeDirLen = 0;
-
-// Cached Flash.ocx address range for fast caller check
-static BYTE* s_flashBase = nullptr;
-static DWORD s_flashSize = 0;
 
 // Forward declaration
 static void NeutralizeFlashBlock();
@@ -1269,73 +1255,6 @@ HRESULT WINAPI FlashLoader::Hooked_WldpQueryDynamicCodeTrust(
 {
     DbgTrace(L"[FlashIE] WldpQueryDynamicCodeTrust -> S_OK (trusted)\n");
     return S_OK;
-}
-
-// =====================================================================
-// Section 8d: Time Hooks
-//
-// Bypass Flash.ocx EOL kill switch. Flash Player 32.0.0.465 has a
-// hardcoded date check: after January 12, 2021, Flash refuses to play
-// ANY content. We spoof a pre-EOL date when called from Flash.ocx.
-// =====================================================================
-
-static void CacheFlashModuleRange(HMODULE hFlash)
-{
-    if (!hFlash) return;
-    auto pDos = reinterpret_cast<PIMAGE_DOS_HEADER>(hFlash);
-    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    auto pNT = reinterpret_cast<PIMAGE_NT_HEADERS>(
-        reinterpret_cast<BYTE*>(hFlash) + pDos->e_lfanew);
-    if (pNT->Signature != IMAGE_NT_SIGNATURE) return;
-    s_flashBase = reinterpret_cast<BYTE*>(hFlash);
-    s_flashSize = pNT->OptionalHeader.SizeOfImage;
-}
-
-static __forceinline bool IsCallerInFlash(void* retAddr)
-{
-    if (!s_flashBase) return false;
-    BYTE* addr = reinterpret_cast<BYTE*>(retAddr);
-    return (addr >= s_flashBase && static_cast<DWORD>(addr - s_flashBase) < s_flashSize);
-}
-
-void WINAPI FlashLoader::Hooked_GetLocalTime(LPSYSTEMTIME lpSystemTime)
-{
-    reinterpret_cast<FN_GetLocalTime>(s_hooks[HK_GetLocalTime].pTrampoline)(lpSystemTime);
-    if (IsCallerInFlash(_ReturnAddress())) {
-        static int s_gltCount = 0;
-        if (s_gltCount++ < 3)
-            DbgTrace(L"[FlashIE] GetLocalTime from Flash -> spoofing to 2020-12-01 (call #%d)\n", s_gltCount);
-        lpSystemTime->wYear = 2020;
-        lpSystemTime->wMonth = 12;
-        lpSystemTime->wDay = 1;
-    }
-}
-
-void WINAPI FlashLoader::Hooked_GetSystemTime(LPSYSTEMTIME lpSystemTime)
-{
-    reinterpret_cast<FN_GetSystemTime>(s_hooks[HK_GetSystemTime].pTrampoline)(lpSystemTime);
-    if (IsCallerInFlash(_ReturnAddress())) {
-        static int s_gstCount = 0;
-        if (s_gstCount++ < 3)
-            DbgTrace(L"[FlashIE] GetSystemTime from Flash -> spoofing to 2020-12-01 (call #%d)\n", s_gstCount);
-        lpSystemTime->wYear = 2020;
-        lpSystemTime->wMonth = 12;
-        lpSystemTime->wDay = 1;
-    }
-}
-
-static void WINAPI Hooked_GetSystemTimeAsFileTime(LPFILETIME lpFileTime)
-{
-    reinterpret_cast<FN_GetSystemTimeAsFileTime>(
-        s_hooks[HK_GetSystemTimeAsFileTime].pTrampoline)(lpFileTime);
-    if (IsCallerInFlash(_ReturnAddress())) {
-        SYSTEMTIME st = {};
-        st.wYear = 2020; st.wMonth = 12; st.wDay = 1;
-        FILETIME ft;
-        SystemTimeToFileTime(&st, &ft);
-        *lpFileTime = ft;
-        DbgTrace(L"[FlashIE] GetSystemTimeAsFileTime from Flash -> spoofing to 2020-12-01\n");
-    }
 }
 
 // =====================================================================
@@ -1855,50 +1774,16 @@ bool FlashLoader::Activate()
     // Ensure Flash.ocx's dependencies resolve from the exe directory
     SetDllDirectoryW(szDir);
 
-    // Install time hooks BEFORE loading Flash.ocx so the EOL kill switch
-    // in DllMain (if any) sees a pre-2021 date. We set the Flash module
-    // range to cover the entire address space temporarily, then narrow it
-    // after loading.
-    {
-        HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
-        HMODULE hKB = GetModuleHandleW(L"kernelbase.dll");
-        void* pGLT = hK32 ? reinterpret_cast<void*>(GetProcAddress(hK32, "GetLocalTime")) : nullptr;
-        if (!pGLT && hKB) pGLT = reinterpret_cast<void*>(GetProcAddress(hKB, "GetLocalTime"));
-        void* pGST = hK32 ? reinterpret_cast<void*>(GetProcAddress(hK32, "GetSystemTime")) : nullptr;
-        if (!pGST && hKB) pGST = reinterpret_cast<void*>(GetProcAddress(hKB, "GetSystemTime"));
-
-        // Temporarily make IsCallerInFlash() match ALL callers
-        // (We don't know Flash.ocx's base address yet)
-        // Use 0xFFFFFFFE to avoid 32-bit pointer overflow (1 + 0xFFFFFFFF wraps to 0)
-        s_flashBase = reinterpret_cast<BYTE*>(static_cast<uintptr_t>(1));
-        s_flashSize = 0xFFFFFFFE;
-
-        void* pGSTAFT = hK32 ? reinterpret_cast<void*>(GetProcAddress(hK32, "GetSystemTimeAsFileTime")) : nullptr;
-        if (!pGSTAFT && hKB) pGSTAFT = reinterpret_cast<void*>(GetProcAddress(hKB, "GetSystemTimeAsFileTime"));
-
-        if (pGLT) InstallDetour(pGLT, reinterpret_cast<void*>(&Hooked_GetLocalTime), s_hooks[HK_GetLocalTime]);
-        if (pGST) InstallDetour(pGST, reinterpret_cast<void*>(&Hooked_GetSystemTime), s_hooks[HK_GetSystemTime]);
-        if (pGSTAFT) InstallDetour(pGSTAFT, reinterpret_cast<void*>(&Hooked_GetSystemTimeAsFileTime), s_hooks[HK_GetSystemTimeAsFileTime]);
-    }
-
     m_hModule = LoadLibraryW(g_szOcxPath);
 
     // Pin Flash.ocx in memory — prevent COM from unloading it when all
-    // Flash objects are released.  Our hooks (time spoofing, factory
-    // pointers) reference Flash.ocx code/data for the process lifetime.
+    // Flash objects are released.  Our hooks (factory pointers, etc.)
+    // reference Flash.ocx code/data for the process lifetime.
     if (m_hModule) {
         HMODULE hPinned = nullptr;
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_PIN,
             g_szOcxPath, &hPinned);
-    }
-
-    // Now narrow the time hooks to only affect Flash.ocx callers
-    if (m_hModule) {
-        CacheFlashModuleRange(m_hModule);
-    } else {
-        s_flashBase = nullptr;
-        s_flashSize = 0;
     }
 
     if (!m_hModule) {
@@ -2046,11 +1931,6 @@ void FlashLoader::InstallHooks()
     ResolveAndHook("DeleteFileW", L"DeleteFileW",
         reinterpret_cast<void*>(&Hooked_DeleteFileW), s_hooks[HK_DeleteFileW],
         hKernelBase, hK32);
-
-    // Time hooks — already installed in Activate() (before Flash.ocx loads)
-    DbgTrace(L"[FlashIE] Hook GetLocalTime: %s\n", s_hooks[HK_GetLocalTime].active ? L"OK (early)" : L"FAIL");
-    DbgTrace(L"[FlashIE] Hook GetSystemTime: %s\n", s_hooks[HK_GetSystemTime].active ? L"OK (early)" : L"FAIL");
-    DbgTrace(L"[FlashIE] Hook GetSystemTimeAsFileTime: %s\n", s_hooks[HK_GetSystemTimeAsFileTime].active ? L"OK (early)" : L"FAIL");
 
     m_hooked = true;
 }
