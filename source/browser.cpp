@@ -1,10 +1,4 @@
 #include "browser.h"
-#include "debug.h"
-#include <mshtml.h>
-
-// {86D52E11-94A8-11d0-82AF-00C04FD5AE38}
-static const GUID SID_SContainerDispatch =
-    {0x86D52E11, 0x94A8, 0x11d0, {0x82, 0xAF, 0x00, 0xC0, 0x4F, 0xD5, 0xAE, 0x38}};
 
 // ===============================================================
 // COleClientSite
@@ -139,10 +133,6 @@ STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IDocHostUIHandler*>(this);
     } else if (riid == IID_IDispatch || riid == DIID_DWebBrowserEvents2) {
         *ppv = static_cast<IDispatch*>(this);
-    } else if (riid == IID_IServiceProvider) {
-        *ppv = static_cast<IServiceProvider*>(this);
-    } else if (riid == IID_IInternetHostSecurityManager) {
-        *ppv = static_cast<IInternetHostSecurityManager*>(this);
     } else {
         *ppv = nullptr;
         return E_NOINTERFACE;
@@ -249,91 +239,10 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         return S_OK;
     }
 
-    case DISPID_BEFORENAVIGATE2: {
-        // Block Flash-detection redirects that replace game iframes with
-        // "install Flash" pages (e.g. 4399's noInstallFlashIE.html).
-        if (pDispParams->cArgs >= 7) {
-            VARIANT* pURL = &pDispParams->rgvarg[5];
-            if (pURL->vt == (VT_VARIANT | VT_BYREF))
-                pURL = pURL->pvarVal;
-            if (pURL && pURL->vt == VT_BSTR && pURL->bstrVal) {
-                if (wcsstr(pURL->bstrVal, L"noInstallFlash") ||
-                    wcsstr(pURL->bstrVal, L"blockflashtip")) {
-                    VARIANT* pCancel = &pDispParams->rgvarg[0];
-                    if (pCancel->vt == (VT_BOOL | VT_BYREF))
-                        *pCancel->pboolVal = VARIANT_TRUE;
-                    DbgTrace(L"[FlashIE] BLOCKED Flash-block redirect: %s\n",
-                             pURL->bstrVal);
-                }
-            }
-        }
-        return S_OK;
-    }
-
     default:
         break;
     }
     return DISP_E_MEMBERNOTFOUND;
-}
-
-// IServiceProvider
-STDMETHODIMP COleSite::QueryService(REFGUID guidService, REFIID riid, void** ppv)
-{
-    DbgTrace(L"[FlashIE] COleSite::QueryService srv={%08X-...} riid={%08X-...}\n",
-             guidService.Data1, riid.Data1);
-    if (guidService == IID_IInternetHostSecurityManager)
-        return QueryInterface(riid, ppv);
-
-    // SID_SContainerDispatch: provide the document's script window dispatch.
-    // Flash uses this to check ExternalInterface.available — without it,
-    // Flash never fires FlashCall events and ExternalInterface is dead.
-    if (guidService == SID_SContainerDispatch && m_pBrowserHost) {
-        IWebBrowser2* pWB = m_pBrowserHost->GetWebBrowser();
-        if (pWB) {
-            IDispatch* pDocDisp = nullptr;
-            pWB->get_Document(&pDocDisp);
-            if (pDocDisp) {
-                IHTMLDocument2* pDoc = nullptr;
-                pDocDisp->QueryInterface(IID_IHTMLDocument2, reinterpret_cast<void**>(&pDoc));
-                pDocDisp->Release();
-                if (pDoc) {
-                    IHTMLWindow2* pWin = nullptr;
-                    pDoc->get_parentWindow(&pWin);
-                    pDoc->Release();
-                    if (pWin) {
-                        HRESULT hr = pWin->QueryInterface(riid, ppv);
-                        pWin->Release();
-                        DbgTrace(L"[FlashIE] SID_SContainerDispatch -> hr=0x%08X\n", hr);
-                        return hr;
-                    }
-                }
-            }
-        }
-    }
-
-    *ppv = nullptr;
-    return E_NOINTERFACE;
-}
-
-// IInternetHostSecurityManager
-STDMETHODIMP COleSite::GetSecurityId(BYTE*, DWORD* pcbSecurityId, DWORD_PTR)
-{
-    if (pcbSecurityId) *pcbSecurityId = 0;
-    return S_OK;
-}
-
-STDMETHODIMP COleSite::ProcessUrlAction(DWORD dwAction, BYTE* pPolicy, DWORD cbPolicy,
-                                         BYTE*, DWORD, DWORD, DWORD)
-{
-    DbgTrace(L"[FlashIE] COleSite::ProcessUrlAction action=0x%X\n", dwAction);
-    if (pPolicy && cbPolicy >= sizeof(DWORD))
-        *(DWORD*)pPolicy = URLPOLICY_ALLOW;
-    return S_OK;
-}
-
-STDMETHODIMP COleSite::QueryCustomPolicy(REFGUID, BYTE**, DWORD*, BYTE*, DWORD, DWORD)
-{
-    return INET_E_DEFAULT_ACTION;
 }
 
 // ===============================================================

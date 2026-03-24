@@ -6,8 +6,6 @@
 #include <exdisp.h>
 #include <exdispid.h>
 #include <mshtmhst.h>
-#include <urlmon.h>
-#include <servprov.h>
 
 class COleSite;
 class BrowserHost;
@@ -89,9 +87,7 @@ private:
 // COleSite - main COM identity
 // ---------------------------------------------------------------
 class COleSite : public IDocHostUIHandler,
-                 public IDispatch,
-                 public IServiceProvider,
-                 public IInternetHostSecurityManager
+                 public IDispatch
 {
     friend class COleClientSite;
     friend class COleInPlaceSite;
@@ -132,15 +128,6 @@ public:
     STDMETHODIMP Invoke(DISPID, REFIID, LCID, WORD, DISPPARAMS*,
                         VARIANT*, EXCEPINFO*, UINT*) override;
 
-    // IServiceProvider
-    STDMETHODIMP QueryService(REFGUID guidService, REFIID riid, void** ppv) override;
-
-    // IInternetHostSecurityManager
-    STDMETHODIMP GetSecurityId(BYTE* pbSecurityId, DWORD* pcbSecurityId, DWORD_PTR dwReserved) override;
-    STDMETHODIMP ProcessUrlAction(DWORD dwAction, BYTE* pPolicy, DWORD cbPolicy,
-                                   BYTE* pContext, DWORD cbContext, DWORD dwFlags, DWORD dwReserved) override;
-    STDMETHODIMP QueryCustomPolicy(REFGUID guidKey, BYTE** ppPolicy, DWORD* pcbPolicy,
-                                    BYTE* pContext, DWORD cbContext, DWORD dwReserved) override;
 
 private:
     ULONG              m_ref = 1;
