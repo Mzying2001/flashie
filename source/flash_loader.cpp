@@ -20,9 +20,8 @@ static const CLSID CLSID_ShockwaveFlash =
 static const GUID GUID_FlashTypeLib =
     {0xD27CDB6B, 0xAE6D, 0x11CF, {0x96, 0xB8, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
 
-// Flash CLSID string forms for comparisons
+// Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
-static const wchar_t FLASH_CLSID_UPPER[] = L"D27CDB6E-AE6D-11CF-96B8-444553540000";
 
 // Static member
 IClassFactory* FlashLoader::s_pFlashFactory = nullptr;
@@ -524,8 +523,8 @@ static void CloseFakeKey(HKEY hKey)
 //
 // FlashSafetyTearoff: IObjectSafety tearoff for Flash objects.
 //   MSHTML checks IObjectSafety on ActiveX controls before allowing
-//   JavaScript to access their IDispatch. Flash's EOL build removed
-//   IObjectSafety entirely, so MSHTML blocks IDispatch delegation.
+//   JavaScript to access their IDispatch. Flash.ocx does not expose
+//   IObjectSafety, so we inject it via a QI hook.
 // =====================================================================
 
 // Forward declaration: installs IObjectSafety hook on Flash's QueryInterface
@@ -747,9 +746,6 @@ static int g_roamingFlashDirLen = 0;
 static wchar_t g_szRoamingAdobeDir[MAX_PATH] = {};   // %APPDATA%\Adobe\Flash Player
 static int g_roamingAdobeDirLen = 0;
 
-// Forward declaration
-static void NeutralizeFlashBlock();
-
 // =====================================================================
 // Section 8a: COM Hooks
 // =====================================================================
@@ -942,7 +938,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             if (wcsstr(lpSubKey, L"ActiveX Compatibility") ||
                 wcsstr(lpSubKey, L"Extension Compatibility")) {
                 DbgTrace(L"[FlashIE] RegOpenKeyExW BLOCKED (kill bit): %s\n", lpSubKey);
-                LazyPatchModules();
                 return ERROR_FILE_NOT_FOUND;
             }
         }
@@ -995,7 +990,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             if (SubKeyEndsWith(lpSubKey, FLASH_CLSID_STR) &&
                 (wcsstr(lpSubKey, L"CLSID") || wcsstr(lpSubKey, L"clsid"))) {
                 fkType = FK_CLSID_ROOT; fkName = L"CLSID root";
-                LazyPatchModules();
             } else if (SubKeyEndsWith(lpSubKey, L"InprocServer32") || SubKeyEndsWith(lpSubKey, L"InProcServer32")) {
                 fkType = FK_INPROC; fkName = L"InprocServer32";
             } else if (SubKeyEndsWith(lpSubKey, L"MiscStatus\\1")) {
@@ -1022,10 +1016,9 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             }
         }
 
-        // Any other D27CDB6E path — log and let through (or fake)
+        // Any other D27CDB6E path — log and let through
         if (wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e")) {
             DbgTrace(L"[FlashIE] RegOpenKeyExW ALLOW (Flash): %s\n", lpSubKey);
-            LazyPatchModules();
         }
 
         // ---- Fake MIME type -> CLSID mapping ----
@@ -1220,8 +1213,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoInternetIsFeatureEnabled(
     DWORD dwFeature, DWORD dwFlags)
 {
-    LazyPatchModules();
-
     HRESULT hrOrig = reinterpret_cast<FN_CoInternetIsFeatureEnabled>(
         s_hooks[HK_CoInternetIsFeatureEnabled].pTrampoline)(dwFeature, dwFlags);
 
@@ -1258,10 +1249,12 @@ HRESULT WINAPI FlashLoader::Hooked_WldpQueryDynamicCodeTrust(
 }
 
 // =====================================================================
-// Section 8e: Flash QI Hook
+// Section 8d: Flash QI Hook
 //
-// Intercepts IObjectSafety queries on Flash objects. Flash's EOL build
-// removed IObjectSafety, so MSHTML blocks IDispatch delegation.
+// Intercepts IObjectSafety and IPersistPropertyBag queries on Flash
+// objects. Injects IObjectSafety support (required by MSHTML for
+// scripting access) and wraps IPersistPropertyBag to force
+// allowScriptAccess="always".
 // =====================================================================
 
 static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void** ppv)
@@ -1310,7 +1303,7 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 8f: TypeLib Hook
+// Section 8e: TypeLib Hook
 //
 // Flash.ocx's TypeLib GUID is {D27CDB6B-AE6D-11CF-96B8-444553540000}.
 // Without registry entries, OLEAUT32 can't find it and returns
@@ -1345,7 +1338,7 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 }
 
 // =====================================================================
-// Section 8g: File System Redirect Hooks
+// Section 8f: File System Redirect Hooks
 //
 // Redirects Flash data paths from %APPDATA%\{Macromedia,Adobe}\Flash Player
 // to a local FlashData directory next to the exe. This preserves the
@@ -1600,132 +1593,7 @@ static BOOL WINAPI Hooked_DeleteFileW(LPCWSTR lpFileName)
 }
 
 // =====================================================================
-// Section 9: Memory Patching
-//
-// Neutralize hardcoded Flash CLSID block in IE/MSHTML DLLs.
-// After Microsoft's Flash EOL (July 2021+), mshtml.dll and related
-// DLLs contain a hardcoded list of blocked CLSIDs that includes
-// {D27CDB6E-AE6D-11CF-96B8-444553540000}. MSHTML checks this list
-// AFTER CoGetClassObject returns the factory and discards the result
-// if the CLSID is blocked. We scan these DLLs for the Flash CLSID
-// byte pattern and corrupt each occurrence so the comparison never
-// matches. Our own CLSID constant (in flashie.exe) is unaffected.
-// =====================================================================
-
-static void NeutralizeFlashBlock()
-{
-    // Flash CLSID in GUID memory layout (little-endian struct)
-    static const BYTE flashGuid[16] = {
-        0x6E, 0xDB, 0x7C, 0xD2,  // Data1 = 0xD27CDB6E
-        0x6D, 0xAE,               // Data2 = 0xAE6D
-        0xCF, 0x11,               // Data3 = 0x11CF
-        0x96, 0xB8, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00  // Data4
-    };
-
-    // Full CLSID string form "{d27cdb6e-ae6d-11cf-96b8-444553540000}" (lowercase)
-    static const wchar_t flashFullStr[] = L"{d27cdb6e-ae6d-11cf-96b8-444553540000}";
-    static const int flashFullStrBytes = (int)(wcslen(flashFullStr) * sizeof(wchar_t));
-    // Uppercase variant
-    static const wchar_t flashFullStrUpper[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
-
-    // IE/MSHTML modules that may contain a Flash-blocked CLSID list.
-    // We deliberately skip flashie.exe and Flash.ocx.
-    static const wchar_t* moduleNames[] = {
-        L"mshtml.dll",
-        L"ieframe.dll",
-        L"iertutil.dll",
-        L"urlmon.dll",
-        L"msiso.dll",
-        L"edgehtml.dll",
-        L"wldp.dll",
-    };
-
-    HMODULE hSelf = GetModuleHandleW(nullptr); // our exe
-
-    for (int m = 0; m < _countof(moduleNames); m++) {
-        HMODULE hMod = GetModuleHandleW(moduleNames[m]);
-        if (!hMod || hMod == hSelf) continue;
-
-        auto pDos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
-        if (pDos->e_magic != IMAGE_DOS_SIGNATURE) continue;
-        auto pNT = reinterpret_cast<PIMAGE_NT_HEADERS>(
-            reinterpret_cast<BYTE*>(hMod) + pDos->e_lfanew);
-        if (pNT->Signature != IMAGE_NT_SIGNATURE) continue;
-
-        BYTE* base = reinterpret_cast<BYTE*>(hMod);
-        DWORD imageSize = pNT->OptionalHeader.SizeOfImage;
-        if (imageSize < 16) continue;
-
-        int patchCount = 0;
-        // Scan for binary GUID form
-        for (DWORD off = 0; off <= imageSize - 16; off++) {
-            if (memcmp(base + off, flashGuid, 16) == 0) {
-                DbgTrace(L"[FlashIE] NeutralizeFlashBlock: GUID at offset 0x%X in %s -> patching\n",
-                          off, moduleNames[m]);
-                DWORD oldProt;
-                if (VirtualProtect(base + off, 16, PAGE_READWRITE, &oldProt)) {
-                    base[off] ^= 0x01;
-                    VirtualProtect(base + off, 16, oldProt, &oldProt);
-                    patchCount++;
-                }
-            }
-        }
-        // Scan for wide-string CLSID form (MSHTML may compare strings)
-        static const wchar_t flashStr[] = L"D27CDB6E";
-        static const int flashStrBytes = 8 * sizeof(wchar_t); // 16 bytes
-        for (DWORD off = 0; off <= imageSize - flashStrBytes; off += 2) {
-            if (memcmp(base + off, flashStr, flashStrBytes) == 0) {
-                DWORD oldProt;
-                if (VirtualProtect(base + off, flashStrBytes, PAGE_READWRITE, &oldProt)) {
-                    *reinterpret_cast<wchar_t*>(base + off) = L'X';
-                    VirtualProtect(base + off, flashStrBytes, oldProt, &oldProt);
-                    patchCount++;
-                }
-            }
-        }
-        // Also scan for lowercase variant
-        static const wchar_t flashStrLower[] = L"d27cdb6e";
-        for (DWORD off = 0; off <= imageSize - flashStrBytes; off += 2) {
-            if (memcmp(base + off, flashStrLower, flashStrBytes) == 0) {
-                DWORD oldProt;
-                if (VirtualProtect(base + off, flashStrBytes, PAGE_READWRITE, &oldProt)) {
-                    *reinterpret_cast<wchar_t*>(base + off) = L'x';
-                    VirtualProtect(base + off, flashStrBytes, oldProt, &oldProt);
-                    patchCount++;
-                }
-            }
-        }
-        // Scan for full CLSID string form (e.g. "{d27cdb6e-ae6d-11cf-96b8-444553540000}")
-        if (imageSize >= (DWORD)flashFullStrBytes) {
-            for (DWORD off = 0; off <= imageSize - flashFullStrBytes; off += 2) {
-                if (_wcsnicmp(reinterpret_cast<wchar_t*>(base + off),
-                              flashFullStr, wcslen(flashFullStr)) == 0) {
-                    DWORD oldProt;
-                    if (VirtualProtect(base + off, flashFullStrBytes, PAGE_READWRITE, &oldProt)) {
-                        reinterpret_cast<wchar_t*>(base + off)[1] = L'X';
-                        VirtualProtect(base + off, flashFullStrBytes, oldProt, &oldProt);
-                        patchCount++;
-                    }
-                }
-            }
-        }
-        if (patchCount > 0)
-            DbgTrace(L"[FlashIE] NeutralizeFlashBlock: patched %d instance(s) in %s\n",
-                      patchCount, moduleNames[m]);
-    }
-}
-
-void FlashLoader::LazyPatchModules()
-{
-    static bool s_done = false;
-    if (s_done) return;
-    s_done = true;
-    NeutralizeFlashBlock();
-    DbgTrace(L"[FlashIE] LazyPatchModules: re-ran NeutralizeFlashBlock (mshtml.dll should be loaded now)\n");
-}
-
-// =====================================================================
-// Section 10: Public API (Activate, InstallHooks, Deactivate)
+// Section 9: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
 
 bool FlashLoader::Activate()
@@ -1832,13 +1700,10 @@ void FlashLoader::InstallHooks()
 {
     if (m_hooked || !m_pFactory) return;
 
-    // --- Step 0: Force-load IE DLLs so we can patch and hook them ---
+    // --- Step 1: Force-load IE DLLs so we can hook them ---
     LoadLibraryW(L"mshtml.dll");
     LoadLibraryW(L"urlmon.dll");
     LoadLibraryW(L"ieframe.dll");
-
-    // --- Step 1: Neutralize any hardcoded Flash-blocked CLSID lists ---
-    NeutralizeFlashBlock();
 
     // --- Step 2: Resolve module handles ---
     HMODULE hCombase    = GetModuleHandleW(L"combase.dll");
@@ -1851,7 +1716,7 @@ void FlashLoader::InstallHooks()
     HMODULE hWldp       = GetModuleHandleW(L"wldp.dll");
     if (!hWldp) hWldp   = LoadLibraryW(L"wldp.dll");
 
-    // --- Step 3: Install inline detours ---
+    // --- Step 3: Install inline hooks ---
     // Order: registry hooks first (kill bit bypass), then COM hooks
 
     // Registry hooks

@@ -95,8 +95,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0, TOOLBAR_HEIGHT, rc.right, rc.bottom - TOOLBAR_HEIGHT,
             hwnd, nullptr, hInst, nullptr);
 
-        // Install hooks BEFORE browser creation so NeutralizeFlashBlock patches
-        // mshtml.dll before it initializes (caches navigator.plugins list).
+        // Install hooks BEFORE browser creation so COM/registry/security
+        // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
         g_flashLoader.InstallHooks();
 

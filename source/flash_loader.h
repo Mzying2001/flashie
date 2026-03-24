@@ -14,12 +14,11 @@ public:
     // Must be called AFTER OleInitialize.
     bool Activate();
 
-    // Phase 2: Install inline hooks (detours) on CoGetClassObject,
-    // CoCreateInstance, and RegOpenKeyExW. Unlike IAT patching, inline
-    // hooks patch the function body so ALL callers are intercepted —
-    // including vtable calls, GetProcAddress-resolved calls, and
-    // internal calls within DLLs. Call AFTER the WebBrowser control
-    // is created (so mshtml.dll/urlmon.dll are loaded).
+    // Phase 2: Install inline hooks (detours) on COM, registry,
+    // security, TypeLib, and file system APIs. Force-loads
+    // mshtml.dll/urlmon.dll/ieframe.dll, then patches them.
+    // Call BEFORE browser creation so hooks are in place when
+    // MSHTML initializes.
     void InstallHooks();
 
     // Cleanup. Must be called BEFORE OleUninitialize.
@@ -71,5 +70,4 @@ private:
     static HRESULT WINAPI Hooked_WldpQueryDynamicCodeTrust(
         HANDLE fileHandle, void* baseImage, DWORD imageSize);
 
-    static void LazyPatchModules();
 };
