@@ -319,6 +319,7 @@ enum HookId {
     HK_MoveFileW,
     HK_MoveFileExW,
     HK_DeleteFileW,
+    HK_RemoveDirectoryW,
     HK_CLSIDFromProgID,
     HK_FlashQI,
     HK_COUNT
@@ -1345,6 +1346,18 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 // "zero system pollution" invariant — no writes to %APPDATA%.
 // =====================================================================
 
+// Case-insensitive wide-string substring search (wcsstr equivalent).
+static const wchar_t* wcsistr(const wchar_t* haystack, const wchar_t* needle)
+{
+    if (!*needle) return haystack;
+    size_t needleLen = wcslen(needle);
+    for (; *haystack; haystack++) {
+        if (_wcsnicmp(haystack, needle, needleLen) == 0)
+            return haystack;
+    }
+    return nullptr;
+}
+
 // Check if a path starts with a known Flash roaming dir and redirect
 // it to our local FlashData directory.
 static bool RedirectFlashDataPath(LPCWSTR lpFileName, wchar_t* outBuf, int outBufLen)
@@ -1371,8 +1384,7 @@ static bool RedirectFlashDataPath(LPCWSTR lpFileName, wchar_t* outBuf, int outBu
     }
 
     // Also catch SysWOW64\Macromed\Flash paths (ss.cfg, ss.sgn, etc.)
-    const wchar_t* p = wcsstr(path, L"Macromed\\Flash\\");
-    if (!p) p = wcsstr(path, L"macromed\\Flash\\");
+    const wchar_t* p = wcsistr(path, L"Macromed\\Flash\\");
     if (p) {
         p += 15; // skip "Macromed\Flash\"
         _snwprintf_s(outBuf, outBufLen, _TRUNCATE, L"%s\\%s", g_szFlashDataDir, p);
@@ -1423,7 +1435,7 @@ static HANDLE WINAPI Hooked_CreateFileW(
 
     if (lpFileName) {
         // Redirect mms.cfg reads to our local copy (catches \\?\ prefixed paths too)
-        if (wcsstr(lpFileName, L"mms.cfg") || wcsstr(lpFileName, L"MMS.CFG")) {
+        if (wcsistr(lpFileName, L"mms.cfg")) {
             if (g_szMmsCfgPath[0]) {
                 DbgTrace(L"[FlashIE] CreateFileW: REDIRECTING %s -> %s\n",
                           lpFileName, g_szMmsCfgPath);
@@ -1592,6 +1604,21 @@ static BOOL WINAPI Hooked_DeleteFileW(LPCWSTR lpFileName)
     return orig(lpFileName);
 }
 
+static BOOL WINAPI Hooked_RemoveDirectoryW(LPCWSTR lpPathName)
+{
+    auto orig = reinterpret_cast<decltype(&RemoveDirectoryW)>(
+        s_hooks[HK_RemoveDirectoryW].pTrampoline);
+
+    if (lpPathName) {
+        wchar_t redirected[MAX_PATH];
+        if (RedirectFlashDataPath(lpPathName, redirected, MAX_PATH)) {
+            return orig(redirected);
+        }
+    }
+
+    return orig(lpPathName);
+}
+
 // =====================================================================
 // Section 9: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
@@ -1624,8 +1651,6 @@ bool FlashLoader::Activate()
     {
         wchar_t sub[MAX_PATH];
         PathCombineW(sub, g_szFlashDataDir, L"#SharedObjects");
-        CreateDirectoryW(sub, nullptr);
-        PathCombineW(sub, g_szFlashDataDir, L"#SharedObjects\\FLASHIE");
         CreateDirectoryW(sub, nullptr);
         PathCombineW(sub, g_szFlashDataDir, L"macromedia.com");
         CreateDirectoryW(sub, nullptr);
@@ -1797,6 +1822,10 @@ void FlashLoader::InstallHooks()
 
     ResolveAndHook("DeleteFileW", L"DeleteFileW",
         reinterpret_cast<void*>(&Hooked_DeleteFileW), s_hooks[HK_DeleteFileW],
+        hKernelBase, hK32);
+
+    ResolveAndHook("RemoveDirectoryW", L"RemoveDirectoryW",
+        reinterpret_cast<void*>(&Hooked_RemoveDirectoryW), s_hooks[HK_RemoveDirectoryW],
         hKernelBase, hK32);
 
     m_hooked = true;
