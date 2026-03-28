@@ -15,6 +15,8 @@ add_executable(flashie WIN32
 
 set_target_properties(flashie PROPERTIES OUTPUT_NAME "FlashIE")
 
+target_compile_options(flashie PRIVATE /utf-8)
+
 target_compile_definitions(flashie PRIVATE
     UNICODE
     _UNICODE
