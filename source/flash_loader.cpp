@@ -455,6 +455,7 @@ enum FakeKeyType {
     FK_PROGID_CURVER,    // HKCR\ShockwaveFlash.ShockwaveFlash\CurVer
     FK_INSTALLED_VER,    // HKCR\CLSID\{...}\InstalledVersion
     FK_IMPL_CATEGORY,    // ...\Implemented Categories\{CATID_SafeFor*}
+    FK_FLASHPLAYER_VER,  // HKLM\SOFTWARE\Macromedia\FlashPlayer[ActiveX]
 };
 
 struct FakeKeyEntry {
@@ -1010,8 +1011,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             FakeKeyType fkType = FK_NONE;
             const wchar_t* fkName = nullptr;
 
-            if (SubKeyEndsWith(lpSubKey, FLASH_CLSID_STR) &&
-                (wcsstr(lpSubKey, L"CLSID") || wcsstr(lpSubKey, L"clsid"))) {
+            if (SubKeyEndsWith(lpSubKey, FLASH_CLSID_STR)) {
                 fkType = FK_CLSID_ROOT; fkName = L"CLSID root";
             } else {
                 for (const auto& e : s_clsidSuffixes) {
@@ -1033,6 +1033,11 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
              wcsstr(lpSubKey, L"x-Shockwave-Flash")) &&
             wcsstr(lpSubKey, L"Content Type"))
             return ReturnFakeKey(FK_MIME, phkResult, lpSubKey, L"MIME mapping");
+
+        // ---- Fake Flash Player version info ----
+        // SWFObject and similar JS detection check Macromedia\FlashPlayer registry keys.
+        if (wcsstr(lpSubKey, L"Macromedia\\FlashPlayer") && phkResult)
+            return ReturnFakeKey(FK_FLASHPLAYER_VER, phkResult, lpSubKey, L"FlashPlayer version");
 
         // ---- FEATURE_BROWSER_EMULATION tracking ----
         if (wcsstr(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
@@ -1155,6 +1160,17 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
             }
             if (lpValueName && _wcsicmp(lpValueName, L"Extension") == 0)
                 return FakeRegSz(lpType, lpData, lpcbData, L".swf");
+            return ERROR_FILE_NOT_FOUND;
+
+        case FK_FLASHPLAYER_VER:
+            if (!lpValueName || lpValueName[0] == 0)
+                return FakeRegSz(lpType, lpData, lpcbData, g_szOcxPath);
+            if (_wcsicmp(lpValueName, L"CurrentVersion") == 0)
+                return FakeRegSz(lpType, lpData, lpcbData, L"34.0");
+            if (_wcsicmp(lpValueName, L"Version") == 0)
+                return FakeRegSz(lpType, lpData, lpcbData, L"34.0.0.330");
+            if (_wcsicmp(lpValueName, L"PlayerPath") == 0)
+                return FakeRegSz(lpType, lpData, lpcbData, g_szOcxPath);
             return ERROR_FILE_NOT_FOUND;
 
         default:
