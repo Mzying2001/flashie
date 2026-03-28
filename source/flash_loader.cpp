@@ -553,10 +553,10 @@ public:
         HRESULT hr = m_real->CreateInstance(pUnkOuter, riid, ppv);
         DbgTrace(L"[FlashIE] Factory::CreateInstance -> hr=0x%08X obj=%p\n",
                  hr, (ppv && SUCCEEDED(hr)) ? *ppv : nullptr);
-        // Log QI calls on the created object to see what MSHTML asks for
         if (SUCCEEDED(hr) && ppv && *ppv) {
             IUnknown* pObj = static_cast<IUnknown*>(*ppv);
-            // Probe key interfaces MSHTML needs
+#ifdef _DEBUG
+            // Probe key interfaces to see what MSHTML asks for
             static const struct { IID iid; const wchar_t* name; } probes[] = {
                 { IID_IOleObject, L"IOleObject" },
                 { IID_IViewObject, L"IViewObject" },
@@ -575,6 +575,7 @@ public:
                 DbgTrace(L"[FlashIE] FlashObj::QI %s -> 0x%08X\n", probes[i].name, hrQI);
                 if (pTest) static_cast<IUnknown*>(pTest)->Release();
             }
+#endif
             // Hook Flash's QueryInterface to inject IObjectSafety support
             MaybeHookFlashQI(pObj);
         }
@@ -744,18 +745,24 @@ static int g_roamingAdobeDirLen = 0;
 // Section 8a: COM Hooks
 // =====================================================================
 
+// Return the active Flash class factory (logging wrapper if available).
+static IClassFactory* GetFlashFactory()
+{
+    return s_pLoggingFactory ? static_cast<IClassFactory*>(s_pLoggingFactory)
+                             : FlashLoader::s_pFlashFactory;
+}
+
+static bool IsFlashCLSID(REFCLSID rclsid)
+{
+    return FlashLoader::s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash);
+}
+
 HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObject(
     REFCLSID rclsid, DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash)) {
-        // Return the logging wrapper so we can trace CreateInstance calls
-        if (s_pLoggingFactory) {
-            HRESULT hr = s_pLoggingFactory->QueryInterface(riid, ppv);
-            DbgTrace(L"[FlashIE] CoGetClassObject(Flash) -> hr=0x%08X ppv=%p\n", hr, ppv ? *ppv : nullptr);
-            return hr;
-        }
-        HRESULT hr = s_pFlashFactory->QueryInterface(riid, ppv);
+    if (IsFlashCLSID(rclsid)) {
+        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
         DbgTrace(L"[FlashIE] CoGetClassObject(Flash) -> hr=0x%08X ppv=%p\n", hr, ppv ? *ppv : nullptr);
         return hr;
     }
@@ -769,9 +776,8 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext,
     REFIID riid, LPVOID* ppv)
 {
-    if (s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash)) {
-        IClassFactory* pCF = s_pLoggingFactory ? static_cast<IClassFactory*>(s_pLoggingFactory) : s_pFlashFactory;
-        HRESULT hr = pCF->CreateInstance(pUnkOuter, riid, ppv);
+    if (IsFlashCLSID(rclsid)) {
+        HRESULT hr = GetFlashFactory()->CreateInstance(pUnkOuter, riid, ppv);
         DbgTrace(L"[FlashIE] CoCreateInstance(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
@@ -790,13 +796,8 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObjectFromURL(
     DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash)) {
-        if (s_pLoggingFactory) {
-            HRESULT hr = s_pLoggingFactory->QueryInterface(riid, ppv);
-            DbgTrace(L"[FlashIE] CoGetClassObjectFromURL(Flash) -> hr=0x%08X\n", hr);
-            return hr;
-        }
-        HRESULT hr = s_pFlashFactory->QueryInterface(riid, ppv);
+    if (IsFlashCLSID(rclsid)) {
+        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
         DbgTrace(L"[FlashIE] CoGetClassObjectFromURL(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
@@ -882,6 +883,80 @@ static LSTATUS FakeRegDword(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, DWO
     return ERROR_SUCCESS;
 }
 
+// Table-driven subkey mapping for opens under fake parent keys.
+// parentOnly: if not FK_NONE, only matches when parent has this type.
+struct FakeSubKeyEntry {
+    const wchar_t* name;
+    FakeKeyType type;
+    FakeKeyType parentOnly;
+};
+
+static const FakeSubKeyEntry s_fakeSubKeys[] = {
+    { L"CLSID",                    FK_PROGID_CLSID,  FK_PROGID_ROOT },
+    { L"CurVer",                   FK_PROGID_CURVER,  FK_NONE },
+    { L"InprocServer32",           FK_INPROC,         FK_NONE },
+    { L"InProcServer32",           FK_INPROC,         FK_NONE },
+    { L"MiscStatus\\1",            FK_MISCSTATUS1,    FK_NONE },
+    { L"1",                        FK_MISCSTATUS1,    FK_NONE },
+    { L"MiscStatus",               FK_MISCSTATUS,     FK_NONE },
+    { L"ProgID",                   FK_PROGID,         FK_NONE },
+    { L"TypeLib",                  FK_TYPELIB,        FK_NONE },
+    { L"Control",                  FK_CONTROL,        FK_NONE },
+    { L"Version",                  FK_VERSION,        FK_NONE },
+    { L"VersionIndependentProgID", FK_VERSION,        FK_NONE },
+    { L"InstalledVersion",         FK_INSTALLED_VER,  FK_NONE },
+};
+
+// Table-driven suffix matching for CLSID absolute-path lookups.
+struct ClsidSuffixEntry {
+    const wchar_t* suffix;
+    FakeKeyType type;
+};
+
+static const ClsidSuffixEntry s_clsidSuffixes[] = {
+    { L"InprocServer32",           FK_INPROC },
+    { L"InProcServer32",           FK_INPROC },
+    { L"MiscStatus\\1",            FK_MISCSTATUS1 },
+    { L"MiscStatus",               FK_MISCSTATUS },
+    { L"ProgID",                   FK_PROGID },
+    { L"TypeLib",                  FK_TYPELIB },
+    { L"Control",                  FK_CONTROL },
+    { L"Version",                  FK_VERSION },
+    { L"VersionIndependentProgID", FK_VERSION },
+};
+
+// Helper: allocate fake key, set output, log, and return ERROR_SUCCESS.
+static LSTATUS ReturnFakeKey(FakeKeyType type, PHKEY phkResult,
+                             LPCWSTR lpSubKey, const wchar_t* desc)
+{
+    HKEY h = AllocFakeKey(type);
+    if (h && phkResult) {
+        *phkResult = h;
+        DbgTrace(L"[FlashIE] RegOpenKeyExW FAKE: %s -> %s\n", lpSubKey, desc);
+        return ERROR_SUCCESS;
+    }
+    return ERROR_FILE_NOT_FOUND;
+}
+
+// Check if lpSubKey contains a ShockwaveFlash ProgID with valid version (<=34).
+static bool IsFlashProgIDPath(LPCWSTR lpSubKey)
+{
+    const wchar_t* progid = wcsstr(lpSubKey, L"ShockwaveFlash.ShockwaveFlash");
+    if (!progid) return false;
+    const wchar_t* afterBase = progid + 29;
+    if (*afterBase == L'.') {
+        int ver = _wtoi(afterBase + 1);
+        if (ver > 34) return false;
+    }
+    return (*afterBase == L'\0' || *afterBase == L'.' || *afterBase == L'\\');
+}
+
+// Case-insensitive check for Flash CLSID substring in a path.
+static bool PathContainsFlashCLSID(LPCWSTR lpSubKey)
+{
+    return wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e");
+}
+
 LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions,
     REGSAM samDesired, PHKEY phkResult)
@@ -891,30 +966,15 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
         FakeKeyType parentType = GetFakeKeyType(hKey);
         FakeKeyType subType = FK_NONE;
 
-        // Handle ProgID root -> CLSID / CurVer subkeys
-        if (parentType == FK_PROGID_ROOT && _wcsicmp(lpSubKey, L"CLSID") == 0)
-            subType = FK_PROGID_CLSID;
-        else if (parentType == FK_PROGID_ROOT && _wcsicmp(lpSubKey, L"CurVer") == 0)
-            subType = FK_PROGID_CURVER;
-        else if (_wcsicmp(lpSubKey, L"InprocServer32") == 0 || _wcsicmp(lpSubKey, L"InProcServer32") == 0)
-            subType = FK_INPROC;
-        else if (_wcsicmp(lpSubKey, L"MiscStatus") == 0)
-            subType = FK_MISCSTATUS;
-        else if (_wcsicmp(lpSubKey, L"MiscStatus\\1") == 0 || _wcsicmp(lpSubKey, L"1") == 0)
-            subType = FK_MISCSTATUS1;
-        else if (_wcsicmp(lpSubKey, L"ProgID") == 0)
-            subType = FK_PROGID;
-        else if (_wcsicmp(lpSubKey, L"TypeLib") == 0)
-            subType = FK_TYPELIB;
-        else if (_wcsicmp(lpSubKey, L"Control") == 0)
-            subType = FK_CONTROL;
-        else if (_wcsicmp(lpSubKey, L"Version") == 0 || _wcsicmp(lpSubKey, L"VersionIndependentProgID") == 0)
-            subType = FK_VERSION;
-        else if (_wcsicmp(lpSubKey, L"CurVer") == 0)
-            subType = FK_PROGID_CURVER;
-        else if (_wcsicmp(lpSubKey, L"InstalledVersion") == 0)
-            subType = FK_INSTALLED_VER;
-        else if (_wcsnicmp(lpSubKey, L"Implemented Categories\\", 23) == 0)
+        for (const auto& e : s_fakeSubKeys) {
+            if (e.parentOnly != FK_NONE && parentType != e.parentOnly)
+                continue;
+            if (_wcsicmp(lpSubKey, e.name) == 0) {
+                subType = e.type;
+                break;
+            }
+        }
+        if (subType == FK_NONE && _wcsnicmp(lpSubKey, L"Implemented Categories\\", 23) == 0)
             subType = FK_IMPL_CATEGORY;
 
         if (subType != FK_NONE) {
@@ -926,9 +986,10 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     }
 
     if (lpSubKey) {
+        bool hasFlashClsid = PathContainsFlashCLSID(lpSubKey);
+
         // ---- Flash kill bit bypass ----
-        if (wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e")) {
-            // Block ActiveX Compatibility and Extension Compatibility (kill bit)
+        if (hasFlashClsid) {
             if (wcsstr(lpSubKey, L"ActiveX Compatibility") ||
                 wcsstr(lpSubKey, L"Extension Compatibility")) {
                 DbgTrace(L"[FlashIE] RegOpenKeyExW BLOCKED (kill bit): %s\n", lpSubKey);
@@ -937,97 +998,41 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
         }
 
         // ---- Fake Flash ProgID registration ----
-        // JavaScript "new ActiveXObject('ShockwaveFlash.ShockwaveFlash')" triggers
-        // lookup of HKCR\ShockwaveFlash.ShockwaveFlash and its \CLSID subkey.
-        // We match unversioned and versioned (up to .34) ProgIDs.
-        if (_wcsnicmp(lpSubKey, L"ShockwaveFlash.ShockwaveFlash", 29) == 0 ||
-            (wcsstr(lpSubKey, L"ShockwaveFlash.ShockwaveFlash") != nullptr)) {
-            // Check versioned ProgID: reject versions > 34
-            bool versionOk = true;
-            {
-                const wchar_t* progid = wcsstr(lpSubKey, L"ShockwaveFlash.ShockwaveFlash");
-                if (progid) {
-                    const wchar_t* afterBase = progid + 29;
-                    if (*afterBase == L'.') {
-                        int ver = _wtoi(afterBase + 1);
-                        if (ver > 34) versionOk = false;
-                    }
-                }
-            }
-            if (versionOk && phkResult) {
-                // Check if it's the \CLSID subkey or the root
-                if (wcsstr(lpSubKey, L"\\CLSID") || SubKeyEndsWith(lpSubKey, L"CLSID")) {
-                    HKEY h = AllocFakeKey(FK_PROGID_CLSID);
-                    if (h) {
-                        *phkResult = h;
-                        DbgTrace(L"[FlashIE] RegOpenKeyExW FAKE: %s -> ProgID\\CLSID\n", lpSubKey);
-                        return ERROR_SUCCESS;
-                    }
-                } else {
-                    HKEY h = AllocFakeKey(FK_PROGID_ROOT);
-                    if (h) {
-                        *phkResult = h;
-                        DbgTrace(L"[FlashIE] RegOpenKeyExW FAKE: %s -> ProgID root\n", lpSubKey);
-                        return ERROR_SUCCESS;
-                    }
-                }
-            }
+        if (IsFlashProgIDPath(lpSubKey) && phkResult) {
+            FakeKeyType type = (wcsstr(lpSubKey, L"\\CLSID") || SubKeyEndsWith(lpSubKey, L"CLSID"))
+                ? FK_PROGID_CLSID : FK_PROGID_ROOT;
+            return ReturnFakeKey(type, phkResult, lpSubKey,
+                type == FK_PROGID_CLSID ? L"ProgID\\CLSID" : L"ProgID root");
         }
 
         // ---- Fake Flash CLSID subkeys ----
-        // MSHTML looks up HKCR\CLSID\{D27CDB6E-...} to check if the control
-        // is installed. We fake the entire CLSID tree so MSHTML proceeds.
-        if (wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e")) {
+        if (hasFlashClsid) {
             FakeKeyType fkType = FK_NONE;
             const wchar_t* fkName = nullptr;
 
             if (SubKeyEndsWith(lpSubKey, FLASH_CLSID_STR) &&
                 (wcsstr(lpSubKey, L"CLSID") || wcsstr(lpSubKey, L"clsid"))) {
                 fkType = FK_CLSID_ROOT; fkName = L"CLSID root";
-            } else if (SubKeyEndsWith(lpSubKey, L"InprocServer32") || SubKeyEndsWith(lpSubKey, L"InProcServer32")) {
-                fkType = FK_INPROC; fkName = L"InprocServer32";
-            } else if (SubKeyEndsWith(lpSubKey, L"MiscStatus\\1")) {
-                fkType = FK_MISCSTATUS1; fkName = L"MiscStatus\\1";
-            } else if (SubKeyEndsWith(lpSubKey, L"MiscStatus")) {
-                fkType = FK_MISCSTATUS; fkName = L"MiscStatus";
-            } else if (SubKeyEndsWith(lpSubKey, L"ProgID")) {
-                fkType = FK_PROGID; fkName = L"ProgID";
-            } else if (SubKeyEndsWith(lpSubKey, L"TypeLib")) {
-                fkType = FK_TYPELIB; fkName = L"TypeLib";
-            } else if (SubKeyEndsWith(lpSubKey, L"Control")) {
-                fkType = FK_CONTROL; fkName = L"Control";
-            } else if (SubKeyEndsWith(lpSubKey, L"Version") || SubKeyEndsWith(lpSubKey, L"VersionIndependentProgID")) {
-                fkType = FK_VERSION; fkName = L"Version";
-            }
-
-            if (fkType != FK_NONE && phkResult) {
-                HKEY h = AllocFakeKey(fkType);
-                if (h) {
-                    *phkResult = h;
-                    DbgTrace(L"[FlashIE] RegOpenKeyExW FAKE: %s -> %s\n", lpSubKey, fkName);
-                    return ERROR_SUCCESS;
+            } else {
+                for (const auto& e : s_clsidSuffixes) {
+                    if (SubKeyEndsWith(lpSubKey, e.suffix)) {
+                        fkType = e.type; fkName = e.suffix;
+                        break;
+                    }
                 }
             }
-        }
 
-        // Any other D27CDB6E path — log and let through
-        if (wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e")) {
+            if (fkType != FK_NONE && phkResult)
+                return ReturnFakeKey(fkType, phkResult, lpSubKey, fkName);
+
             DbgTrace(L"[FlashIE] RegOpenKeyExW ALLOW (Flash): %s\n", lpSubKey);
         }
 
         // ---- Fake MIME type -> CLSID mapping ----
-        // MSHTML resolves <embed type="application/x-shockwave-flash">
-        // via HKCR\MIME\Database\Content Type\application/x-shockwave-flash
-        // IMPORTANT: Only match actual MIME database paths, NOT protocol
-        // filter paths (PROTOCOLS\Filter\...) or shell association paths.
         if ((wcsstr(lpSubKey, L"x-shockwave-flash") ||
              wcsstr(lpSubKey, L"x-Shockwave-Flash")) &&
-            wcsstr(lpSubKey, L"Content Type")) {
-            HKEY h = AllocFakeKey(FK_MIME);
-            if (h && phkResult) *phkResult = h;
-            DbgTrace(L"[FlashIE] RegOpenKeyExW FAKE: %s -> MIME mapping\n", lpSubKey);
-            return ERROR_SUCCESS;
-        }
+            wcsstr(lpSubKey, L"Content Type"))
+            return ReturnFakeKey(FK_MIME, phkResult, lpSubKey, L"MIME mapping");
 
         // ---- FEATURE_BROWSER_EMULATION tracking ----
         if (wcsstr(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
@@ -1041,12 +1046,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     }
     LSTATUS res = reinterpret_cast<FN_RegOpenKeyExW>(s_hooks[HK_RegOpenKeyExW].pTrampoline)(
         hKey, lpSubKey, ulOptions, samDesired, phkResult);
-    // Log Flash-related registry access for debugging
-    if (lpSubKey && (wcsstr(lpSubKey, L"Macr") || wcsstr(lpSubKey, L"Flash") ||
-                     wcsstr(lpSubKey, L"flash") || wcsstr(lpSubKey, L"ShockwaveFlash") ||
-                     wcsstr(lpSubKey, L"mms.cfg"))) {
-        DbgTrace(L"[FlashIE] RegOpenKeyExW FLASH-RELATED: %s -> 0x%X\n", lpSubKey, res);
-    }
+    DbgTrace(L"[FlashIE] RegOpenKeyExW: %s -> 0x%X\n", lpSubKey ? lpSubKey : L"(null)", res);
     return res;
 }
 

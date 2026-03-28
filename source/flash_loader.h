@@ -26,13 +26,14 @@ public:
 
     bool IsActive() const { return m_hModule != nullptr; }
 
+    // Exposed for static hook helpers (GetFlashFactory, IsFlashCLSID)
+    static IClassFactory* s_pFlashFactory;
+
 private:
     HMODULE        m_hModule = nullptr;
     IClassFactory* m_pFactory = nullptr;
     DWORD          m_dwCookie = 0;
     bool           m_hooked = false;
-
-    static IClassFactory* s_pFlashFactory;
 
     // Hook callbacks
     static HRESULT STDAPICALLTYPE Hooked_CoGetClassObject(
