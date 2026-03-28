@@ -10,7 +10,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_executable(flashie WIN32
     source/main.cpp
     source/browser.cpp
+    source/flash.cpp
     source/flash_loader.cpp
+    assets/app.manifest
 )
 
 set_target_properties(flashie PROPERTIES OUTPUT_NAME "FlashIE")

@@ -11,14 +11,7 @@
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
-
-// Flash Player ActiveX CLSID: {D27CDB6E-AE6D-11CF-96B8-444553540000}
-static const CLSID CLSID_ShockwaveFlash =
-    {0xD27CDB6E, 0xAE6D, 0x11CF, {0x96, 0xB8, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
-
-// Flash TypeLib GUID: {D27CDB6B-AE6D-11CF-96B8-444553540000}
-static const GUID GUID_FlashTypeLib =
-    {0xD27CDB6B, 0xAE6D, 0x11CF, {0x96, 0xB8, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+#include "flash.h"      // MIDL-generated Flash COM interface definitions
 
 // Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
@@ -1314,7 +1307,7 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 static HRESULT WINAPI Hooked_LoadRegTypeLib(
     REFGUID rguid, WORD wVerMajor, WORD wVerMinor, LCID lcid, ITypeLib** pptlib)
 {
-    if (IsEqualGUID(rguid, GUID_FlashTypeLib) && pptlib) {
+    if (IsEqualGUID(rguid, LIBID_ShockwaveFlashObjects) && pptlib) {
         static FN_LoadTypeLibEx s_pfnLoadTypeLibEx = nullptr;
         if (!s_pfnLoadTypeLibEx) {
             HMODULE hOleAut = GetModuleHandleW(L"oleaut32.dll");
