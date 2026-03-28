@@ -11,6 +11,7 @@
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
+#include <urlmon.h>     // IInternetSecurityManager, CoInternetCreateSecurityManager
 #include "flash.h"      // MIDL-generated Flash COM interface definitions
 
 // Flash CLSID string form for comparisons
@@ -315,6 +316,7 @@ enum HookId {
     HK_RemoveDirectoryW,
     HK_CLSIDFromProgID,
     HK_FlashQI,
+    HK_ProcessUrlAction,
     HK_COUNT
 };
 
@@ -524,6 +526,8 @@ static void CloseFakeKey(HKEY hKey)
 
 // Forward declaration: installs IObjectSafety hook on Flash's QueryInterface
 static void MaybeHookFlashQI(IUnknown* pObj);
+// Forward declaration: installs SetClientSite hook for forced activation
+static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
@@ -579,6 +583,8 @@ public:
 #endif
             // Hook Flash's QueryInterface to inject IObjectSafety support
             MaybeHookFlashQI(pObj);
+            // Hook Flash's SetClientSite to force in-place activation
+            MaybeHookFlashSetClientSite(pObj);
         }
         return hr;
     }
@@ -1217,6 +1223,67 @@ LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 // Section 8c: Security & Feature Hooks
 // =====================================================================
 
+// Hook IInternetSecurityManager::ProcessUrlAction via inline detour.
+// MSHTML calls ProcessUrlAction to decide whether to auto-activate ActiveX.
+// We locate the function by reading the vtable of a temporary security
+// manager, then install an inline hook on the actual function body so
+// ALL security manager instances are affected.
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_ProcessUrlAction)(
+    void* pThis, LPCWSTR pwszUrl, DWORD dwAction,
+    BYTE* pPolicy, DWORD cbPolicy, BYTE* pContext, DWORD cbContext,
+    DWORD dwFlags, DWORD dwReserved);
+
+static HRESULT STDMETHODCALLTYPE Hooked_ProcessUrlAction(
+    void* pThis, LPCWSTR pwszUrl, DWORD dwAction,
+    BYTE* pPolicy, DWORD cbPolicy, BYTE* pContext, DWORD cbContext,
+    DWORD dwFlags, DWORD dwReserved)
+{
+    // 0x1200-0x15FF: ActiveX run/override + Script actions
+    // 0x2000-0x23FF: Download/code download actions
+    if ((dwAction >= 0x1200 && dwAction <= 0x15FF) ||
+        (dwAction >= 0x2000 && dwAction <= 0x23FF)) {
+        if (pPolicy && cbPolicy >= sizeof(DWORD))
+            *reinterpret_cast<DWORD*>(pPolicy) = 0; // URLPOLICY_ALLOW
+        DbgTrace(L"[FlashIE] ProcessUrlAction(0x%X) -> ALLOW\n", dwAction);
+        return S_OK;
+    }
+    return reinterpret_cast<FN_ProcessUrlAction>(
+        s_hooks[HK_ProcessUrlAction].pTrampoline)(
+        pThis, pwszUrl, dwAction, pPolicy, cbPolicy,
+        pContext, cbContext, dwFlags, dwReserved);
+}
+
+// Resolve ProcessUrlAction address from a temporary security manager's vtable
+// and install an inline detour on the actual function body.
+static void HookProcessUrlAction()
+{
+    typedef HRESULT (STDAPICALLTYPE *FN_CoInternetCreateSecurityManager)(
+        IServiceProvider*, IInternetSecurityManager**, DWORD);
+
+    HMODULE hUrlmon = GetModuleHandleW(L"urlmon.dll");
+    if (!hUrlmon) return;
+
+    auto pfnCreate = reinterpret_cast<FN_CoInternetCreateSecurityManager>(
+        GetProcAddress(hUrlmon, "CoInternetCreateSecurityManager"));
+    if (!pfnCreate) return;
+
+    IInternetSecurityManager* pSM = nullptr;
+    if (FAILED(pfnCreate(nullptr, &pSM, 0)) || !pSM) return;
+
+    // Read ProcessUrlAction address from vtable slot 7
+    void** vtable = *reinterpret_cast<void***>(pSM);
+    void* pTarget = vtable[7];
+    pSM->Release();
+
+    if (pTarget) {
+        bool ok = InstallDetour(pTarget, reinterpret_cast<void*>(Hooked_ProcessUrlAction),
+                                s_hooks[HK_ProcessUrlAction]);
+        DbgTrace(L"[FlashIE] Hook ProcessUrlAction: %s (addr=%p)\n",
+                 ok ? L"OK" : L"FAIL", pTarget);
+    }
+}
+
 // Disable all IE Feature Controls. MSHTML checks features like
 // FEATURE_RESTRICT_ACTIVEXINSTALL and FEATURE_SAFE_BINDTOOBJECT before
 // allowing ActiveX. Returning S_FALSE means "feature not enabled".
@@ -1310,6 +1377,98 @@ static void MaybeHookFlashQI(IUnknown* pObj)
     } else {
         DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED\n");
     }
+}
+
+// =====================================================================
+// Section 8d-2: Flash forced in-place activation
+//
+// MSHTML creates Flash objects but may defer DoVerb(INPLACEACTIVATE)
+// until a user click (Windows 10 Flash phase-out behavior).
+// We hook Flash's IOleObject::SetClientSite; once MSHTML sets the site,
+// we schedule a timer to call DoVerb(OLEIVERB_INPLACEACTIVATE) forcing
+// the control to activate without user interaction.
+// =====================================================================
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
+    IOleObject* pThis, IOleClientSite* pClientSite);
+static FN_OleSetClientSite s_origSetClientSite = nullptr;
+
+struct PendingActivation {
+    IOleObject* pObj;
+    IOleClientSite* pSite;
+};
+
+static void CALLBACK ActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
+{
+    KillTimer(nullptr, idTimer);
+
+    // Retrieve the pending activation info stored by the hook
+    auto* pa = reinterpret_cast<PendingActivation*>(idTimer);
+    // We can't use idTimer as pointer — use a static queue instead.
+}
+
+// Simple queue of Flash objects awaiting forced activation
+static const int MAX_PENDING = 16;
+static PendingActivation s_pending[MAX_PENDING] = {};
+static int s_pendingCount = 0;
+
+static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
+{
+    KillTimer(nullptr, idTimer);
+
+    for (int i = 0; i < s_pendingCount; i++) {
+        IOleObject* pObj = s_pending[i].pObj;
+        IOleClientSite* pSite = s_pending[i].pSite;
+        if (pObj && pSite) {
+            HRESULT hr = pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+            DbgTrace(L"[FlashIE] ForceActivate DoVerb -> hr=0x%08X\n", hr);
+            pSite->Release();
+            pObj->Release();
+        }
+    }
+    s_pendingCount = 0;
+}
+
+static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
+    IOleObject* pThis, IOleClientSite* pClientSite)
+{
+    HRESULT hr = s_origSetClientSite(pThis, pClientSite);
+
+    // When MSHTML sets a non-null client site, queue forced activation
+    if (SUCCEEDED(hr) && pClientSite && s_pendingCount < MAX_PENDING) {
+        pThis->AddRef();
+        pClientSite->AddRef();
+        s_pending[s_pendingCount].pObj = pThis;
+        s_pending[s_pendingCount].pSite = pClientSite;
+        s_pendingCount++;
+        // Schedule activation after MSHTML finishes setup (100ms delay)
+        SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
+        DbgTrace(L"[FlashIE] SetClientSite -> queued forced activation\n");
+    }
+
+    return hr;
+}
+
+static void MaybeHookFlashSetClientSite(IUnknown* pObj)
+{
+    if (s_origSetClientSite) return; // already hooked
+
+    IOleObject* pOle = nullptr;
+    pObj->QueryInterface(IID_IOleObject, reinterpret_cast<void**>(&pOle));
+    if (!pOle) return;
+
+    void** vtable = *reinterpret_cast<void***>(pOle);
+    // IOleObject::SetClientSite is vtable slot 3 (after QI, AddRef, Release)
+    s_origSetClientSite = reinterpret_cast<FN_OleSetClientSite>(vtable[3]);
+
+    DWORD oldProtect;
+    if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        vtable[3] = reinterpret_cast<void*>(Hooked_OleSetClientSite);
+        VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
+        DbgTrace(L"[FlashIE] Hook Flash IOleObject::SetClientSite: OK\n");
+    }
+
+    pOle->Release();
 }
 
 // =====================================================================
@@ -1789,6 +1948,9 @@ void FlashLoader::InstallHooks()
     ResolveAndHook("CoInternetIsFeatureEnabled", L"CoInternetIsFeatureEnabled",
         reinterpret_cast<void*>(&Hooked_CoInternetIsFeatureEnabled), s_hooks[HK_CoInternetIsFeatureEnabled],
         hUrlmon);
+
+    // Inline-hook ProcessUrlAction to allow ActiveX auto-activation
+    HookProcessUrlAction();
 
     // WLDP hooks (Windows 10+ ActiveX approval)
     ResolveAndHook("WldpIsClassInApprovedList", L"WldpIsClassInApprovedList",
