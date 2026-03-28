@@ -513,13 +513,17 @@ static void CloseFakeKey(HKEY hKey)
 // Section 6: COM Wrapper Classes
 //
 // LoggingClassFactory: Wraps the real Flash class factory to log
-//   CreateInstance calls from MSHTML which calls pCF->CreateInstance()
-//   on the vtable directly (not through CoCreateInstance).
+//   CreateInstance calls and trigger QI/activation hooks on new objects.
 //
 // FlashSafetyTearoff: IObjectSafety tearoff for Flash objects.
-//   MSHTML checks IObjectSafety on ActiveX controls before allowing
-//   JavaScript to access their IDispatch. Flash.ocx does not expose
-//   IObjectSafety, so we inject it via a QI hook.
+//   MSHTML requires IObjectSafety for scripting access; Flash.ocx
+//   does not expose it, so we inject it via a QI hook.
+//
+// PropertyBagWrapper: Wraps MSHTML's IPropertyBag to force
+//   allowScriptAccess="always" so ExternalInterface works.
+//
+// FlashPersistPBagTearoff: Wraps Flash's IPersistPropertyBag to
+//   intercept Load() and inject the PropertyBagWrapper.
 // =====================================================================
 
 // Forward declaration: installs IObjectSafety hook on Flash's QueryInterface
@@ -1317,9 +1321,9 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 8d-2: Flash forced in-place activation
+// Section 8e: Flash forced in-place activation
 //
-// MSHTML creates Flash objects but may defer DoVerb(INPLACEACTIVATE)
+// MSHTML creates Flash objects but defers DoVerb(INPLACEACTIVATE)
 // until a user click (Windows 10 Flash phase-out behavior).
 // We hook Flash's IOleObject::SetClientSite; once MSHTML sets the site,
 // we schedule a timer to call DoVerb(OLEIVERB_INPLACEACTIVATE) forcing
@@ -1335,14 +1339,15 @@ struct PendingActivation {
     IOleClientSite* pSite;
 };
 
-// Simple queue of Flash objects awaiting forced activation
 static const int MAX_PENDING = 16;
 static PendingActivation s_pending[MAX_PENDING] = {};
 static int s_pendingCount = 0;
+static UINT_PTR s_activateTimer = 0;
 
 static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
     KillTimer(nullptr, idTimer);
+    s_activateTimer = 0;
 
     for (int i = 0; i < s_pendingCount; i++) {
         IOleObject* pObj = s_pending[i].pObj;
@@ -1353,6 +1358,20 @@ static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
             pSite->Release();
             pObj->Release();
         }
+    }
+    s_pendingCount = 0;
+}
+
+// Release any pending activation references (called during shutdown).
+static void FlushPendingActivations()
+{
+    if (s_activateTimer) {
+        KillTimer(nullptr, s_activateTimer);
+        s_activateTimer = 0;
+    }
+    for (int i = 0; i < s_pendingCount; i++) {
+        if (s_pending[i].pSite) s_pending[i].pSite->Release();
+        if (s_pending[i].pObj)  s_pending[i].pObj->Release();
     }
     s_pendingCount = 0;
 }
@@ -1369,8 +1388,9 @@ static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
         s_pending[s_pendingCount].pObj = pThis;
         s_pending[s_pendingCount].pSite = pClientSite;
         s_pendingCount++;
-        // Schedule activation after MSHTML finishes setup (100ms delay)
-        SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
+        // Coalesce: restart the timer so one callback handles all pending objects
+        if (s_activateTimer) KillTimer(nullptr, s_activateTimer);
+        s_activateTimer = SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
         DbgTrace(L"[FlashIE] SetClientSite -> queued forced activation\n");
     }
 
@@ -1400,7 +1420,7 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 8e: TypeLib Hook
+// Section 8f: TypeLib Hook
 //
 // Flash.ocx's TypeLib GUID is {D27CDB6B-AE6D-11CF-96B8-444553540000}.
 // Without registry entries, OLEAUT32 can't find it and returns
@@ -1929,6 +1949,8 @@ void FlashLoader::InstallHooks()
 
 void FlashLoader::Deactivate()
 {
+    FlushPendingActivations();
+
     if (m_hooked) {
         for (int i = 0; i < HK_COUNT; i++)
             RemoveDetour(s_hooks[i]);
