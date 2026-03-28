@@ -242,6 +242,19 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
     default:
         break;
     }
+
+    // Handle ambient properties that MSHTML queries on the host.
+    // DISPID_AMBIENT_DLCONTROL (-5512): download-control flags.
+    // Returning DLCTL_DLIMAGES|VIDEOS|BGSOUNDS and NOT setting
+    // DLCTL_NO_RUNACTIVEXCTLS allows ActiveX controls to auto-run.
+    if (dispid == -5512 && pvarResult) { // DISPID_AMBIENT_DLCONTROL
+        pvarResult->vt = VT_I4;
+        // DLCTL_DLIMAGES|DLCTL_VIDEOS|DLCTL_BGSOUNDS | DLCTL_NO_DLACTIVEXCTLS
+        // Allow content but block ActiveX CAB downloads (we have Flash locally).
+        pvarResult->lVal = 0x00000470;
+        return S_OK;
+    }
+
     return DISP_E_MEMBERNOTFOUND;
 }
 
