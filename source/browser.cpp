@@ -131,6 +131,8 @@ STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
         return S_OK;
     } else if (riid == IID_IDocHostUIHandler) {
         *ppv = static_cast<IDocHostUIHandler*>(this);
+    } else if (riid == IID_IOleCommandTarget) {
+        *ppv = static_cast<IOleCommandTarget*>(this);
     } else if (riid == IID_IDispatch || riid == DIID_DWebBrowserEvents2) {
         *ppv = static_cast<IDispatch*>(this);
     } else {
@@ -163,6 +165,30 @@ STDMETHODIMP COleSite::GetHostInfo(DOCHOSTUIINFO* pInfo)
     pInfo->pchHostCss = nullptr;
     pInfo->pchHostNS = nullptr;
     return S_OK;
+}
+
+// IOleCommandTarget — suppress script error dialogs
+static const GUID CGID_DocHostCommandHandler =
+    {0xf38bc242, 0xb950, 0x11d1, {0x89, 0x18, 0x00, 0xc0, 0x4f, 0xc2, 0xc8, 0x36}};
+
+STDMETHODIMP COleSite::QueryStatus(const GUID*, ULONG, OLECMD[], OLECMDTEXT*)
+{
+    return E_NOTIMPL;
+}
+
+STDMETHODIMP COleSite::Exec(const GUID* pguidCmdGroup, DWORD nCmdID, DWORD,
+                             VARIANT*, VARIANT* pvaOut)
+{
+    // OLECMDID_SHOWSCRIPTERROR = 40
+    if (pguidCmdGroup && IsEqualGUID(*pguidCmdGroup, CGID_DocHostCommandHandler) && nCmdID == 40) {
+        // Set pvaOut to VARIANT_TRUE to continue running scripts (suppress dialog)
+        if (pvaOut) {
+            pvaOut->vt = VT_BOOL;
+            pvaOut->boolVal = VARIANT_TRUE;
+        }
+        return S_OK;
+    }
+    return OLECMDERR_E_NOTSUPPORTED;
 }
 
 // IDispatch (DWebBrowserEvents2)

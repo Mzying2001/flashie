@@ -6,6 +6,7 @@
 #include <exdisp.h>
 #include <exdispid.h>
 #include <mshtmhst.h>
+#include <docobj.h>
 
 class COleSite;
 class BrowserHost;
@@ -87,6 +88,7 @@ private:
 // COleSite - main COM identity
 // ---------------------------------------------------------------
 class COleSite : public IDocHostUIHandler,
+                 public IOleCommandTarget,
                  public IDispatch
 {
     friend class COleClientSite;
@@ -120,6 +122,10 @@ public:
     STDMETHODIMP GetExternal(IDispatch**) override { return E_NOTIMPL; }
     STDMETHODIMP TranslateUrl(DWORD, OLECHAR*, OLECHAR**) override { return S_FALSE; }
     STDMETHODIMP FilterDataObject(IDataObject*, IDataObject**) override { return S_FALSE; }
+
+    // IOleCommandTarget
+    STDMETHODIMP QueryStatus(const GUID*, ULONG, OLECMD[], OLECMDTEXT*) override;
+    STDMETHODIMP Exec(const GUID*, DWORD, DWORD, VARIANT*, VARIANT*) override;
 
     // IDispatch (DWebBrowserEvents2 sink)
     STDMETHODIMP GetTypeInfoCount(UINT*) override;
