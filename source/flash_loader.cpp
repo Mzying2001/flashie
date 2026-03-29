@@ -530,6 +530,8 @@ static void CloseFakeKey(HKEY hKey)
 static void MaybeHookFlashQI(IUnknown* pObj);
 // Forward declaration: installs SetClientSite hook for forced activation
 static void MaybeHookFlashSetClientSite(IUnknown* pObj);
+// Forward declaration: installs QuickActivate hook for iframe forced activation
+static void MaybeHookFlashQuickActivate(IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
@@ -587,6 +589,8 @@ public:
             MaybeHookFlashQI(pObj);
             // Hook Flash's SetClientSite to force in-place activation
             MaybeHookFlashSetClientSite(pObj);
+            // Hook Flash's QuickActivate for iframe activation
+            MaybeHookFlashQuickActivate(pObj);
         }
         return hr;
     }
@@ -1344,6 +1348,41 @@ static PendingActivation s_pending[MAX_PENDING] = {};
 static int s_pendingCount = 0;
 static UINT_PTR s_activateTimer = 0;
 
+// Saved references for deferred re-activation (handles display:none iframes).
+// A 200ms repeating timer calls DoVerb until the iframe becomes visible,
+// up to 50 retries (10 seconds total).
+static const int MAX_DEFERRED = 16;
+static PendingActivation s_deferred[MAX_DEFERRED] = {};
+static int s_deferredCount = 0;
+static UINT_PTR s_deferredTimer = 0;
+static int s_deferredRetries = 0;
+static const int MAX_DEFERRED_RETRIES = 50; // 50 × 200ms = 10s
+
+static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
+{
+    s_deferredRetries++;
+
+    for (int i = 0; i < s_deferredCount; i++) {
+        IOleObject* pObj = s_deferred[i].pObj;
+        IOleClientSite* pSite = s_deferred[i].pSite;
+        if (pObj && pSite) {
+            pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+        }
+    }
+
+    // Stop after max retries — release references and kill timer
+    if (s_deferredRetries >= MAX_DEFERRED_RETRIES) {
+        KillTimer(nullptr, idTimer);
+        s_deferredTimer = 0;
+        for (int i = 0; i < s_deferredCount; i++) {
+            if (s_deferred[i].pSite) s_deferred[i].pSite->Release();
+            if (s_deferred[i].pObj)  s_deferred[i].pObj->Release();
+        }
+        s_deferredCount = 0;
+        DbgTrace(L"[FlashIE] DeferredActivate stopped after %d retries\n", s_deferredRetries);
+    }
+}
+
 static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
     KillTimer(nullptr, idTimer);
@@ -1355,11 +1394,28 @@ static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
         if (pObj && pSite) {
             HRESULT hr = pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
             DbgTrace(L"[FlashIE] ForceActivate DoVerb -> hr=0x%08X\n", hr);
+
+            // Save for deferred re-activation: Flash in display:none iframes
+            // may need re-activation when the iframe becomes visible.
+            if (s_deferredCount < MAX_DEFERRED) {
+                pObj->AddRef();
+                pSite->AddRef();
+                s_deferred[s_deferredCount].pObj = pObj;
+                s_deferred[s_deferredCount].pSite = pSite;
+                s_deferredCount++;
+            }
+
             pSite->Release();
             pObj->Release();
         }
     }
     s_pendingCount = 0;
+
+    // Schedule repeating re-activation every 200ms for display:none iframes
+    if (s_deferredCount > 0 && !s_deferredTimer) {
+        s_deferredRetries = 0;
+        s_deferredTimer = SetTimer(nullptr, 0, 200, DeferredActivateTimerProc);
+    }
 }
 
 // Release any pending activation references (called during shutdown).
@@ -1369,11 +1425,20 @@ static void FlushPendingActivations()
         KillTimer(nullptr, s_activateTimer);
         s_activateTimer = 0;
     }
+    if (s_deferredTimer) {
+        KillTimer(nullptr, s_deferredTimer);
+        s_deferredTimer = 0;
+    }
     for (int i = 0; i < s_pendingCount; i++) {
         if (s_pending[i].pSite) s_pending[i].pSite->Release();
         if (s_pending[i].pObj)  s_pending[i].pObj->Release();
     }
     s_pendingCount = 0;
+    for (int i = 0; i < s_deferredCount; i++) {
+        if (s_deferred[i].pSite) s_deferred[i].pSite->Release();
+        if (s_deferred[i].pObj)  s_deferred[i].pObj->Release();
+    }
+    s_deferredCount = 0;
 }
 
 static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
@@ -1417,6 +1482,64 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
     }
 
     pOle->Release();
+}
+
+// Also hook IQuickActivate::QuickActivate — MSHTML in cross-domain
+// iframes may use IQuickActivate instead of IOleObject::SetClientSite.
+// QuickActivate sets the client site internally, bypassing our
+// SetClientSite vtable hook.
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
+    IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
+static FN_QuickActivate s_origQuickActivate = nullptr;
+
+static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
+    IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl)
+{
+    HRESULT hr = s_origQuickActivate(pThis, pQAContainer, pQAControl);
+
+    if (SUCCEEDED(hr) && pQAContainer && pQAContainer->pClientSite &&
+        s_pendingCount < MAX_PENDING) {
+        // Get IOleObject from the Flash control to call DoVerb later
+        IOleObject* pOle = nullptr;
+        pThis->QueryInterface(IID_IOleObject, reinterpret_cast<void**>(&pOle));
+        if (pOle) {
+            IOleClientSite* pSite = pQAContainer->pClientSite;
+            pOle->AddRef();
+            pSite->AddRef();
+            s_pending[s_pendingCount].pObj = pOle;
+            s_pending[s_pendingCount].pSite = pSite;
+            s_pendingCount++;
+            if (s_activateTimer) KillTimer(nullptr, s_activateTimer);
+            s_activateTimer = SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
+            DbgTrace(L"[FlashIE] QuickActivate -> queued forced activation\n");
+            pOle->Release(); // balance the QI AddRef (pending still holds a ref from AddRef above)
+        }
+    }
+
+    return hr;
+}
+
+static void MaybeHookFlashQuickActivate(IUnknown* pObj)
+{
+    if (s_origQuickActivate) return; // already hooked
+
+    IQuickActivate* pQA = nullptr;
+    pObj->QueryInterface(IID_IQuickActivate, reinterpret_cast<void**>(&pQA));
+    if (!pQA) return;
+
+    void** vtable = *reinterpret_cast<void***>(pQA);
+    // IQuickActivate::QuickActivate is vtable slot 3 (after QI, AddRef, Release)
+    s_origQuickActivate = reinterpret_cast<FN_QuickActivate>(vtable[3]);
+
+    DWORD oldProtect;
+    if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        vtable[3] = reinterpret_cast<void*>(Hooked_QuickActivate);
+        VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
+        DbgTrace(L"[FlashIE] Hook Flash IQuickActivate::QuickActivate: OK\n");
+    }
+
+    pQA->Release();
 }
 
 // =====================================================================
@@ -1819,17 +1942,20 @@ bool FlashLoader::Activate()
         return false;
     }
 
-    // Also register via CoRegisterClassObject (backup for non-hooked paths)
-    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, m_pFactory,
-                          CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
-                          &m_dwCookie);
-    DbgTrace(L"[FlashIE] CoRegisterClassObject -> hr=0x%08X cookie=%u\n", hrReg, m_dwCookie);
-
     // Publish for the hook functions
     s_pFlashFactory = m_pFactory;
 
     // Create logging wrapper around the real factory
     s_pLoggingFactory = new LoggingClassFactory(m_pFactory);
+
+    // Register the LOGGING wrapper (not raw factory) via CoRegisterClassObject.
+    // This ensures that even when COM routes through the registered class object
+    // (e.g., cross-domain iframes), our wrapper is used and SetClientSite/
+    // QuickActivate hooks are triggered for forced activation.
+    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, s_pLoggingFactory,
+                          CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
+                          &m_dwCookie);
+    DbgTrace(L"[FlashIE] CoRegisterClassObject -> hr=0x%08X cookie=%u\n", hrReg, m_dwCookie);
 
     // Cache exe name for FEATURE_BROWSER_EMULATION hook
     WCHAR szExe[MAX_PATH];
