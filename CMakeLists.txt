@@ -32,7 +32,6 @@ target_link_libraries(flashie PRIVATE
     uuid
     shlwapi
     urlmon
-    shell32
 )
 
 # Copy the correct Flash.ocx (32-bit or 64-bit) based on target architecture.
