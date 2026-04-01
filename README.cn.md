@@ -41,12 +41,12 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-构建过程会自动将对应架构的 `Flash.ocx` 复制到输出目录的 `Flash/` 下。
+构建过程会自动将对应架构的 `Flash.ocx` 复制到可执行文件同目录下。
 
 ## 使用方法
 
 1. 构建或下载 `FlashIE.exe`
-2. 确保 `Flash/` 目录（包含 `Flash.ocx`）与可执行文件位于同一目录
+2. 确保 `Flash.ocx` 与可执行文件位于同一目录
 3. 运行 `FlashIE.exe`
 4. 在地址栏中输入包含 Flash 内容的 URL 或本地文件路径
 

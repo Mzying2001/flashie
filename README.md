@@ -41,12 +41,12 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The build automatically copies the architecture-matched `Flash.ocx` to the output directory under `Flash/`.
+The build automatically copies the architecture-matched `Flash.ocx` to the output directory alongside the executable.
 
 ## Usage
 
 1. Build or download `FlashIE.exe`
-2. Ensure the `Flash/` directory (containing `Flash.ocx`) is alongside the executable
+2. Ensure `Flash.ocx` is alongside the executable
 3. Run `FlashIE.exe`
 4. Enter a URL or local file path containing Flash content in the address bar
 

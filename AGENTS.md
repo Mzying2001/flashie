@@ -67,7 +67,7 @@ Six source files plus two headers:
 
 The program MUST NOT register Flash.ocx into the system registry, and MUST NOT write to or modify the system registry. All registry operations must be strictly process-local:
 
-- **No `regsvr32` or `DllRegisterServer`**: Flash.ocx is loaded via `LoadLibrary` + `DllGetClassObject` only. The class factory is registered in-process via `CoRegisterClassObject`, never written to `HKCR` or `HKLM`.
+- **No `regsvr32` or `DllRegisterServer`**: Flash.ocx (alongside the exe) is loaded via `LoadLibrary` + `DllGetClassObject` only. The class factory is registered in-process via `CoRegisterClassObject`, never written to `HKCR` or `HKLM`.
 - **No registry writes**: Registry hooks (`RegOpenKeyExW`, `RegQueryValueExW`) return fake in-memory responses for Flash CLSID lookups. No actual registry keys are created or modified. Fake `HKEY` handles are opened read-only on existing unrelated keys — used only as valid handle values, never written to.
 - **Process-scoped hooks**: All inline hooks (COM, registry, WLDP, TypeLib) operate only within the current process's address space. They are removed on shutdown via `FlashLoader::Deactivate()`.
 

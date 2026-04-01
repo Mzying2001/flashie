@@ -31,7 +31,7 @@
     </windowsSettings>
   </application>
 
-  <file name="Flash\Flash.ocx" hashalg="SHA1">
+  <file name="Flash.ocx" hashalg="SHA1">
     <comClass clsid="{D27CDB6E-AE6D-11CF-96B8-444553540000}" tlbid="{D27CDB6B-AE6D-11CF-96B8-444553540000}" description="Shockwave Flash"></comClass>
     <comClass clsid="{D27CDB71-AE6D-11CF-96B8-444553540000}" tlbid="{D27CDB6B-AE6D-11CF-96B8-444553540000}" description="IFlashObjectInterface Interface"></comClass>
     <comClass clsid="{E0920E11-6B65-4D5D-9C58-B1FC5C07DC43}" tlbid="{D27CDB6B-AE6D-11CF-96B8-444553540000}" description="FlashObject Class"></comClass>

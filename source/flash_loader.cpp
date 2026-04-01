@@ -708,7 +708,7 @@ static LoggingClassFactory* s_pLoggingFactory = nullptr;
 static HKEY s_hkeyBrowserEmulation = nullptr;
 static wchar_t s_szExeName[MAX_PATH] = {};
 
-// Path to Flash.ocx (next to exe, in Flash\ subdirectory)
+// Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
 
 // =====================================================================
@@ -1544,12 +1544,10 @@ bool FlashLoader::Activate()
     GetModuleFileNameW(nullptr, szDir, MAX_PATH);
     PathRemoveFileSpecW(szDir);
 
-    PathCombineW(g_szOcxPath, szDir, L"Flash\\Flash.ocx");
+    PathCombineW(g_szOcxPath, szDir, L"Flash.ocx");
 
-    // Ensure Flash.ocx's dependencies resolve from the Flash subdirectory
-    WCHAR szFlashDir[MAX_PATH];
-    PathCombineW(szFlashDir, szDir, L"Flash");
-    SetDllDirectoryW(szFlashDir);
+    // Ensure Flash.ocx's dependencies resolve from the exe directory
+    SetDllDirectoryW(szDir);
 
     m_hModule = LoadLibraryW(g_szOcxPath);
 
