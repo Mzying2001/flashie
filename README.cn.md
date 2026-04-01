@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-一个独立运行的 Windows 应用程序，无需在系统中安装 Flash 即可运行 Adobe Flash 内容。FlashIE 内嵌 Internet Explorer WebBrowser 控件，通过 API 钩子加载本地附带的 Flash.ocx——不修改注册表、不修改系统文件、完全绿色便携。
+一个独立运行的 Windows 应用程序，无需在系统中安装 Flash 即可运行 Adobe Flash 内容。FlashIE 内嵌 Internet Explorer WebBrowser 控件，通过 API 钩子加载本地附带的 Flash.ocx——不修改注册表，完全绿色便携。
 
 ## 特性
 
@@ -19,7 +19,7 @@ FlashIE 使用内联函数钩子（Detour）在进程级别拦截 Windows API �
 3. **安全钩子** — 通过 `WldpIsClassInApprovedList` 和 `CoInternetIsFeatureEnabled` 批准 Flash，绕过 Windows 10+ 的限制
 4. **激活钩子** — 钩子 `IOleObject::SetClientSite` 和 `IQuickActivate::QuickActivate` 虚表，通过合并定时器强制 Flash 就地激活
 
-所有钩子在进程初始化后安装，在程序退出时干净移除。**不会对系统产生任何持久性更改。**
+所有钩子在进程初始化后安装，在程序退出时干净移除。**不会对注册表产生任何持久性更改。**
 
 ## 构建
 

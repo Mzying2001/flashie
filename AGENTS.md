@@ -26,7 +26,7 @@ Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy
 
 ### Source Files
 
-Six source files plus two headers:
+Four source files and four headers:
 
 - **`source/flash_loader.h/.cpp`** — `FlashLoader` class. The core hooking engine, organized into 9 sections:
   - **Section 1-2**: Includes, constants, function pointer typedefs for all hooked APIs.

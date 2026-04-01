@@ -2,7 +2,7 @@
 
 [中文版](README.cn.md)
 
-A standalone Windows application that runs Adobe Flash content without requiring Flash to be installed on the system. FlashIE embeds an Internet Explorer WebBrowser control and loads a bundled Flash.ocx through API hooking — no registry modifications, no system file changes, completely portable.
+A standalone Windows application that runs Adobe Flash content without requiring Flash to be installed on the system. FlashIE embeds an Internet Explorer WebBrowser control and loads a bundled Flash.ocx through API hooking — no registry modifications, completely portable.
 
 ## Features
 
@@ -19,7 +19,7 @@ FlashIE uses inline function hooking (detours) to intercept Windows API calls at
 3. **Security Hooks** — Approve Flash through `WldpIsClassInApprovedList` and `CoInternetIsFeatureEnabled` to bypass Windows 10+ restrictions
 4. **Activation Hooks** — Hook `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables to force Flash in-place activation via a coalesced timer
 
-All hooks are installed after process initialization and cleanly removed on shutdown. **No persistent changes are made to the system.**
+All hooks are installed after process initialization and cleanly removed on shutdown. **No persistent changes are made to the registry.**
 
 ## Build
 
