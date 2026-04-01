@@ -15,7 +15,7 @@ public:
     bool Activate();
 
     // Phase 2: Install inline hooks (detours) on COM, registry,
-    // security, TypeLib, and file system APIs. Force-loads
+    // security, and TypeLib APIs. Force-loads
     // mshtml.dll/urlmon.dll/ieframe.dll, then patches them.
     // Call BEFORE browser creation so hooks are in place when
     // MSHTML initializes.

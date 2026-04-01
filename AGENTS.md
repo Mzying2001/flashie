@@ -20,7 +20,7 @@ cmake --build build --config Debug
 cmake --build build --config Release
 ```
 
-Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy the architecture-matched `Flash.ocx` and `mms.cfg` to the output directory.
+Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy the architecture-matched `Flash.ocx` to the output directory.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy
 
 Six source files plus two headers:
 
-- **`source/flash_loader.h/.cpp`** — `FlashLoader` class (~2100 lines). The core hooking engine, organized into 9 sections:
+- **`source/flash_loader.h/.cpp`** — `FlashLoader` class. The core hooking engine, organized into 9 sections:
   - **Section 1-2**: Includes, constants, function pointer typedefs for all hooked APIs.
   - **Section 3**: Minimal x86/x64 instruction length decoder (`InsnLength`) for computing hook trampoline sizes.
   - **Section 4**: Inline hook (detour) infrastructure — `InstallDetour`/`RemoveDetour` with trampoline allocation via `VirtualAlloc`.
@@ -45,7 +45,6 @@ Six source files plus two headers:
   - **Section 8d**: Flash `QueryInterface` vtable hook — injects `IObjectSafety` (via `FlashSafetyTearoff`) and `IPersistPropertyBag` (via `FlashPersistPBagTearoff`) into Flash objects.
   - **Section 8e**: Flash forced in-place activation — hooks `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables. When MSHTML sets a client site, queues a 100ms timer to call `DoVerb(OLEIVERB_INPLACEACTIVATE)`. For `display:none` iframes, a 200ms repeating deferred timer re-activates Flash objects (max 50 retries / 10 seconds).
   - **Section 8f**: TypeLib hook (`LoadRegTypeLib`) — redirects Flash TypeLib GUID to `LoadTypeLibEx` on the local OCX file.
-  - **Section 8g**: File system redirect hooks — `CreateFileW`, `CreateDirectoryW`, `GetFileAttributesW`, `FindFirstFileW`, `MoveFileW`, `MoveFileExW`, `DeleteFileW`, `RemoveDirectoryW`. Redirects `%APPDATA%\{Macromedia,Adobe}\Flash Player` and `Macromed\Flash\` paths to the local `FlashData/` directory.
   - **Section 9**: Public API — `Activate()` (loads OCX, creates factory, registers with COM), `InstallHooks()` (force-loads IE DLLs, installs all detours), `Deactivate()` (flushes pending activations, removes hooks, revokes COM registration).
 
 - **`source/browser.h/.cpp`** — `BrowserHost` and OLE site classes (`COleSite`, `COleClientSite`, `COleInPlaceSite`, `COleInPlaceFrame`). Implements the standard OLE container interfaces needed to host an `IWebBrowser2` (IE) control in-process. `COleSite` implements:
@@ -57,22 +56,20 @@ Six source files plus two headers:
 
 - **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
 
-- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. Initialization order: `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and installs hooks) → create browser. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
+- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. Initialization order: `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and installs COM/registry/security/TypeLib hooks) → create browser. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
 
 ### Assets
 
 - **`assets/Flash32.ocx`** / **`assets/Flash64.ocx`** — Pre-patched Flash Player ActiveX (32-bit / 64-bit).
 - **`assets/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
-- **`assets/mms.cfg`** — Flash Player configuration: disables EOL uninstall, auto-update, and allowlist check.
 
-## Core Requirement: Zero System Pollution
+## Core Requirement: Zero Registry Pollution
 
-The program MUST NOT register Flash.ocx into the system, and MUST NOT write to or modify the system registry or any system files. All operations must be strictly process-local:
+The program MUST NOT register Flash.ocx into the system registry, and MUST NOT write to or modify the system registry. All registry operations must be strictly process-local:
 
 - **No `regsvr32` or `DllRegisterServer`**: Flash.ocx is loaded via `LoadLibrary` + `DllGetClassObject` only. The class factory is registered in-process via `CoRegisterClassObject`, never written to `HKCR` or `HKLM`.
 - **No registry writes**: Registry hooks (`RegOpenKeyExW`, `RegQueryValueExW`) return fake in-memory responses for Flash CLSID lookups. No actual registry keys are created or modified. Fake `HKEY` handles are opened read-only on existing unrelated keys — used only as valid handle values, never written to.
-- **No system file modifications**: Flash.ocx and mms.cfg live in `Flash/` subdirectory next to the exe. Flash SharedObject data (`FlashData/`) is redirected to the application directory via file system hooks, not to `%APPDATA%`.
-- **Process-scoped hooks**: All inline hooks (COM, registry, WLDP, file system) operate only within the current process's address space. They are removed on shutdown via `FlashLoader::Deactivate()`.
+- **Process-scoped hooks**: All inline hooks (COM, registry, WLDP, TypeLib) operate only within the current process's address space. They are removed on shutdown via `FlashLoader::Deactivate()`.
 
 When adding new features or modifying hooks, ensure this invariant is preserved. Any code path that could write to the registry or register COM objects system-wide is a bug.
 
@@ -85,7 +82,6 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
   - `SetClientSite` hook — catches the normal MSHTML activation path.
   - `QuickActivate` hook — catches the alternative path used by cross-domain iframes.
   - Both queue a 100ms coalescing timer that calls `DoVerb`. After the initial activation, objects are saved into a deferred array with a 200ms repeating timer (max 50 retries) to handle `display:none` iframes that need re-activation when they become visible.
-- **`mms.cfg`**: Flash configuration file that disables EOL uninstall, auto-update, and the allowlist check.
 
 ## Debugging
 

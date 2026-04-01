@@ -5,7 +5,6 @@
 #include "flash_loader.h"
 #include "debug.h"
 #include <shlwapi.h>
-#include <shlobj.h>      // SHGetFolderPathW, CSIDL_APPDATA
 #include <stdint.h>
 #include <string.h>
 #include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
@@ -80,29 +79,6 @@ typedef HRESULT (WINAPI *FN_LoadRegTypeLib)(
 
 typedef HRESULT (WINAPI *FN_LoadTypeLibEx)(
     LPCOLESTR szFile, REGKIND regkind, ITypeLib** pptlib);
-
-// --- File System ---
-
-typedef HANDLE (WINAPI *FN_CreateFileW)(
-    LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
-    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
-    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
-
-typedef BOOL  (WINAPI *FN_CreateDirectoryW)(
-    LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
-
-typedef DWORD (WINAPI *FN_GetFileAttributesW)(LPCWSTR lpFileName);
-
-typedef HANDLE (WINAPI *FN_FindFirstFileW)(
-    LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData);
-
-typedef BOOL (WINAPI *FN_MoveFileW)(
-    LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName);
-
-typedef BOOL (WINAPI *FN_MoveFileExW)(
-    LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
-
-typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
 
 // --- Flash object vtable ---
 
@@ -305,14 +281,6 @@ enum HookId {
     HK_WldpIsClassInApprovedList,
     HK_WldpQueryDynamicCodeTrust,
     HK_LoadRegTypeLib,
-    HK_CreateFileW,
-    HK_CreateDirectoryW,
-    HK_GetFileAttributesW,
-    HK_FindFirstFileW,
-    HK_MoveFileW,
-    HK_MoveFileExW,
-    HK_DeleteFileW,
-    HK_RemoveDirectoryW,
     HK_CLSIDFromProgID,
     HK_FlashQI,
     HK_COUNT
@@ -740,19 +708,8 @@ static LoggingClassFactory* s_pLoggingFactory = nullptr;
 static HKEY s_hkeyBrowserEmulation = nullptr;
 static wchar_t s_szExeName[MAX_PATH] = {};
 
-// Paths
+// Path to Flash.ocx (next to exe, in Flash\ subdirectory)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
-static wchar_t g_szMmsCfgPath[MAX_PATH] = {};
-
-// Path to local FlashData directory (next to exe) — replaces %APPDATA%\{Macromedia,Adobe}\Flash Player
-static wchar_t g_szFlashDataDir[MAX_PATH] = {};
-static int g_flashDataDirLen = 0;
-
-// The roaming path prefixes Flash uses
-static wchar_t g_szRoamingFlashDir[MAX_PATH] = {};   // %APPDATA%\Macromedia\Flash Player
-static int g_roamingFlashDirLen = 0;
-static wchar_t g_szRoamingAdobeDir[MAX_PATH] = {};   // %APPDATA%\Adobe\Flash Player
-static int g_roamingAdobeDirLen = 0;
 
 // =====================================================================
 // Section 8a: COM Hooks
@@ -1578,287 +1535,6 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 }
 
 // =====================================================================
-// Section 8f: File System Redirect Hooks
-//
-// Redirects Flash data paths from %APPDATA%\{Macromedia,Adobe}\Flash Player
-// to a local FlashData directory next to the exe. This preserves the
-// "zero system pollution" invariant — no writes to %APPDATA%.
-// =====================================================================
-
-// Case-insensitive wide-string substring search (wcsstr equivalent).
-static const wchar_t* wcsistr(const wchar_t* haystack, const wchar_t* needle)
-{
-    if (!*needle) return haystack;
-    size_t needleLen = wcslen(needle);
-    for (; *haystack; haystack++) {
-        if (_wcsnicmp(haystack, needle, needleLen) == 0)
-            return haystack;
-    }
-    return nullptr;
-}
-
-// Check if a path starts with a known Flash roaming dir and redirect
-// it to our local FlashData directory.
-static bool RedirectFlashDataPath(LPCWSTR lpFileName, wchar_t* outBuf, int outBufLen)
-{
-    if (!g_szFlashDataDir[0]) return false;
-
-    // Strip \\?\ extended-length path prefix if present
-    LPCWSTR path = lpFileName;
-    if (wcsncmp(path, L"\\\\?\\", 4) == 0)
-        path += 4;
-
-    if (g_roamingFlashDirLen &&
-        _wcsnicmp(path, g_szRoamingFlashDir, g_roamingFlashDirLen) == 0) {
-        const wchar_t* suffix = path + g_roamingFlashDirLen;
-        _snwprintf_s(outBuf, outBufLen, _TRUNCATE, L"%s%s", g_szFlashDataDir, suffix);
-        return true;
-    }
-
-    if (g_roamingAdobeDirLen &&
-        _wcsnicmp(path, g_szRoamingAdobeDir, g_roamingAdobeDirLen) == 0) {
-        const wchar_t* suffix = path + g_roamingAdobeDirLen;
-        _snwprintf_s(outBuf, outBufLen, _TRUNCATE, L"%s%s", g_szFlashDataDir, suffix);
-        return true;
-    }
-
-    // Also catch SysWOW64\Macromed\Flash paths (ss.cfg, ss.sgn, etc.)
-    const wchar_t* p = wcsistr(path, L"Macromed\\Flash\\");
-    if (p) {
-        p += 15; // skip "Macromed\Flash\"
-        _snwprintf_s(outBuf, outBufLen, _TRUNCATE, L"%s\\%s", g_szFlashDataDir, p);
-        return true;
-    }
-
-    return false;
-}
-
-// Ensure all parent directories of a path exist (for redirected paths)
-static void EnsureParentDirExists(const wchar_t* filePath)
-{
-    wchar_t dir[MAX_PATH];
-    wcsncpy_s(dir, filePath, _TRUNCATE);
-    PathRemoveFileSpecW(dir);
-
-    DWORD attr = GetFileAttributesW(dir);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
-        return;
-
-    // Build from FlashData root down
-    if (_wcsnicmp(dir, g_szFlashDataDir, g_flashDataDirLen) != 0)
-        return;
-
-    wchar_t build[MAX_PATH];
-    wcscpy_s(build, g_szFlashDataDir);
-    const wchar_t* rest = dir + g_flashDataDirLen;
-    while (*rest == L'\\') rest++;
-
-    wchar_t* ctx = nullptr;
-    wchar_t restCopy[MAX_PATH];
-    wcscpy_s(restCopy, rest);
-    wchar_t* tok = wcstok_s(restCopy, L"\\", &ctx);
-    while (tok) {
-        wcscat_s(build, L"\\");
-        wcscat_s(build, tok);
-        CreateDirectoryW(build, nullptr);
-        tok = wcstok_s(nullptr, L"\\", &ctx);
-    }
-}
-
-static HANDLE WINAPI Hooked_CreateFileW(
-    LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
-    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
-    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
-{
-    auto orig = reinterpret_cast<FN_CreateFileW>(s_hooks[HK_CreateFileW].pTrampoline);
-
-    if (lpFileName) {
-        // Redirect mms.cfg reads to our local copy (catches \\?\ prefixed paths too)
-        if (wcsistr(lpFileName, L"mms.cfg")) {
-            if (g_szMmsCfgPath[0]) {
-                DbgTrace(L"[FlashIE] CreateFileW: REDIRECTING %s -> %s\n",
-                          lpFileName, g_szMmsCfgPath);
-                return orig(g_szMmsCfgPath, dwDesiredAccess, dwShareMode,
-                           lpSecurityAttributes, dwCreationDisposition,
-                           dwFlagsAndAttributes, hTemplateFile);
-            }
-        }
-
-        // Redirect Flash Player data paths to local FlashData directory
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpFileName, redirected, MAX_PATH)) {
-            if (dwCreationDisposition == CREATE_ALWAYS ||
-                dwCreationDisposition == CREATE_NEW ||
-                dwCreationDisposition == OPEN_ALWAYS ||
-                (dwDesiredAccess & GENERIC_WRITE)) {
-                EnsureParentDirExists(redirected);
-            }
-            HANDLE h = orig(redirected, dwDesiredAccess, dwShareMode,
-                           lpSecurityAttributes, dwCreationDisposition,
-                           dwFlagsAndAttributes, hTemplateFile);
-            static int s_redirectLogCount = 0;
-            if (s_redirectLogCount < 200) {
-                s_redirectLogCount++;
-                DbgTrace(L"[FlashIE] CreateFileW REDIRECT: %s -> %s (%s)\n",
-                          lpFileName, redirected,
-                          (h != INVALID_HANDLE_VALUE) ? L"OK" : L"FAILED");
-            }
-            return h;
-        }
-
-        // Log Flash-related file access (SWF, Flash, Macromed)
-        if (wcsstr(lpFileName, L".swf") || wcsstr(lpFileName, L".SWF") ||
-            wcsstr(lpFileName, L"Flash") || wcsstr(lpFileName, L"flash") ||
-            wcsstr(lpFileName, L"Macromed") || wcsstr(lpFileName, L"macromed")) {
-            HANDLE h = orig(lpFileName, dwDesiredAccess, dwShareMode,
-                           lpSecurityAttributes, dwCreationDisposition,
-                           dwFlagsAndAttributes, hTemplateFile);
-            DbgTrace(L"[FlashIE] CreateFileW: %s -> %s\n",
-                      lpFileName,
-                      (h != INVALID_HANDLE_VALUE) ? L"OK" : L"FAILED");
-            return h;
-        }
-    }
-
-    return orig(lpFileName, dwDesiredAccess, dwShareMode,
-               lpSecurityAttributes, dwCreationDisposition,
-               dwFlagsAndAttributes, hTemplateFile);
-}
-
-static BOOL WINAPI Hooked_CreateDirectoryW(
-    LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
-{
-    auto orig = reinterpret_cast<FN_CreateDirectoryW>(s_hooks[HK_CreateDirectoryW].pTrampoline);
-
-    if (lpPathName) {
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpPathName, redirected, MAX_PATH)) {
-            BOOL ok = orig(redirected, lpSecurityAttributes);
-            static int s_mkdirLogCount = 0;
-            if (s_mkdirLogCount < 50) {
-                s_mkdirLogCount++;
-                DbgTrace(L"[FlashIE] CreateDirectoryW REDIRECT: %s -> %s (%s)\n",
-                          lpPathName, redirected,
-                          ok ? L"OK" : L"FAILED/EXISTS");
-            }
-            return ok;
-        }
-    }
-
-    return orig(lpPathName, lpSecurityAttributes);
-}
-
-static DWORD WINAPI Hooked_GetFileAttributesW(LPCWSTR lpFileName)
-{
-    auto orig = reinterpret_cast<FN_GetFileAttributesW>(s_hooks[HK_GetFileAttributesW].pTrampoline);
-
-    if (lpFileName) {
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpFileName, redirected, MAX_PATH)) {
-            return orig(redirected);
-        }
-    }
-
-    return orig(lpFileName);
-}
-
-static HANDLE WINAPI Hooked_FindFirstFileW(
-    LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)
-{
-    auto orig = reinterpret_cast<decltype(&FindFirstFileW)>(s_hooks[HK_FindFirstFileW].pTrampoline);
-
-    if (lpFileName) {
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpFileName, redirected, MAX_PATH)) {
-            return orig(redirected, lpFindFileData);
-        }
-    }
-
-    return orig(lpFileName, lpFindFileData);
-}
-
-static BOOL WINAPI Hooked_MoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName)
-{
-    auto orig = reinterpret_cast<FN_MoveFileW>(s_hooks[HK_MoveFileW].pTrampoline);
-
-    wchar_t redSrc[MAX_PATH], redDst[MAX_PATH];
-    bool rSrc = lpExistingFileName && RedirectFlashDataPath(lpExistingFileName, redSrc, MAX_PATH);
-    bool rDst = lpNewFileName && RedirectFlashDataPath(lpNewFileName, redDst, MAX_PATH);
-
-    if (rSrc || rDst) {
-        if (rDst) EnsureParentDirExists(redDst);
-        BOOL ok = orig(rSrc ? redSrc : lpExistingFileName,
-                       rDst ? redDst : lpNewFileName);
-        static int s_mvLogCount = 0;
-        if (s_mvLogCount < 50) {
-            s_mvLogCount++;
-            DbgTrace(L"[FlashIE] MoveFileW REDIRECT: %s -> %s (%s)\n",
-                      rSrc ? redSrc : lpExistingFileName,
-                      rDst ? redDst : lpNewFileName,
-                      ok ? L"OK" : L"FAILED");
-        }
-        return ok;
-    }
-
-    return orig(lpExistingFileName, lpNewFileName);
-}
-
-static BOOL WINAPI Hooked_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags)
-{
-    auto orig = reinterpret_cast<FN_MoveFileExW>(s_hooks[HK_MoveFileExW].pTrampoline);
-
-    wchar_t redSrc[MAX_PATH], redDst[MAX_PATH];
-    bool rSrc = lpExistingFileName && RedirectFlashDataPath(lpExistingFileName, redSrc, MAX_PATH);
-    bool rDst = lpNewFileName && RedirectFlashDataPath(lpNewFileName, redDst, MAX_PATH);
-
-    if (rSrc || rDst) {
-        if (rDst) EnsureParentDirExists(redDst);
-        BOOL ok = orig(rSrc ? redSrc : lpExistingFileName,
-                       rDst ? redDst : lpNewFileName, dwFlags);
-        static int s_mvxLogCount = 0;
-        if (s_mvxLogCount < 50) {
-            s_mvxLogCount++;
-            DbgTrace(L"[FlashIE] MoveFileExW REDIRECT: %s -> %s (%s)\n",
-                      rSrc ? redSrc : lpExistingFileName,
-                      rDst ? redDst : lpNewFileName,
-                      ok ? L"OK" : L"FAILED");
-        }
-        return ok;
-    }
-
-    return orig(lpExistingFileName, lpNewFileName, dwFlags);
-}
-
-static BOOL WINAPI Hooked_DeleteFileW(LPCWSTR lpFileName)
-{
-    auto orig = reinterpret_cast<FN_DeleteFileW>(s_hooks[HK_DeleteFileW].pTrampoline);
-
-    if (lpFileName) {
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpFileName, redirected, MAX_PATH)) {
-            return orig(redirected);
-        }
-    }
-
-    return orig(lpFileName);
-}
-
-static BOOL WINAPI Hooked_RemoveDirectoryW(LPCWSTR lpPathName)
-{
-    auto orig = reinterpret_cast<decltype(&RemoveDirectoryW)>(
-        s_hooks[HK_RemoveDirectoryW].pTrampoline);
-
-    if (lpPathName) {
-        wchar_t redirected[MAX_PATH];
-        if (RedirectFlashDataPath(lpPathName, redirected, MAX_PATH)) {
-            return orig(redirected);
-        }
-    }
-
-    return orig(lpPathName);
-}
-
-// =====================================================================
 // Section 9: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
 
@@ -1869,39 +1545,6 @@ bool FlashLoader::Activate()
     PathRemoveFileSpecW(szDir);
 
     PathCombineW(g_szOcxPath, szDir, L"Flash\\Flash.ocx");
-    PathCombineW(g_szMmsCfgPath, szDir, L"Flash\\mms.cfg");
-
-    // Set up local FlashData directory to redirect Flash Player's
-    // %APPDATA%\Macromedia\Flash Player writes (LSOs, settings, etc.)
-    PathCombineW(g_szFlashDataDir, szDir, L"FlashData");
-    g_flashDataDirLen = (int)wcslen(g_szFlashDataDir);
-
-    // Build the roaming path prefixes that Flash normally uses
-    WCHAR szAppData[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, szAppData))) {
-        PathCombineW(g_szRoamingFlashDir, szAppData, L"Macromedia\\Flash Player");
-        g_roamingFlashDirLen = (int)wcslen(g_szRoamingFlashDir);
-        PathCombineW(g_szRoamingAdobeDir, szAppData, L"Adobe\\Flash Player");
-        g_roamingAdobeDirLen = (int)wcslen(g_szRoamingAdobeDir);
-    }
-
-    // Create FlashData directory structure that Flash expects
-    CreateDirectoryW(g_szFlashDataDir, nullptr);
-    {
-        wchar_t sub[MAX_PATH];
-        PathCombineW(sub, g_szFlashDataDir, L"#SharedObjects");
-        CreateDirectoryW(sub, nullptr);
-        PathCombineW(sub, g_szFlashDataDir, L"macromedia.com");
-        CreateDirectoryW(sub, nullptr);
-        PathCombineW(sub, g_szFlashDataDir, L"macromedia.com\\support");
-        CreateDirectoryW(sub, nullptr);
-        PathCombineW(sub, g_szFlashDataDir, L"macromedia.com\\support\\flashplayer");
-        CreateDirectoryW(sub, nullptr);
-        PathCombineW(sub, g_szFlashDataDir, L"macromedia.com\\support\\flashplayer\\sys");
-        CreateDirectoryW(sub, nullptr);
-    }
-    DbgTrace(L"[FlashIE] FlashData dir: %s\n", g_szFlashDataDir);
-    DbgTrace(L"[FlashIE] Roaming Flash dir: %s (len=%d)\n", g_szRoamingFlashDir, g_roamingFlashDirLen);
 
     // Ensure Flash.ocx's dependencies resolve from the Flash subdirectory
     WCHAR szFlashDir[MAX_PATH];
@@ -1980,7 +1623,6 @@ void FlashLoader::InstallHooks()
     HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
     HMODULE hAdvapi32   = GetModuleHandleW(L"advapi32.dll");
     HMODULE hUrlmon     = GetModuleHandleW(L"urlmon.dll");
-    HMODULE hK32        = GetModuleHandleW(L"kernel32.dll");
     HMODULE hOleAut32   = GetModuleHandleW(L"oleaut32.dll");
     HMODULE hWldp       = GetModuleHandleW(L"wldp.dll");
     if (!hWldp) hWldp   = LoadLibraryW(L"wldp.dll");
@@ -2036,39 +1678,6 @@ void FlashLoader::InstallHooks()
     ResolveAndHook("LoadRegTypeLib", L"LoadRegTypeLib",
         reinterpret_cast<void*>(&Hooked_LoadRegTypeLib), s_hooks[HK_LoadRegTypeLib],
         hOleAut32);
-
-    // File system hooks (redirect Flash data paths to local FlashData dir)
-    ResolveAndHook("CreateFileW", L"CreateFileW",
-        reinterpret_cast<void*>(&Hooked_CreateFileW), s_hooks[HK_CreateFileW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("CreateDirectoryW", L"CreateDirectoryW",
-        reinterpret_cast<void*>(&Hooked_CreateDirectoryW), s_hooks[HK_CreateDirectoryW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("GetFileAttributesW", L"GetFileAttributesW",
-        reinterpret_cast<void*>(&Hooked_GetFileAttributesW), s_hooks[HK_GetFileAttributesW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("FindFirstFileW", L"FindFirstFileW",
-        reinterpret_cast<void*>(&Hooked_FindFirstFileW), s_hooks[HK_FindFirstFileW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("MoveFileW", L"MoveFileW",
-        reinterpret_cast<void*>(&Hooked_MoveFileW), s_hooks[HK_MoveFileW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("MoveFileExW", L"MoveFileExW",
-        reinterpret_cast<void*>(&Hooked_MoveFileExW), s_hooks[HK_MoveFileExW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("DeleteFileW", L"DeleteFileW",
-        reinterpret_cast<void*>(&Hooked_DeleteFileW), s_hooks[HK_DeleteFileW],
-        hKernelBase, hK32);
-
-    ResolveAndHook("RemoveDirectoryW", L"RemoveDirectoryW",
-        reinterpret_cast<void*>(&Hooked_RemoveDirectoryW), s_hooks[HK_RemoveDirectoryW],
-        hKernelBase, hK32);
 
     m_hooked = true;
 }
