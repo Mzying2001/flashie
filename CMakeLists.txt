@@ -11,6 +11,23 @@ add_subdirectory(JScriptCC)
 # Force JScriptCC to use the same CRT as flashie (its cmake_minimum_required resets CMP0091)
 set_target_properties(jscriptcc PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 
+# Microsoft Detours — function hooking library (no CMake support, build manually)
+add_library(detours STATIC
+    Detours/src/detours.cpp
+    Detours/src/disasm.cpp
+    Detours/src/modules.cpp
+    Detours/src/image.cpp
+    Detours/src/creatwth.cpp
+    Detours/src/disolx86.cpp
+    Detours/src/disolx64.cpp
+    Detours/src/disolia64.cpp
+    Detours/src/disolarm.cpp
+    Detours/src/disolarm64.cpp
+)
+target_include_directories(detours PUBLIC Detours/src)
+target_compile_options(detours PRIVATE /W0)
+set_target_properties(detours PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+
 add_executable(flashie WIN32
     source/main.cpp
     source/browser.cpp
@@ -32,6 +49,7 @@ target_compile_definitions(flashie PRIVATE
 
 target_link_libraries(flashie PRIVATE
     jscriptcc
+    detours
     ole32
     oleaut32
     uuid
