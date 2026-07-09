@@ -4,13 +4,17 @@
 
 #include "flash_loader.h"
 #include "debug.h"
-#include <shlwapi.h>
-#include <stdint.h>
+#include "flash.h"      // MIDL-generated Flash COM interface definitions
+
+#include <jscriptcc/CCPreprocessor.h>
+
+#include <string>
 #include <string.h>
-#include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
+#include <stdint.h>
+#include <shlwapi.h>
+#include <ocidl.h>      // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
-#include "flash.h"      // MIDL-generated Flash COM interface definitions
 
 // Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
@@ -514,7 +518,7 @@ static void MaybeHookFlashQI(IUnknown* pObj);
 static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 static void MaybeHookFlashQuickActivate(IUnknown* pObj);
-// Forward declaration: hooks IActiveScriptParse::ParseScriptText to log JS code
+// Forward declaration: hooks IActiveScriptParse::ParseScriptText for JScriptCC preprocessing
 static void MaybeHookScriptParseText(IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
@@ -774,7 +778,7 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     HRESULT hr = reinterpret_cast<FN_CoCreateInstance>(s_hooks[HK_CoCreateInstance].pTrampoline)(
         rclsid, pUnkOuter, dwClsContext, riid, ppv);
     DbgTrace(L"[FlashIE] CoCreateInstance({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
-    // Hook script engine ParseScriptText to log JS code
+    // Hook script engine ParseScriptText to preprocess via JScriptCC
     if (SUCCEEDED(hr) && ppv && *ppv)
         MaybeHookScriptParseText(static_cast<IUnknown*>(*ppv));
     return hr;
@@ -1560,9 +1564,12 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 // =====================================================================
 // Section 8g: Script Engine ParseScriptText Hook
 //
-// Hooks IActiveScriptParse::ParseScriptText on JScript/VBScript engines
-// to log all JavaScript code executed in the browser. Script engines
-// are detected by QI for IActiveScriptParse after CoCreateInstance.
+// Hooks IActiveScriptParse::ParseScriptText on JScript/VBScript engines.
+// Script code is preprocessed through JScriptCC's Conditional Compilation
+// engine (@cc_on / @if / @set / @end) before execution. If preprocessing
+// succeeds, the expanded code is passed to the original engine; otherwise
+// the original code is executed unmodified. All errors are reported via
+// DbgTrace (OutputDebugStringW).
 // =====================================================================
 
 static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
@@ -1572,11 +1579,49 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
     DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo)
 {
     if (pstrCode) {
-        DbgTrace(L"[FlashIE] === ParseScriptText begin ===\n");
-        if (pstrItemName && pstrItemName[0])
-            DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
-        DbgTrace(L"[FlashIE]   code: %s\n", pstrCode);
-        DbgTrace(L"[FlashIE] === ParseScriptText end ===\n");
+        // Convert UTF-16 source to UTF-8 for JScriptCC
+        int codeLen = static_cast<int>(wcslen(pstrCode));
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, nullptr, 0, nullptr, nullptr);
+        if (utf8Len > 0) {
+            std::string utf8Source(utf8Len, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, &utf8Source[0], utf8Len, nullptr, nullptr);
+
+            // Run JScriptCC conditional compilation preprocessor
+            std::string preprocessed;
+            jscriptcc::CCErrorList errors;
+            jscriptcc::CCPreprocessor preprocessor;
+            bool ok = preprocessor.Process(utf8Source, preprocessed, jscriptcc::CCEnvironment(), &errors);
+
+            // Report any preprocessing errors
+            for (const auto& err : errors) {
+                DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
+                         err.line, err.column, err.message.c_str());
+            }
+
+            if (ok && !preprocessed.empty()) {
+                // Convert preprocessed UTF-8 back to UTF-16
+                int wideLen = MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), nullptr, 0);
+                if (wideLen > 0) {
+                    std::wstring preprocessedWide(wideLen, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), &preprocessedWide[0], wideLen);
+
+                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) begin ===\n");
+                    if (pstrItemName && pstrItemName[0])
+                        DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
+                    DbgTrace(L"[FlashIE]   code: %s\n", preprocessedWide.c_str());
+                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
+
+                    return s_origParseScriptText(pThis, preprocessedWide.c_str(), pstrItemName,
+                        punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
+                        dwFlags, pvarResult, pexcepinfo);
+                }
+            }
+
+            // Preprocessing failed or produced empty output — fall through to original code
+            if (!ok) {
+                DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
+            }
+        }
     }
 
     return s_origParseScriptText(pThis, pstrCode, pstrItemName, punkContext,

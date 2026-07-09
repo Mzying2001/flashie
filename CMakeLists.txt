@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Use /MT (static CRT) for Release builds
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+add_subdirectory(JScriptCC)
+# Force JScriptCC to use the same CRT as flashie (its cmake_minimum_required resets CMP0091)
+set_target_properties(jscriptcc PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+
 add_executable(flashie WIN32
     source/main.cpp
     source/browser.cpp
@@ -27,6 +31,7 @@ target_compile_definitions(flashie PRIVATE
 )
 
 target_link_libraries(flashie PRIVATE
+    jscriptcc
     ole32
     oleaut32
     uuid
