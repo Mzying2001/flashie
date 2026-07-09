@@ -80,6 +80,20 @@ typedef HRESULT (WINAPI *FN_LoadRegTypeLib)(
 typedef HRESULT (WINAPI *FN_LoadTypeLibEx)(
     LPCOLESTR szFile, REGKIND regkind, ITypeLib** pptlib);
 
+// --- Script Engine ---
+
+// IActiveScriptParse32 {BB1A2AE2-A4F9-11CF-8F20-00805F2CD064}
+// NOTE: NOT BB1A2AE1 which is IID_IActiveScript (different interface!)
+static const IID IID_IActiveScriptParse_ =
+    {0xBB1A2AE2, 0xA4F9, 0x11CF, {0x8F, 0x20, 0x00, 0x80, 0x5F, 0x2C, 0xD0, 0x64}};
+
+// IActiveScriptParse::ParseScriptText (vtable index 5)
+typedef HRESULT (STDMETHODCALLTYPE *FN_ParseScriptText)(
+    void* pThis, LPCOLESTR pstrCode, LPCOLESTR pstrItemName,
+    IUnknown* punkContext, LPCOLESTR pstrDelimiter,
+    DWORD_PTR dwSourceContextCookie, ULONG ulStartingLineNumber,
+    DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo);
+
 // --- Flash object vtable ---
 
 typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(
@@ -500,6 +514,8 @@ static void MaybeHookFlashQI(IUnknown* pObj);
 static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 static void MaybeHookFlashQuickActivate(IUnknown* pObj);
+// Forward declaration: hooks IActiveScriptParse::ParseScriptText to log JS code
+static void MaybeHookScriptParseText(IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
@@ -711,6 +727,10 @@ static wchar_t s_szExeName[MAX_PATH] = {};
 // Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
 
+// Script engine ParseScriptText hook state
+static FN_ParseScriptText s_origParseScriptText = nullptr;
+static void** s_hookedScriptVtable = nullptr;
+
 // =====================================================================
 // Section 8a: COM Hooks
 // =====================================================================
@@ -754,6 +774,9 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     HRESULT hr = reinterpret_cast<FN_CoCreateInstance>(s_hooks[HK_CoCreateInstance].pTrampoline)(
         rclsid, pUnkOuter, dwClsContext, riid, ppv);
     DbgTrace(L"[FlashIE] CoCreateInstance({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
+    // Hook script engine ParseScriptText to log JS code
+    if (SUCCEEDED(hr) && ppv && *ppv)
+        MaybeHookScriptParseText(static_cast<IUnknown*>(*ppv));
     return hr;
 }
 
@@ -1535,6 +1558,59 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 }
 
 // =====================================================================
+// Section 8g: Script Engine ParseScriptText Hook
+//
+// Hooks IActiveScriptParse::ParseScriptText on JScript/VBScript engines
+// to log all JavaScript code executed in the browser. Script engines
+// are detected by QI for IActiveScriptParse after CoCreateInstance.
+// =====================================================================
+
+static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
+    void* pThis, LPCOLESTR pstrCode, LPCOLESTR pstrItemName,
+    IUnknown* punkContext, LPCOLESTR pstrDelimiter,
+    DWORD_PTR dwSourceContextCookie, ULONG ulStartingLineNumber,
+    DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo)
+{
+    if (pstrCode) {
+        DbgTrace(L"[FlashIE] === ParseScriptText begin ===\n");
+        if (pstrItemName && pstrItemName[0])
+            DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
+        DbgTrace(L"[FlashIE]   code: %s\n", pstrCode);
+        DbgTrace(L"[FlashIE] === ParseScriptText end ===\n");
+    }
+
+    return s_origParseScriptText(pThis, pstrCode, pstrItemName, punkContext,
+        pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
+        dwFlags, pvarResult, pexcepinfo);
+}
+
+static void MaybeHookScriptParseText(IUnknown* pObj)
+{
+    if (s_origParseScriptText) return; // already hooked
+
+    void* pParse = nullptr;
+    if (FAILED(pObj->QueryInterface(IID_IActiveScriptParse_, &pParse)) || !pParse)
+        return;
+
+    void** vtable = *reinterpret_cast<void***>(pParse);
+    // IActiveScriptParse::ParseScriptText is vtable slot 5
+    // (after QI=0, AddRef=1, Release=2, InitNew=3, AddScriptlet=4)
+    void* pTarget = vtable[5];
+
+    DWORD oldProtect;
+    if (VirtualProtect(&vtable[5], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        s_origParseScriptText = reinterpret_cast<FN_ParseScriptText>(pTarget);
+        vtable[5] = reinterpret_cast<void*>(Hooked_ParseScriptText);
+        VirtualProtect(&vtable[5], sizeof(void*), oldProtect, &oldProtect);
+        s_hookedScriptVtable = vtable;
+        DbgTrace(L"[FlashIE] Hook IActiveScriptParse::ParseScriptText: OK (addr=%p)\n",
+                 pTarget);
+    }
+
+    static_cast<IUnknown*>(pParse)->Release();
+}
+
+// =====================================================================
 // Section 9: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
 
@@ -1688,6 +1764,18 @@ void FlashLoader::Deactivate()
         for (int i = 0; i < HK_COUNT; i++)
             RemoveDetour(s_hooks[i]);
         m_hooked = false;
+    }
+
+    // Restore script engine vtable hook
+    if (s_hookedScriptVtable && s_origParseScriptText) {
+        DWORD oldProtect;
+        if (VirtualProtect(&s_hookedScriptVtable[5], sizeof(void*),
+                           PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            s_hookedScriptVtable[5] = reinterpret_cast<void*>(s_origParseScriptText);
+            VirtualProtect(&s_hookedScriptVtable[5], sizeof(void*), oldProtect, &oldProtect);
+        }
+        s_hookedScriptVtable = nullptr;
+        s_origParseScriptText = nullptr;
     }
 
     s_pFlashFactory = nullptr;
