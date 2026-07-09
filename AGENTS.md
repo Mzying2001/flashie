@@ -26,8 +26,9 @@ Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy
 
 ### Source Files
 
-Four source files and four headers:
+Four source files, four headers, plus one submodule dependency:
 
+- **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
 - **`source/flash_loader.h/.cpp`** — `FlashLoader` class. The core hooking engine, organized into 9 sections:
   - **Section 1-2**: Includes, constants, function pointer typedefs for all hooked APIs.
   - **Section 3**: Minimal x86/x64 instruction length decoder (`InsnLength`) for computing hook trampoline sizes.
@@ -45,6 +46,7 @@ Four source files and four headers:
   - **Section 8d**: Flash `QueryInterface` vtable hook — injects `IObjectSafety` (via `FlashSafetyTearoff`) and `IPersistPropertyBag` (via `FlashPersistPBagTearoff`) into Flash objects.
   - **Section 8e**: Flash forced in-place activation — hooks `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables. When MSHTML sets a client site, queues a 100ms timer to call `DoVerb(OLEIVERB_INPLACEACTIVATE)`. For `display:none` iframes, a 200ms repeating deferred timer re-activates Flash objects (max 50 retries / 10 seconds).
   - **Section 8f**: TypeLib hook (`LoadRegTypeLib`) — redirects Flash TypeLib GUID to `LoadTypeLibEx` on the local OCX file.
+  - **Section 8g**: Script engine `ParseScriptText` vtable hook — intercepts script execution to preprocess JScript Conditional Compilation via JScriptCC (`@cc_on` / `@if` / `@set` / `@end`). Converts UTF-16 source to UTF-8, runs `CCPreprocessor::Process`, reports errors via `DbgTrace`, then passes expanded code to the original engine. Falls back to original code on failure.
   - **Section 9**: Public API — `Activate()` (loads OCX, creates factory, registers with COM), `InstallHooks()` (force-loads IE DLLs, installs all detours), `Deactivate()` (flushes pending activations, removes hooks, revokes COM registration).
 
 - **`source/browser.h/.cpp`** — `BrowserHost` and OLE site classes (`COleSite`, `COleClientSite`, `COleInPlaceSite`, `COleInPlaceFrame`). Implements the standard OLE container interfaces needed to host an `IWebBrowser2` (IE) control in-process. `COleSite` implements:
