@@ -26,28 +26,28 @@ Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy
 
 ### Source Files
 
-Four source files, four headers, plus one submodule dependency:
+Four source files, four headers, plus two submodule dependencies:
 
+- **`Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, WLDP, TypeLib).
 - **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
-- **`source/flash_loader.h/.cpp`** — `FlashLoader` class. The core hooking engine, organized into 9 sections:
+- **`source/flash_loader.h/.cpp`** — `FlashLoader` class. The core hooking engine, organized into 8 sections:
   - **Section 1-2**: Includes, constants, function pointer typedefs for all hooked APIs.
-  - **Section 3**: Minimal x86/x64 instruction length decoder (`InsnLength`) for computing hook trampoline sizes.
-  - **Section 4**: Inline hook (detour) infrastructure — `InstallDetour`/`RemoveDetour` with trampoline allocation via `VirtualAlloc`.
-  - **Section 5**: Fake registry key system — tracks real `HKEY` handles (opened read-only) used as sentinels for fake Flash registry entries.
-  - **Section 6**: COM wrapper classes:
+  - **Section 3**: Detours hook infrastructure — `DetoursAttach` helper function, original function pointers (`s_orig*`) for all hooked APIs.
+  - **Section 4**: Fake registry key system — tracks real `HKEY` handles (opened read-only) used as sentinels for fake Flash registry entries.
+  - **Section 5**: COM wrapper classes:
     - `LoggingClassFactory` — wraps Flash's `IClassFactory`, hooks new Flash objects on `CreateInstance` (installs QI, SetClientSite, and QuickActivate vtable hooks).
     - `FlashSafetyTearoff` — `IObjectSafety` tearoff delegating COM identity to Flash (required by MSHTML for scripting).
     - `PropertyBagWrapper` — forces `allowScriptAccess="always"` in `IPropertyBag::Read` for ExternalInterface support.
     - `FlashPersistPBagTearoff` — wraps `IPersistPropertyBag::Load` to inject the PropertyBagWrapper.
-  - **Section 7**: Shared static state (paths, factory pointers, fake registry handles).
-  - **Section 8a**: COM hooks — `CoGetClassObject`, `CoCreateInstance`, `CoGetClassObjectFromURL`, `CLSIDFromProgID`. Intercept Flash CLSID requests and redirect to our local factory.
-  - **Section 8b**: Registry hooks — `RegOpenKeyExW`, `RegQueryValueExW`, `RegCloseKey`. Fake Flash CLSID registration (InprocServer32, TypeLib, ProgID), MIME type mapping, ActiveX kill bit bypass, FEATURE_BROWSER_EMULATION.
-  - **Section 8c**: Security hooks — `WldpIsClassInApprovedList`, `WldpQueryDynamicCodeTrust` (WLDP bypass), `CoInternetIsFeatureEnabled` (feature control bypass).
-  - **Section 8d**: Flash `QueryInterface` vtable hook — injects `IObjectSafety` (via `FlashSafetyTearoff`) and `IPersistPropertyBag` (via `FlashPersistPBagTearoff`) into Flash objects.
-  - **Section 8e**: Flash forced in-place activation — hooks `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables. When MSHTML sets a client site, queues a 100ms timer to call `DoVerb(OLEIVERB_INPLACEACTIVATE)`. For `display:none` iframes, a 200ms repeating deferred timer re-activates Flash objects (max 50 retries / 10 seconds).
-  - **Section 8f**: TypeLib hook (`LoadRegTypeLib`) — redirects Flash TypeLib GUID to `LoadTypeLibEx` on the local OCX file.
-  - **Section 8g**: Script engine `ParseScriptText` vtable hook — intercepts script execution to preprocess JScript Conditional Compilation via JScriptCC (`@cc_on` / `@if` / `@set` / `@end`). Converts UTF-16 source to UTF-8, runs `CCPreprocessor::Process`, reports errors via `DbgTrace`, then passes expanded code to the original engine. Falls back to original code on failure.
-  - **Section 9**: Public API — `Activate()` (loads OCX, creates factory, registers with COM), `InstallHooks()` (force-loads IE DLLs, installs all detours), `Deactivate()` (flushes pending activations, removes hooks, revokes COM registration).
+  - **Section 6**: Shared static state (paths, factory pointers, fake registry handles).
+  - **Section 7a**: COM hooks — `CoGetClassObject`, `CoCreateInstance`, `CoGetClassObjectFromURL`, `CLSIDFromProgID`. Intercept Flash CLSID requests and redirect to our local factory.
+  - **Section 7b**: Registry hooks — `RegOpenKeyExW`, `RegQueryValueExW`, `RegCloseKey`. Fake Flash CLSID registration (InprocServer32, TypeLib, ProgID), MIME type mapping, ActiveX kill bit bypass, FEATURE_BROWSER_EMULATION.
+  - **Section 7c**: Security hooks — `WldpIsClassInApprovedList`, `WldpQueryDynamicCodeTrust` (WLDP bypass), `CoInternetIsFeatureEnabled` (feature control bypass).
+  - **Section 7d**: Flash `QueryInterface` vtable hook — injects `IObjectSafety` (via `FlashSafetyTearoff`) and `IPersistPropertyBag` (via `FlashPersistPBagTearoff`) into Flash objects.
+  - **Section 7e**: Flash forced in-place activation — hooks `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables. When MSHTML sets a client site, queues a 100ms timer to call `DoVerb(OLEIVERB_INPLACEACTIVATE)`. For `display:none` iframes, a 200ms repeating deferred timer re-activates Flash objects (max 50 retries / 10 seconds).
+  - **Section 7f**: TypeLib hook (`LoadRegTypeLib`) — redirects Flash TypeLib GUID to `LoadTypeLibEx` on the local OCX file.
+  - **Section 7g**: Script engine `ParseScriptText` vtable hook — intercepts script execution to preprocess JScript Conditional Compilation via JScriptCC (`@cc_on` / `@if` / `@set` / `@end`). Converts UTF-16 source to UTF-8, runs `CCPreprocessor::Process`, reports errors via `DbgTrace`, then passes expanded code to the original engine. Falls back to original code on failure.
+  - **Section 8**: Public API — `Activate()` (loads OCX, creates factory, registers with COM), `InstallHooks()` (force-loads IE DLLs, installs all detours via `DetoursAttach`), `Deactivate()` (flushes pending activations, detaches hooks via `DetourDetach`, revokes COM registration).
 
 - **`source/browser.h/.cpp`** — `BrowserHost` and OLE site classes (`COleSite`, `COleClientSite`, `COleInPlaceSite`, `COleInPlaceFrame`). Implements the standard OLE container interfaces needed to host an `IWebBrowser2` (IE) control in-process. `COleSite` implements:
   - `IDocHostUIHandler` — disables 3D border (`DOCHOSTUIFLAG_NO3DBORDER`).
@@ -71,13 +71,13 @@ The program MUST NOT register Flash.ocx into the system registry, and MUST NOT w
 
 - **No `regsvr32` or `DllRegisterServer`**: Flash.ocx (alongside the exe) is loaded via `LoadLibrary` + `DllGetClassObject` only. The class factory is registered in-process via `CoRegisterClassObject`, never written to `HKCR` or `HKLM`.
 - **No registry writes**: Registry hooks (`RegOpenKeyExW`, `RegQueryValueExW`) return fake in-memory responses for Flash CLSID lookups. No actual registry keys are created or modified. Fake `HKEY` handles are opened read-only on existing unrelated keys — used only as valid handle values, never written to.
-- **Process-scoped hooks**: All inline hooks (COM, registry, WLDP, TypeLib) operate only within the current process's address space. They are removed on shutdown via `FlashLoader::Deactivate()`.
+- **Process-scoped hooks**: All Detours hooks (COM, registry, WLDP, TypeLib) and vtable patches operate only within the current process's address space. They are removed on shutdown via `FlashLoader::Deactivate()` (`DetourDetach` + vtable restoration).
 
 When adding new features or modifying hooks, ensure this invariant is preserved. Any code path that could write to the registry or register COM objects system-wide is a bug.
 
 ## Key Design Details
 
-- **Inline hooking**: Patches the first bytes of target functions with a JMP to the hook, saving originals in a trampoline. Not IAT patching — intercepts all callers including vtable and `GetProcAddress`-resolved calls. Uses a custom x86/x64 instruction length decoder to determine how many bytes to copy for the trampoline prologue.
+- **Inline hooking**: Uses Microsoft Detours (`DetourAttach`/`DetourDetach`) to intercept API-level function calls. Not IAT patching — intercepts all callers including `GetProcAddress`-resolved calls. Vtable hooks (`IOleObject::SetClientSite`, `IQuickActivate::QuickActivate`, `IActiveScriptParse::ParseScriptText`) are handled separately by direct vtable entry patching, since Detours targets function prologues rather than vtable slots.
 - **Fake registry keys**: Uses real `HKEY` handles (opened read-only on existing keys) tracked in a table, because Windows internals dereference `HKEY` as a pointer — sentinel values cause access violations.
 - **`LoggingClassFactory`**: Wraps the real Flash class factory. On `CreateInstance`, installs three vtable hooks on the new Flash object: (1) `QueryInterface` hook for `IObjectSafety`/`IPersistPropertyBag` injection, (2) `IOleObject::SetClientSite` hook for forced activation, (3) `IQuickActivate::QuickActivate` hook for iframe activation. Registered as the COM class object (not the raw factory) so all creation paths go through it.
 - **Forced activation**: Windows 10 defers Flash `DoVerb(INPLACEACTIVATE)` until user click. Two vtable hooks solve this:
