@@ -10,6 +10,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_subdirectory(JScriptCC)
 # Force JScriptCC to use the same CRT as flashie (its cmake_minimum_required resets CMP0091)
 set_target_properties(jscriptcc PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+target_compile_options(jscriptcc PRIVATE /utf-8)
 
 # Microsoft Detours — function hooking library (no CMake support, build manually)
 add_library(detours STATIC

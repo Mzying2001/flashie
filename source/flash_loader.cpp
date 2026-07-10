@@ -1295,7 +1295,13 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
             std::string preprocessed;
             jscriptcc::CCErrorList errors;
             jscriptcc::CCPreprocessor preprocessor;
-            bool ok = preprocessor.Process(utf8Source, preprocessed, jscriptcc::CCEnvironment(), &errors);
+
+            const auto architecture = sizeof(void*) == 8
+                ? jscriptcc::TargetArchitecture::Win64
+                : jscriptcc::TargetArchitecture::Win32;
+
+            bool ok = preprocessor.process(
+                utf8Source, preprocessed, jscriptcc::CCEnvironment(architecture), &errors);
 
             // Report any preprocessing errors
             for (const auto& err : errors) {
