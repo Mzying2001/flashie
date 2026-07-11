@@ -47,9 +47,6 @@ typedef HRESULT (STDAPICALLTYPE *FN_CoGetClassObjectFromURL)(
     DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv);
 
-typedef HRESULT (STDAPICALLTYPE *FN_CoInternetIsFeatureEnabled)(
-    DWORD dwFeature, DWORD dwFlags);
-
 typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(
     LPCOLESTR lpszProgID, LPCLSID lpclsid);
 
@@ -112,7 +109,6 @@ static FN_RegOpenKeyExW               s_origRegOpenKeyExW = nullptr;
 static FN_RegQueryValueExW            s_origRegQueryValueExW = nullptr;
 static FN_RegCloseKey                 s_origRegCloseKey = nullptr;
 static FN_CoGetClassObjectFromURL     s_origCoGetClassObjectFromURL = nullptr;
-static FN_CoInternetIsFeatureEnabled  s_origCoInternetIsFeatureEnabled = nullptr;
 static FN_WldpIsClassInApprovedList   s_origWldpIsClassInApprovedList = nullptr;
 static FN_WldpQueryDynamicCodeTrust   s_origWldpQueryDynamicCodeTrust = nullptr;
 static FN_LoadRegTypeLib              s_origLoadRegTypeLib = nullptr;
@@ -437,6 +433,7 @@ static wchar_t s_szExeName[MAX_PATH] = {};
 
 // Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
+static HMODULE g_hOcxModule = nullptr;
 
 // Script engine ParseScriptText hook state
 static FN_ParseScriptText s_origParseScriptText = nullptr;
@@ -883,20 +880,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
         return FakeRegDword(lpType, lpData, lpcbData, 11001);
     }
 
-    // ---- Clear kill bit from Compatibility Flags ----
-    if (lpValueName && _wcsicmp(lpValueName, L"Compatibility Flags") == 0) {
-        LSTATUS res = s_origRegQueryValueExW(
-            hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
-        if (res == ERROR_SUCCESS && lpData && lpcbData && *lpcbData >= sizeof(DWORD)) {
-            DWORD val = *reinterpret_cast<DWORD*>(lpData);
-            if (val & 0x400) {
-                DbgTrace(L"[FlashIE] RegQueryValueExW: cleared kill bit (was 0x%X)\n", val);
-                *reinterpret_cast<DWORD*>(lpData) = val & ~0x400;
-            }
-        }
-        return res;
-    }
-
     return s_origRegQueryValueExW(
         hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
 }
@@ -914,44 +897,57 @@ LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 // Section 7c: Security & Feature Hooks
 // =====================================================================
 
-// Disable all IE Feature Controls. MSHTML checks features like
-// FEATURE_RESTRICT_ACTIVEXINSTALL and FEATURE_SAFE_BINDTOOBJECT before
-// allowing ActiveX. Returning S_FALSE means "feature not enabled".
-HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoInternetIsFeatureEnabled(
-    DWORD dwFeature, DWORD dwFlags)
+static bool IsFlashCodeImage(HANDLE fileHandle, void* baseImage)
 {
-    HRESULT hrOrig = s_origCoInternetIsFeatureEnabled(dwFeature, dwFlags);
-
-    // S_OK = feature enabled (blocks), S_FALSE = feature not enabled (allows).
-    // Only log non-spammy features (skip feature 0 = OBJECT_CACHING)
-    static int s_featureLogCount = 0;
-    if (dwFeature != 0 && s_featureLogCount < 50) {
-        s_featureLogCount++;
-        DbgTrace(L"[FlashIE] CoInternetIsFeatureEnabled(feature=%u, flags=0x%X) orig=0x%08X -> S_FALSE\n",
-                 dwFeature, dwFlags, hrOrig);
+    if (baseImage && g_hOcxModule) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(baseImage, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+            mbi.AllocationBase == g_hOcxModule) {
+            return true;
+        }
     }
-    return S_FALSE;
+
+    if (fileHandle && fileHandle != INVALID_HANDLE_VALUE && g_szOcxPath[0]) {
+        wchar_t path[MAX_PATH + 4] = {};
+        DWORD length = GetFinalPathNameByHandleW(
+            fileHandle, path, _countof(path), FILE_NAME_NORMALIZED);
+        if (length > 0 && length < _countof(path)) {
+            const wchar_t* normalized = path;
+            if (wcsncmp(normalized, L"\\\\?\\", 4) == 0)
+                normalized += 4;
+            if (_wcsicmp(normalized, g_szOcxPath) == 0)
+                return true;
+        }
+    }
+
+    return false;
 }
 
 // Windows 10+ MSHTML calls wldp!WldpIsClassInApprovedList to check if
-// an ActiveX CLSID is approved for instantiation. We approve everything.
+// an ActiveX CLSID is approved for instantiation. Only the local Flash class
+// is exempted; every other class keeps the system policy result.
 HRESULT WINAPI FlashLoader::Hooked_WldpIsClassInApprovedList(
     const CLSID* classID, void* hostInfo, BOOL* isApproved, DWORD optionalFlags)
 {
-    if (classID)
-        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList({%08X-...}) -> approved\n", classID->Data1);
-    else
-        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList(null) -> approved\n");
+    if (classID && IsEqualCLSID(*classID, CLSID_ShockwaveFlash)) {
+        if (isApproved) *isApproved = TRUE;
+        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList(Flash) -> approved\n");
+        return S_OK;
+    }
 
-    if (isApproved) *isApproved = TRUE;
-    return S_OK;
+    return s_origWldpIsClassInApprovedList(
+        classID, hostInfo, isApproved, optionalFlags);
 }
 
 HRESULT WINAPI FlashLoader::Hooked_WldpQueryDynamicCodeTrust(
     HANDLE fileHandle, void* baseImage, DWORD imageSize)
 {
-    DbgTrace(L"[FlashIE] WldpQueryDynamicCodeTrust -> S_OK (trusted)\n");
-    return S_OK;
+    if (IsFlashCodeImage(fileHandle, baseImage)) {
+        DbgTrace(L"[FlashIE] WldpQueryDynamicCodeTrust(Flash.ocx) -> trusted\n");
+        return S_OK;
+    }
+
+    return s_origWldpQueryDynamicCodeTrust(fileHandle, baseImage, imageSize);
 }
 
 // =====================================================================
@@ -1382,6 +1378,7 @@ bool FlashLoader::Activate()
     SetDllDirectoryW(szDir);
 
     m_hModule = LoadLibraryW(g_szOcxPath);
+    g_hOcxModule = m_hModule;
 
     // Pin Flash.ocx in memory — prevent COM from unloading it when all
     // Flash objects are released.  Our hooks (factory pointers, etc.)
@@ -1404,6 +1401,7 @@ bool FlashLoader::Activate()
     if (!pfnGetClassObject) {
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
+        g_hOcxModule = nullptr;
         return false;
     }
 
@@ -1412,6 +1410,7 @@ bool FlashLoader::Activate()
     if (FAILED(hr) || !m_pFactory) {
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
+        g_hOcxModule = nullptr;
         return false;
     }
 
@@ -1479,9 +1478,6 @@ void FlashLoader::InstallHooks()
     // URL moniker hooks
     DetoursAttach(reinterpret_cast<void**>(&s_origCoGetClassObjectFromURL),
         reinterpret_cast<void*>(&Hooked_CoGetClassObjectFromURL), hUrlmon, "CoGetClassObjectFromURL");
-    DetoursAttach(reinterpret_cast<void**>(&s_origCoInternetIsFeatureEnabled),
-        reinterpret_cast<void*>(&Hooked_CoInternetIsFeatureEnabled), hUrlmon, "CoInternetIsFeatureEnabled");
-
     // WLDP hooks (Windows 10+ ActiveX approval)
     DetoursAttach(reinterpret_cast<void**>(&s_origWldpIsClassInApprovedList),
         reinterpret_cast<void*>(&Hooked_WldpIsClassInApprovedList), hWldp, "WldpIsClassInApprovedList");
@@ -1514,7 +1510,6 @@ void FlashLoader::Deactivate()
         DETACH(s_origCoCreateInstance,           Hooked_CoCreateInstance);
         DETACH(s_origCLSIDFromProgID,            Hooked_CLSIDFromProgID);
         DETACH(s_origCoGetClassObjectFromURL,    Hooked_CoGetClassObjectFromURL);
-        DETACH(s_origCoInternetIsFeatureEnabled, Hooked_CoInternetIsFeatureEnabled);
         DETACH(s_origWldpIsClassInApprovedList,  Hooked_WldpIsClassInApprovedList);
         DETACH(s_origWldpQueryDynamicCodeTrust,  Hooked_WldpQueryDynamicCodeTrust);
         DETACH(s_origLoadRegTypeLib,             Hooked_LoadRegTypeLib);
@@ -1563,6 +1558,7 @@ void FlashLoader::Deactivate()
     }
     
     if (m_hModule) {
+        g_hOcxModule = nullptr;
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
     }
