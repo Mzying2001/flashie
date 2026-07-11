@@ -65,6 +65,14 @@ static void OnStatusTextChange(const wchar_t* text, void*)
         SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text));
 }
 
+static void OnLoadingStateChange(bool isLoading, void*)
+{
+    if (g_hwndRefresh)
+        EnableWindow(g_hwndRefresh, !isLoading);
+    if (g_hwndStop)
+        EnableWindow(g_hwndStop, isLoading);
+}
+
 static void LayoutControls(int cx, int cy)
 {
     int statusHeight = 0;
@@ -112,6 +120,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,
             reinterpret_cast<HMENU>(ID_STATUS), hInst, nullptr);
 
+        OnLoadingStateChange(false, nullptr);
+
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
@@ -128,6 +138,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
             g_pBrowser->SetStatusTextChangeCallback(OnStatusTextChange, nullptr);
+            g_pBrowser->SetLoadingStateCallback(OnLoadingStateChange, nullptr);
             g_pBrowser->Navigate(g_initialAddress.c_str());
         }
 

@@ -209,6 +209,20 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
 {
     switch (dispid) {
 
+    case DISPID_DOWNLOADBEGIN:
+        if (m_pBrowserHost && m_pBrowserHost->m_loadingStateCallback) {
+            m_pBrowserHost->m_loadingStateCallback(
+                true, m_pBrowserHost->m_loadingStateCtx);
+        }
+        return S_OK;
+
+    case DISPID_DOWNLOADCOMPLETE:
+        if (m_pBrowserHost && m_pBrowserHost->m_loadingStateCallback) {
+            m_pBrowserHost->m_loadingStateCallback(
+                false, m_pBrowserHost->m_loadingStateCtx);
+        }
+        return S_OK;
+
     case DISPID_NAVIGATECOMPLETE2: {
         // rgvarg[1] = pDisp (IDispatch of the frame), rgvarg[0] = URL
         if (pDispParams->cArgs >= 2 && m_pBrowserHost) {
