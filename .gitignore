@@ -71,3 +71,6 @@ Testing/
 # IDE / tool directories
 .claude/
 .vscode/
+
+# Code review documents
+code-review/
