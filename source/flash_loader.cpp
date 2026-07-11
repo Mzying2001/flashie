@@ -412,7 +412,6 @@ static wchar_t s_szExeName[MAX_PATH] = {};
 // Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
 static HMODULE g_hOcxModule = nullptr;
-static std::wstring g_sharedObjectsRoot;
 
 // Script engine ParseScriptText hook state. Different JScript implementations
 // have different shared vtables, so each original slot is tracked separately.
@@ -1535,108 +1534,27 @@ static bool IsFlashCaller(void* returnAddress)
            mbi.AllocationBase == g_hOcxModule;
 }
 
-static bool HasParentTraversal(const std::wstring& path)
+static bool HasSolExtension(LPCWSTR path)
 {
-    size_t start = 0;
-    while (start <= path.size()) {
-        size_t end = path.find(L'\\', start);
-        size_t length = end == std::wstring::npos ? path.size() - start : end - start;
-        if (length == 2 && path[start] == L'.' && path[start + 1] == L'.')
-            return true;
-        if (end == std::wstring::npos)
-            break;
-        start = end + 1;
-    }
-    return false;
-}
-
-static bool CanonicalizeAbsolutePath(LPCWSTR path, std::wstring& canonical)
-{
-    canonical.clear();
-    if (!path || !path[0])
-        return false;
-
-    std::wstring input(path);
-    for (wchar_t& ch : input) {
-        if (ch == L'/')
-            ch = L'\\';
-    }
-
-    if (input.size() < 3 || input[1] != L':' || input[2] != L'\\' ||
-        input.find(L':', 2) != std::wstring::npos || HasParentTraversal(input))
-        return false;
-
-    DWORD required = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
-    if (!required)
-        return false;
-
-    std::wstring full(required, L'\0');
-    DWORD written = GetFullPathNameW(input.c_str(), required, &full[0], nullptr);
-    if (!written || written >= required)
-        return false;
-    full.resize(written);
-    canonical.swap(full);
-    return true;
-}
-
-static void InitializeSharedObjectsRoot()
-{
-    g_sharedObjectsRoot.clear();
-
-    DWORD required = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
-    if (required <= 1)
-        return;
-
-    std::wstring appData(required, L'\0');
-    DWORD written = GetEnvironmentVariableW(L"APPDATA", &appData[0], required);
-    if (!written || written >= required)
-        return;
-    appData.resize(written);
-
-    std::wstring root = appData + L"\\Macromedia\\Flash Player\\#SharedObjects";
-    if (!CanonicalizeAbsolutePath(root.c_str(), g_sharedObjectsRoot))
-        g_sharedObjectsRoot.clear();
-}
-
-static bool IsScopedSolPath(LPCWSTR path)
-{
-    std::wstring normalized;
-    if (!CanonicalizeAbsolutePath(path, normalized) || g_sharedObjectsRoot.empty())
-        return false;
-
-    size_t rootLength = g_sharedObjectsRoot.size();
-    if (normalized.size() <= rootLength + 4 || normalized[rootLength] != L'\\' ||
-        _wcsnicmp(normalized.c_str(), g_sharedObjectsRoot.c_str(), rootLength) != 0)
-        return false;
-
-    return _wcsicmp(normalized.c_str() + normalized.size() - 4, L".sol") == 0;
-}
-
-static bool ConvertAnsiPath(LPCSTR path, std::wstring& widePath)
-{
-    widePath.clear();
     if (!path)
         return false;
+    size_t length = wcslen(path);
+    return length >= 4 && _wcsicmp(path + length - 4, L".sol") == 0;
+}
 
-    int required = MultiByteToWideChar(CP_ACP, 0, path, -1, nullptr, 0);
-    if (required <= 1)
+static bool HasSolExtension(LPCSTR path)
+{
+    if (!path)
         return false;
-
-    widePath.resize(static_cast<size_t>(required));
-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, &widePath[0], required)) {
-        widePath.clear();
-        return false;
-    }
-    widePath.resize(static_cast<size_t>(required - 1));
-    return true;
+    size_t length = strlen(path);
+    return length >= 4 && _stricmp(path + length - 4, ".sol") == 0;
 }
 
 static BOOL ReturnMissingSolDeleteAsSuccess(
-    BOOL result, DWORD error, LPCWSTR path, void* returnAddress)
+    BOOL result, DWORD error, bool isFlashSol)
 {
-    if (!result && error == ERROR_FILE_NOT_FOUND &&
-        IsFlashCaller(returnAddress) && IsScopedSolPath(path)) {
-        DbgTrace(L"[FlashIE] Treating missing first-save SOL as deleted: %s\n", path);
+    if (!result && error == ERROR_FILE_NOT_FOUND && isFlashSol) {
+        DbgTrace(L"[FlashIE] Treating missing first-save SOL as deleted\n");
         SetLastError(ERROR_SUCCESS);
         return TRUE;
     }
@@ -1647,25 +1565,18 @@ static BOOL ReturnMissingSolDeleteAsSuccess(
 
 BOOL WINAPI FlashLoader::Hooked_DeleteFileW(LPCWSTR lpFileName)
 {
-    void* returnAddress = _ReturnAddress();
+    bool isFlashSol = IsFlashCaller(_ReturnAddress()) && HasSolExtension(lpFileName);
     BOOL result = s_origDeleteFileW(lpFileName);
     DWORD error = GetLastError();
-    return ReturnMissingSolDeleteAsSuccess(result, error, lpFileName, returnAddress);
+    return ReturnMissingSolDeleteAsSuccess(result, error, isFlashSol);
 }
 
 BOOL WINAPI FlashLoader::Hooked_DeleteFileA(LPCSTR lpFileName)
 {
-    void* returnAddress = _ReturnAddress();
+    bool isFlashSol = IsFlashCaller(_ReturnAddress()) && HasSolExtension(lpFileName);
     BOOL result = s_origDeleteFileA(lpFileName);
     DWORD error = GetLastError();
-
-    std::wstring widePath;
-    if (!ConvertAnsiPath(lpFileName, widePath)) {
-        SetLastError(error);
-        return result;
-    }
-    return ReturnMissingSolDeleteAsSuccess(
-        result, error, widePath.c_str(), returnAddress);
+    return ReturnMissingSolDeleteAsSuccess(result, error, isFlashSol);
 }
 
 // =====================================================================
@@ -1679,7 +1590,6 @@ bool FlashLoader::Activate()
     PathRemoveFileSpecW(szDir);
 
     PathCombineW(g_szOcxPath, szDir, L"Flash.ocx");
-    InitializeSharedObjectsRoot();
 
     // Ensure Flash.ocx's dependencies resolve from the exe directory
     SetDllDirectoryW(szDir);
@@ -1979,6 +1889,5 @@ void FlashLoader::Deactivate()
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
     }
-    g_sharedObjectsRoot.clear();
     InterlockedExchange(&s_activationThreadId, 0);
 }
