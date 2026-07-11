@@ -1,7 +1,9 @@
 #include <windows.h>
 #include <ole2.h>
+#include <shellapi.h>
 #include <shlwapi.h>
 #include <stdio.h>
+#include <string>
 #include "flash_loader.h"
 #include "browser.h"
 
@@ -32,6 +34,7 @@ static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
 static bool         g_isClosing       = false;
+static std::wstring g_initialAddress  = L"about:blank";
 
 static void DoNavigate()
 {
@@ -104,7 +107,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
-            g_pBrowser->Navigate(L"about:blank");
+            g_pBrowser->Navigate(g_initialAddress.c_str());
         }
 
         LayoutControls(rc.right, rc.bottom);
@@ -165,6 +168,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        if (argc > 1)
+            g_initialAddress = argv[1];
+        LocalFree(argv);
+    }
+
     OleInitialize(nullptr);
 
     // Register Flash.ocx class factory into this process's COM table.

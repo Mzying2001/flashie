@@ -58,6 +58,12 @@ cmake --build build-win7-x64 --config Release
 3. Run `FlashIE.exe`
 4. Enter a URL or local file path containing Flash content in the address bar
 
+To load an address at startup, pass the URL or local file path as the first argument:
+
+```powershell
+FlashIE.exe "https://example.com/flash.html"
+```
+
 ## Project Structure
 
 ```

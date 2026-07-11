@@ -63,7 +63,7 @@ Four source files, four headers, plus two submodule dependencies:
 
 - **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
 
-- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. Initialization order: `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/WLDP/TypeLib hooks) → create browser. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
+- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. The first command-line argument is used as the initial address; without one, the browser opens `about:blank`. Initialization order: parse command line → `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/WLDP/TypeLib hooks) → create browser. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
 
 - **`source/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
 

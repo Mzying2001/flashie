@@ -82,6 +82,7 @@ target_link_libraries(flashie PRIVATE
     ole32
     oleaut32
     uuid
+    shell32
     shlwapi
     urlmon
 )
