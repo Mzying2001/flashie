@@ -21,6 +21,13 @@
 // Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
 
+// In-box JScript Active Scripting engines. VBScript implements the same parse
+// interface, so the class ID must be checked before installing JScriptCC.
+static const CLSID CLSID_JScript_ =
+    {0xF414C260, 0x6AC0, 0x11CF, {0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58}};
+static const CLSID CLSID_JScript9_ =
+    {0x16D51579, 0xA30B, 0x4C8B, {0xA2, 0x76, 0x0F, 0xF4, 0xDC, 0x41, 0xE7, 0x55}};
+
 // Static member
 IClassFactory* FlashLoader::s_pFlashFactory = nullptr;
 
@@ -218,7 +225,7 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 static void MaybeHookFlashQuickActivate(IUnknown* pObj);
 // Forward declaration: hooks IActiveScriptParse::ParseScriptText for JScriptCC preprocessing
-static void MaybeHookScriptParseText(IUnknown* pObj);
+static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
@@ -344,9 +351,15 @@ static wchar_t s_szExeName[MAX_PATH] = {};
 static wchar_t g_szOcxPath[MAX_PATH] = {};
 static HMODULE g_hOcxModule = nullptr;
 
-// Script engine ParseScriptText hook state
-static FN_ParseScriptText s_origParseScriptText = nullptr;
-static void** s_hookedScriptVtable = nullptr;
+// Script engine ParseScriptText hook state. Different JScript implementations
+// have different shared vtables, so each original slot is tracked separately.
+struct ScriptVtableHook {
+    void** vtable;
+    FN_ParseScriptText original;
+};
+static const int MAX_SCRIPT_HOOKS = 4;
+static ScriptVtableHook s_scriptHooks[MAX_SCRIPT_HOOKS] = {};
+static int s_scriptHookCount = 0;
 
 // =====================================================================
 // Section 7a: COM Hooks
@@ -391,7 +404,7 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     DbgTrace(L"[FlashIE] CoCreateInstance({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
     // Hook script engine ParseScriptText to preprocess via JScriptCC
     if (SUCCEEDED(hr) && ppv && *ppv)
-        MaybeHookScriptParseText(static_cast<IUnknown*>(*ppv));
+        MaybeHookScriptParseText(rclsid, static_cast<IUnknown*>(*ppv));
     return hr;
 }
 
@@ -1157,7 +1170,7 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 // =====================================================================
 // Section 7g: Script Engine ParseScriptText Hook
 //
-// Hooks IActiveScriptParse::ParseScriptText on JScript/VBScript engines.
+// Hooks IActiveScriptParse::ParseScriptText on JScript engines.
 // Script code is preprocessed through JScriptCC's Conditional Compilation
 // engine (@cc_on / @if / @set / @end) before execution. If preprocessing
 // succeeds, the expanded code is passed to the original engine; otherwise
@@ -1171,6 +1184,17 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
     DWORD_PTR dwSourceContextCookie, ULONG ulStartingLineNumber,
     DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo)
 {
+    void** vtable = *reinterpret_cast<void***>(pThis);
+    FN_ParseScriptText original = nullptr;
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        if (s_scriptHooks[i].vtable == vtable) {
+            original = s_scriptHooks[i].original;
+            break;
+        }
+    }
+    if (!original)
+        return E_UNEXPECTED;
+
     if (pstrCode) {
         // Convert UTF-16 source to UTF-8 for JScriptCC
         int codeLen = static_cast<int>(wcslen(pstrCode));
@@ -1210,7 +1234,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
                     DbgTrace(L"[FlashIE]   code: %s\n", preprocessedWide.c_str());
                     DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
 
-                    return s_origParseScriptText(pThis, preprocessedWide.c_str(), pstrItemName,
+                    return original(pThis, preprocessedWide.c_str(), pstrItemName,
                         punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
                         dwFlags, pvarResult, pexcepinfo);
                 }
@@ -1223,14 +1247,21 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
         }
     }
 
-    return s_origParseScriptText(pThis, pstrCode, pstrItemName, punkContext,
+    return original(pThis, pstrCode, pstrItemName, punkContext,
         pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
         dwFlags, pvarResult, pexcepinfo);
 }
 
-static void MaybeHookScriptParseText(IUnknown* pObj)
+static bool IsJScriptEngine(REFCLSID rclsid)
 {
-    if (s_origParseScriptText) return; // already hooked
+    return IsEqualCLSID(rclsid, CLSID_JScript_) ||
+           IsEqualCLSID(rclsid, CLSID_JScript9_);
+}
+
+static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
+{
+    if (!IsJScriptEngine(rclsid))
+        return;
 
     void* pParse = nullptr;
     if (FAILED(pObj->QueryInterface(IID_IActiveScriptParse, &pParse)) || !pParse)
@@ -1241,12 +1272,26 @@ static void MaybeHookScriptParseText(IUnknown* pObj)
     // (after QI=0, AddRef=1, Release=2, InitNew=3, AddScriptlet=4)
     void* pTarget = vtable[5];
 
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        if (s_scriptHooks[i].vtable == vtable) {
+            static_cast<IUnknown*>(pParse)->Release();
+            return;
+        }
+    }
+    if (s_scriptHookCount >= MAX_SCRIPT_HOOKS) {
+        DbgTrace(L"[FlashIE] Script vtable hook table is full\n");
+        static_cast<IUnknown*>(pParse)->Release();
+        return;
+    }
+
     DWORD oldProtect;
     if (VirtualProtect(&vtable[5], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        s_origParseScriptText = reinterpret_cast<FN_ParseScriptText>(pTarget);
         vtable[5] = reinterpret_cast<void*>(Hooked_ParseScriptText);
         VirtualProtect(&vtable[5], sizeof(void*), oldProtect, &oldProtect);
-        s_hookedScriptVtable = vtable;
+        s_scriptHooks[s_scriptHookCount].vtable = vtable;
+        s_scriptHooks[s_scriptHookCount].original =
+            reinterpret_cast<FN_ParseScriptText>(pTarget);
+        s_scriptHookCount++;
         DbgTrace(L"[FlashIE] Hook IActiveScriptParse::ParseScriptText: OK (addr=%p)\n",
                  pTarget);
     }
@@ -1420,17 +1465,21 @@ void FlashLoader::Deactivate()
         m_hooked = false;
     }
 
-    // Restore script engine vtable hook
-    if (s_hookedScriptVtable && s_origParseScriptText) {
+    // Restore all script engine vtable hooks.
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        ScriptVtableHook& hook = s_scriptHooks[i];
+        if (!hook.vtable || !hook.original)
+            continue;
         DWORD oldProtect;
-        if (VirtualProtect(&s_hookedScriptVtable[5], sizeof(void*),
+        if (VirtualProtect(&hook.vtable[5], sizeof(void*),
                            PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            s_hookedScriptVtable[5] = reinterpret_cast<void*>(s_origParseScriptText);
-            VirtualProtect(&s_hookedScriptVtable[5], sizeof(void*), oldProtect, &oldProtect);
+            if (hook.vtable[5] == reinterpret_cast<void*>(Hooked_ParseScriptText))
+                hook.vtable[5] = reinterpret_cast<void*>(hook.original);
+            VirtualProtect(&hook.vtable[5], sizeof(void*), oldProtect, &oldProtect);
         }
-        s_hookedScriptVtable = nullptr;
-        s_origParseScriptText = nullptr;
+        hook = {};
     }
+    s_scriptHookCount = 0;
 
     s_pFlashFactory = nullptr;
 
