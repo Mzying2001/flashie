@@ -544,7 +544,6 @@ static const FakeSubKeyEntry s_fakeSubKeys[] = {
     { L"CLSID",                    FK_PROGID_CLSID,   FK_PROGID_ROOT },
     { L"CurVer",                   FK_PROGID_CURVER,  FK_NONE },
     { L"InprocServer32",           FK_INPROC,         FK_NONE },
-    { L"InProcServer32",           FK_INPROC,         FK_NONE },
     { L"MiscStatus\\1",            FK_MISCSTATUS1,    FK_NONE },
     { L"1",                        FK_MISCSTATUS1,    FK_NONE },
     { L"MiscStatus",               FK_MISCSTATUS,     FK_NONE },
@@ -564,7 +563,6 @@ struct ClsidSuffixEntry {
 
 static const ClsidSuffixEntry s_clsidSuffixes[] = {
     { L"InprocServer32",           FK_INPROC },
-    { L"InProcServer32",           FK_INPROC },
     { L"MiscStatus\\1",            FK_MISCSTATUS1 },
     { L"MiscStatus",               FK_MISCSTATUS },
     { L"ProgID",                   FK_PROGID },
@@ -587,23 +585,69 @@ static LSTATUS ReturnFakeKey(FakeKeyType type, PHKEY phkResult,
     return ERROR_FILE_NOT_FOUND;
 }
 
-// Check if lpSubKey contains a ShockwaveFlash ProgID with valid version (<=34).
-static bool IsFlashProgIDPath(LPCWSTR lpSubKey)
+static bool IsPathBoundary(wchar_t ch)
 {
-    const wchar_t* progid = wcsstr(lpSubKey, L"ShockwaveFlash.ShockwaveFlash");
-    if (!progid) return false;
-    const wchar_t* afterBase = progid + 29;
-    if (*afterBase == L'.') {
-        int ver = _wtoi(afterBase + 1);
-        if (ver > 34) return false;
-    }
-    return (*afterBase == L'\0' || *afterBase == L'.' || *afterBase == L'\\');
+    return ch == L'\0' || ch == L'\\';
 }
 
-// Case-insensitive check for Flash CLSID substring in a path.
+static const wchar_t* FindPathElementI(LPCWSTR path, LPCWSTR element)
+{
+    size_t elementLength = wcslen(element);
+    const wchar_t* cursor = path;
+    while (const wchar_t* match = StrStrIW(cursor, element)) {
+        bool validStart = match == path || match[-1] == L'\\';
+        if (validStart && IsPathBoundary(match[elementLength]))
+            return match;
+        cursor = match + 1;
+    }
+    return nullptr;
+}
+
+// Check if lpSubKey contains a complete ShockwaveFlash ProgID path element
+// with an optional all-numeric version suffix no greater than 34.
+static bool IsFlashProgIDPath(LPCWSTR lpSubKey)
+{
+    static const wchar_t base[] = L"ShockwaveFlash.ShockwaveFlash";
+    const wchar_t* cursor = lpSubKey;
+
+    while (const wchar_t* progid = StrStrIW(cursor, base)) {
+        if (progid != lpSubKey && progid[-1] != L'\\') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        const wchar_t* suffix = progid + _countof(base) - 1;
+        if (IsPathBoundary(*suffix))
+            return true;
+        if (*suffix != L'.') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        const wchar_t* digit = suffix + 1;
+        if (*digit < L'0' || *digit > L'9') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        unsigned version = 0;
+        while (*digit >= L'0' && *digit <= L'9') {
+            version = version * 10 + static_cast<unsigned>(*digit - L'0');
+            if (version > 34)
+                break;
+            digit++;
+        }
+        if (version <= 34 && IsPathBoundary(*digit))
+            return true;
+        cursor = progid + 1;
+    }
+    return false;
+}
+
+// Registry class paths use the complete braced GUID as one path element.
 static bool PathContainsFlashCLSID(LPCWSTR lpSubKey)
 {
-    return wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e");
+    return FindPathElementI(lpSubKey, FLASH_CLSID_STR) != nullptr;
 }
 
 LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
@@ -639,8 +683,8 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
 
         // ---- Flash kill bit bypass ----
         if (hasFlashClsid) {
-            if (wcsstr(lpSubKey, L"ActiveX Compatibility") ||
-                wcsstr(lpSubKey, L"Extension Compatibility")) {
+            if (FindPathElementI(lpSubKey, L"ActiveX Compatibility") ||
+                FindPathElementI(lpSubKey, L"Extension Compatibility")) {
                 DbgTrace(L"[FlashIE] RegOpenKeyExW BLOCKED (kill bit): %s\n", lpSubKey);
                 return ERROR_FILE_NOT_FOUND;
             }
@@ -648,7 +692,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
 
         // ---- Fake Flash ProgID registration ----
         if (IsFlashProgIDPath(lpSubKey) && phkResult) {
-            FakeKeyType type = (wcsstr(lpSubKey, L"\\CLSID") || SubKeyEndsWith(lpSubKey, L"CLSID"))
+            FakeKeyType type = SubKeyEndsWith(lpSubKey, L"\\CLSID")
                 ? FK_PROGID_CLSID : FK_PROGID_ROOT;
             return ReturnFakeKey(type, phkResult, lpSubKey,
                 type == FK_PROGID_CLSID ? L"ProgID\\CLSID" : L"ProgID root");
@@ -677,18 +721,18 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
         }
 
         // ---- Fake MIME type -> CLSID mapping ----
-        if ((wcsstr(lpSubKey, L"x-shockwave-flash") ||
-             wcsstr(lpSubKey, L"x-Shockwave-Flash")) &&
-            wcsstr(lpSubKey, L"Content Type"))
+        if (FindPathElementI(lpSubKey, L"application/x-shockwave-flash") &&
+            FindPathElementI(lpSubKey, L"Content Type"))
             return ReturnFakeKey(FK_MIME, phkResult, lpSubKey, L"MIME mapping");
 
         // ---- Fake Flash Player version info ----
         // SWFObject and similar JS detection check Macromedia\FlashPlayer registry keys.
-        if (wcsstr(lpSubKey, L"Macromedia\\FlashPlayer") && phkResult)
+        if ((FindPathElementI(lpSubKey, L"Macromedia\\FlashPlayer") ||
+             FindPathElementI(lpSubKey, L"Macromedia\\FlashPlayerActiveX")) && phkResult)
             return ReturnFakeKey(FK_FLASHPLAYER_VER, phkResult, lpSubKey, L"FlashPlayer version");
 
         // ---- FEATURE_BROWSER_EMULATION tracking ----
-        if (wcsstr(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
+        if (FindPathElementI(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
             LSTATUS res = s_origRegOpenKeyExW(
                 hKey, lpSubKey, ulOptions, samDesired, phkResult);
             if (res == ERROR_SUCCESS && phkResult)
@@ -702,10 +746,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     return res;
 }
 
-// Belt-and-suspenders kill bit bypass.
-// If CompatFlagsFromClsid already has the key open (cached handle),
-// it reads "Compatibility Flags". We intercept the value read and
-// return 0 (no flags) instead of 0x400 (COMPAT_EVIL_DONT_LOAD).
 LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
     HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved,
     LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
