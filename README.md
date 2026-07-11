@@ -32,16 +32,24 @@ All hooks are installed after process initialization and cleanly removed on shut
 ### Build Steps
 
 ```bash
-# 32-bit
-cmake -S . -B build -A Win32
-cmake --build build --config Release
+# 32-bit (Windows 8 or later, default)
+cmake -S . -B build-x86 -A Win32
+cmake --build build-x86 --config Release
 
-# 64-bit
-cmake -S . -B build -A x64
-cmake --build build --config Release
+# 64-bit (Windows 8 or later, default)
+cmake -S . -B build-x64 -A x64
+cmake --build build-x64 --config Release
+
+# 32-bit Windows 7 target (uses the Windows 7-and-earlier OCX)
+cmake -S . -B build-win7-x86 -A Win32 -DFLASHIE_WINDOWS_TARGET=WIN7
+cmake --build build-win7-x86 --config Release
+
+# 64-bit Windows 7 target (uses the Windows 7-and-earlier OCX)
+cmake -S . -B build-win7-x64 -A x64 -DFLASHIE_WINDOWS_TARGET=WIN7
+cmake --build build-win7-x64 --config Release
 ```
 
-The build automatically copies the architecture-matched `Flash.ocx` to the output directory alongside the executable.
+`FLASHIE_WINDOWS_TARGET` accepts `WIN7` and `WIN8` (default). `WIN7` packages the control compatible with Windows 7 and earlier; `WIN8` packages the control for Windows 8 and later. Do not use the `WIN7` control on newer Windows versions because it has rendering problems there. The build also sets the corresponding Windows API and PE subsystem target, then copies the selected control to the output directory as `Flash.ocx`.
 
 ## Usage
 
@@ -63,6 +71,8 @@ flashie/
 ├── assets/
 │   ├── Flash32.ocx           # 32-bit Flash Player ActiveX control
 │   ├── Flash64.ocx           # 64-bit Flash Player ActiveX control
+│   ├── Flash32_Win7.ocx      # 32-bit Windows 7-and-earlier control
+│   ├── Flash64_Win7.ocx      # 64-bit Windows 7-and-earlier control
 │   └── app.manifest          # Registration-free COM manifest
 ├── CMakeLists.txt            # Build configuration
 └── AGENTS.md                 # Architecture documentation

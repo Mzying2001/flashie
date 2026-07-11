@@ -12,15 +12,21 @@ CMake project targeting MSVC with C++17 and static CRT (`/MT` for Release, `/MTd
 
 ```bash
 # Generate build files (from repo root)
-cmake -S . -B build -A Win32    # 32-bit
-cmake -S . -B build -A x64      # 64-bit
+cmake -S . -B build-x86 -A Win32    # 32-bit
+cmake -S . -B build-x64 -A x64      # 64-bit
 
-# Build
-cmake --build build --config Debug
-cmake --build build --config Release
+# Windows 7 target (selects the OCX for Windows 7 and earlier)
+cmake -S . -B build-win7-x86 -A Win32 -DFLASHIE_WINDOWS_TARGET=WIN7
+cmake -S . -B build-win7-x64 -A x64 -DFLASHIE_WINDOWS_TARGET=WIN7
+
+# Build (replace Release with Debug when needed)
+cmake --build build-x86 --config Release
+cmake --build build-x64 --config Release
+cmake --build build-win7-x86 --config Release
+cmake --build build-win7-x64 --config Release
 ```
 
-Output binary: `build/<Config>/FlashIE.exe`. Post-build steps automatically copy the architecture-matched `Flash.ocx` to the output directory.
+Output binary: `<build-directory>/<Config>/FlashIE.exe`. Post-build steps automatically copy the selected architecture- and OS-matched `Flash.ocx` to the output directory.
 
 ## Architecture
 
@@ -62,6 +68,7 @@ Four source files, four headers, plus two submodule dependencies:
 ### Assets
 
 - **`assets/Flash32.ocx`** / **`assets/Flash64.ocx`** — Pre-patched Flash Player ActiveX (32-bit / 64-bit).
+- **`assets/Flash32_Win7.ocx`** / **`assets/Flash64_Win7.ocx`** — Flash Player ActiveX for Windows 7 and earlier (32-bit / 64-bit), selected with `-DFLASHIE_WINDOWS_TARGET=WIN7`. These controls have rendering problems on newer Windows versions.
 - **`assets/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
 
 ## Core Requirement: Zero Registry Pollution

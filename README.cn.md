@@ -32,16 +32,24 @@ FlashIE 使用内联函数钩子（Detour）在进程级别拦截 Windows API �
 ### 构建步骤
 
 ```bash
-# 32 位
-cmake -S . -B build -A Win32
-cmake --build build --config Release
+# 32 位（Windows 8 及更高版本，默认配置）
+cmake -S . -B build-x86 -A Win32
+cmake --build build-x86 --config Release
 
-# 64 位
-cmake -S . -B build -A x64
-cmake --build build --config Release
+# 64 位（Windows 8 及更高版本，默认配置）
+cmake -S . -B build-x64 -A x64
+cmake --build build-x64 --config Release
+
+# 32 位 Windows 7 目标（使用兼容 Windows 7 及更早系统的 OCX）
+cmake -S . -B build-win7-x86 -A Win32 -DFLASHIE_WINDOWS_TARGET=WIN7
+cmake --build build-win7-x86 --config Release
+
+# 64 位 Windows 7 目标（使用兼容 Windows 7 及更早系统的 OCX）
+cmake -S . -B build-win7-x64 -A x64 -DFLASHIE_WINDOWS_TARGET=WIN7
+cmake --build build-win7-x64 --config Release
 ```
 
-构建过程会自动将对应架构的 `Flash.ocx` 复制到可执行文件同目录下。
+`FLASHIE_WINDOWS_TARGET` 支持 `WIN7` 和 `WIN8`（默认值）。`WIN7` 会打包兼容 Windows 7 及更早系统的控件，`WIN8` 会打包适用于 Windows 8 及更新系统的控件。Win7 控件在新版 Windows 上存在渲染问题，请勿在新版系统中使用。构建过程还会设置相应的 Windows API 和 PE 子系统目标，并将选中的控件以 `Flash.ocx` 文件名复制到可执行文件同目录下。
 
 ## 使用方法
 
@@ -63,6 +71,8 @@ flashie/
 ├── assets/
 │   ├── Flash32.ocx           # 32 位 Flash Player ActiveX 控件
 │   ├── Flash64.ocx           # 64 位 Flash Player ActiveX 控件
+│   ├── Flash32_Win7.ocx      # 兼容 Windows 7 及更早系统的 32 位控件
+│   ├── Flash64_Win7.ocx      # 兼容 Windows 7 及更早系统的 64 位控件
 │   └── app.manifest          # 免注册 COM 清单
 ├── CMakeLists.txt            # 构建配置
 └── AGENTS.md                 # 架构文档
