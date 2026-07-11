@@ -37,7 +37,7 @@ static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
 static HWND         g_hwndStatus      = nullptr;
 static bool         g_isClosing       = false;
-static std::wstring g_initialAddress  = L"about:blank";
+static std::wstring g_initialAddress  = L"https://www.bing.com/";
 
 static void DoNavigate()
 {
