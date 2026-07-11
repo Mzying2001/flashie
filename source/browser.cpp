@@ -50,7 +50,7 @@ STDMETHODIMP COleInPlaceSite::GetWindowContext(
     m_pSite->m_pInPlaceFrame->AddRef();
     *ppDoc = nullptr;
 
-    GetClientRect(m_pSite->m_hWnd, lprcPosRect);
+    *lprcPosRect = m_pSite->m_rcPos;
     *lprcClipRect = *lprcPosRect;
 
     lpFrameInfo->fMDIApp = FALSE;
@@ -209,6 +209,20 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
 {
     switch (dispid) {
 
+    case DISPID_DOWNLOADBEGIN:
+        if (m_pBrowserHost && m_pBrowserHost->m_loadingStateCallback) {
+            m_pBrowserHost->m_loadingStateCallback(
+                true, m_pBrowserHost->m_loadingStateCtx);
+        }
+        return S_OK;
+
+    case DISPID_DOWNLOADCOMPLETE:
+        if (m_pBrowserHost && m_pBrowserHost->m_loadingStateCallback) {
+            m_pBrowserHost->m_loadingStateCallback(
+                false, m_pBrowserHost->m_loadingStateCtx);
+        }
+        return S_OK;
+
     case DISPID_NAVIGATECOMPLETE2: {
         // rgvarg[1] = pDisp (IDispatch of the frame), rgvarg[0] = URL
         if (pDispParams->cArgs >= 2 && m_pBrowserHost) {
@@ -241,6 +255,26 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
             if (pDispParams->rgvarg[0].vt == VT_BSTR)
                 m_pBrowserHost->m_titleCallback(pDispParams->rgvarg[0].bstrVal,
                                                  m_pBrowserHost->m_titleCtx);
+        }
+        return S_OK;
+    }
+
+    case DISPID_STATUSTEXTCHANGE: {
+        if (pDispParams->cArgs >= 1 && m_pBrowserHost &&
+            m_pBrowserHost->m_statusTextCallback) {
+            VARIANT* pText = &pDispParams->rgvarg[0];
+            if (pText->vt == (VT_VARIANT | VT_BYREF))
+                pText = pText->pvarVal;
+
+            if (pText->vt == VT_BSTR) {
+                m_pBrowserHost->m_statusTextCallback(
+                    pText->bstrVal ? pText->bstrVal : L"",
+                    m_pBrowserHost->m_statusTextCtx);
+            } else if (pText->vt == (VT_BSTR | VT_BYREF) && pText->pbstrVal) {
+                m_pBrowserHost->m_statusTextCallback(
+                    *pText->pbstrVal ? *pText->pbstrVal : L"",
+                    m_pBrowserHost->m_statusTextCtx);
+            }
         }
         return S_OK;
     }
@@ -292,6 +326,7 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 {
     m_pSite = new COleSite();
     m_pSite->m_hWnd = hwndParent;
+    m_pSite->m_rcPos = rc;
     m_pSite->m_pBrowserHost = this;
 
     FORMATETC fe = {};
@@ -318,6 +353,18 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 
     m_pWebBrowser->QueryInterface(IID_IOleInPlaceActiveObject,
                                   reinterpret_cast<void**>(&m_pIPActiveObj));
+
+    HWND hwndActive = nullptr;
+    if (m_pIPActiveObj && SUCCEEDED(m_pIPActiveObj->GetWindow(&hwndActive))) {
+        while (hwndActive) {
+            HWND hwndParentWindow = GetParent(hwndActive);
+            if (hwndParentWindow == hwndParent) {
+                m_hwndBrowser = hwndActive;
+                break;
+            }
+            hwndActive = hwndParentWindow;
+        }
+    }
 
     ConnectEvents();
 
@@ -352,6 +399,9 @@ void BrowserHost::Stop()      { if (m_pWebBrowser) m_pWebBrowser->Stop(); }
 
 void BrowserHost::Resize(const RECT& rc)
 {
+    if (m_pSite)
+        m_pSite->m_rcPos = rc;
+
     if (m_pWebBrowser) {
         m_pWebBrowser->put_Left(rc.left);
         m_pWebBrowser->put_Top(rc.top);
@@ -402,6 +452,7 @@ void BrowserHost::DisconnectEvents()
 
 void BrowserHost::Destroy()
 {
+    m_hwndBrowser = nullptr;
     DisconnectEvents();
 
     if (m_pIPActiveObj) {

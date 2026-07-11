@@ -141,6 +141,7 @@ private:
     IStorage*          m_lpStorage = nullptr;
     IOleObject*        m_lpOleObject = nullptr;
     IOleInPlaceObject* m_lpInPlaceObject = nullptr;
+    RECT               m_rcPos = {};
     COleClientSite*    m_pClientSite = nullptr;
     COleInPlaceSite*   m_pInPlaceSite = nullptr;
     COleInPlaceFrame*  m_pInPlaceFrame = nullptr;
@@ -152,6 +153,8 @@ private:
 // ---------------------------------------------------------------
 using NavigateCompleteCallback = void(*)(const wchar_t* url, void* ctx);
 using TitleChangeCallback = void(*)(const wchar_t* title, void* ctx);
+using StatusTextChangeCallback = void(*)(const wchar_t* text, void* ctx);
+using LoadingStateCallback = void(*)(bool isLoading, void* ctx);
 
 class BrowserHost {
     friend class COleSite;
@@ -175,20 +178,32 @@ public:
     void SetTitleChangeCallback(TitleChangeCallback cb, void* ctx) {
         m_titleCallback = cb; m_titleCtx = ctx;
     }
+    void SetStatusTextChangeCallback(StatusTextChangeCallback cb, void* ctx) {
+        m_statusTextCallback = cb; m_statusTextCtx = ctx;
+    }
+    void SetLoadingStateCallback(LoadingStateCallback cb, void* ctx) {
+        m_loadingStateCallback = cb; m_loadingStateCtx = ctx;
+    }
 
     IWebBrowser2* GetWebBrowser() { return m_pWebBrowser; }
+    HWND GetBrowserWindow() const { return m_hwndBrowser; }
 
 private:
     COleSite*                m_pSite = nullptr;
     IWebBrowser2*            m_pWebBrowser = nullptr;
     IOleObject*              m_pOleObject = nullptr;
     IOleInPlaceActiveObject* m_pIPActiveObj = nullptr;
+    HWND                     m_hwndBrowser = nullptr;
     DWORD                    m_dwEventCookie = 0;
 
     NavigateCompleteCallback m_navCallback = nullptr;
     void*                    m_navCtx = nullptr;
     TitleChangeCallback      m_titleCallback = nullptr;
     void*                    m_titleCtx = nullptr;
+    StatusTextChangeCallback m_statusTextCallback = nullptr;
+    void*                    m_statusTextCtx = nullptr;
+    LoadingStateCallback     m_loadingStateCallback = nullptr;
+    void*                    m_loadingStateCtx = nullptr;
 
     void ConnectEvents();
     void DisconnectEvents();

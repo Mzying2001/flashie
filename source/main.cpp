@@ -1,10 +1,12 @@
 #include <windows.h>
 #include <ole2.h>
+#include <shellapi.h>
 #include <shlwapi.h>
+#include <commctrl.h>
 #include <stdio.h>
+#include <string>
 #include "flash_loader.h"
 #include "browser.h"
-
 
 static constexpr int TOOLBAR_HEIGHT = 32;
 static constexpr int BUTTON_WIDTH   = 60;
@@ -20,18 +22,21 @@ enum ControlID {
     ID_STOP,
     ID_ADDRESS,
     ID_GO,
+    ID_STATUS,
 };
 
 static FlashLoader  g_flashLoader;
 static BrowserHost* g_pBrowser        = nullptr;
 static HWND         g_hwndMain        = nullptr;
-static HWND         g_hwndBrowserArea = nullptr;
 static HWND         g_hwndBack        = nullptr;
 static HWND         g_hwndForward     = nullptr;
 static HWND         g_hwndRefresh     = nullptr;
 static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
+static HWND         g_hwndStatus      = nullptr;
+static bool         g_isClosing       = false;
+static std::wstring g_initialAddress  = L"https://www.bing.com/";
 
 static void DoNavigate()
 {
@@ -53,13 +58,40 @@ static void OnTitleChange(const wchar_t* title, void*)
     SetWindowTextW(g_hwndMain, buf);
 }
 
+static void OnStatusTextChange(const wchar_t* text, void*)
+{
+    if (g_hwndStatus)
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text));
+}
+
+static void OnLoadingStateChange(bool isLoading, void*)
+{
+    if (g_hwndRefresh == nullptr || g_hwndStop == nullptr)
+        return;
+    if (isLoading) {
+        ShowWindow(g_hwndRefresh, SW_HIDE);
+        ShowWindow(g_hwndStop, SW_SHOW);
+    } else {
+        ShowWindow(g_hwndRefresh, SW_SHOW);
+        ShowWindow(g_hwndStop, SW_HIDE);
+    }
+}
+
 static void LayoutControls(int cx, int cy)
 {
+    int statusHeight = 0;
+    if (g_hwndStatus) {
+        SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
+        RECT rcStatus;
+        if (GetWindowRect(g_hwndStatus, &rcStatus))
+            statusHeight = rcStatus.bottom - rcStatus.top;
+    }
+
     int x = MARGIN;
     int y = (TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
     MoveWindow(g_hwndBack,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
     MoveWindow(g_hwndForward, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
-    MoveWindow(g_hwndRefresh, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
+    MoveWindow(g_hwndRefresh, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
     MoveWindow(g_hwndStop,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
 
     int goX = cx - MARGIN - BUTTON_WIDTH;
@@ -68,9 +100,8 @@ static void LayoutControls(int cx, int cy)
     MoveWindow(g_hwndAddress, x, y, addrWidth, BUTTON_HEIGHT, TRUE);
     MoveWindow(g_hwndGo, goX, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
 
-    MoveWindow(g_hwndBrowserArea, 0, TOOLBAR_HEIGHT, cx, cy - TOOLBAR_HEIGHT, TRUE);
     if (g_pBrowser) {
-        RECT rc = {0, 0, cx, cy - TOOLBAR_HEIGHT};
+        RECT rc = {0, TOOLBAR_HEIGHT, cx, cy - statusHeight};
         g_pBrowser->Resize(rc);
     }
 }
@@ -89,24 +120,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STOP),    hInst, nullptr);
         g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_ADDRESS), hInst, nullptr);
         g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_GO),      hInst, nullptr);
+        g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), hInst, nullptr);
 
-        g_hwndBrowserArea = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-            0, TOOLBAR_HEIGHT, rc.right, rc.bottom - TOOLBAR_HEIGHT,
-            hwnd, nullptr, hInst, nullptr);
+        OnLoadingStateChange(false, nullptr);
 
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
-        g_flashLoader.InstallHooks();
+        if (!g_flashLoader.InstallHooks() && g_flashLoader.IsActive()) {
+            MessageBoxW(hwnd, L"Failed to install the Flash compatibility hooks.\n"
+                        L"Flash support has been disabled for this session.",
+                        L"FlashIE", MB_ICONWARNING);
+            g_flashLoader.Deactivate();
+        }
 
         g_pBrowser = new BrowserHost();
-        RECT rcBrowser = {0, 0, rc.right, rc.bottom - TOOLBAR_HEIGHT};
-        if (g_pBrowser->Initialize(g_hwndBrowserArea, rcBrowser)) {
-
+        RECT rcBrowser = {0, TOOLBAR_HEIGHT, rc.right, rc.bottom};
+        if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
-            g_pBrowser->Navigate(L"about:blank");
+            g_pBrowser->SetStatusTextChangeCallback(OnStatusTextChange, nullptr);
+            g_pBrowser->SetLoadingStateCallback(OnLoadingStateChange, nullptr);
+            g_pBrowser->Navigate(g_initialAddress.c_str());
         }
 
         LayoutControls(rc.right, rc.bottom);
@@ -136,6 +171,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_PARENTNOTIFY:
+        if (!g_isClosing && LOWORD(wParam) == WM_DESTROY) {
+            HWND hwndDestroyed = reinterpret_cast<HWND>(lParam);
+            if (g_pBrowser && hwndDestroyed == g_pBrowser->GetBrowserWindow()) {
+                g_isClosing = true;
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        return 0;
+
+    case WM_CLOSE:
+        g_isClosing = true;
+        DestroyWindow(hwnd);
+        return 0;
+
     case WM_DESTROY:
         if (g_pBrowser) {
             g_pBrowser->Destroy();
@@ -152,7 +202,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        if (argc > 1)
+            g_initialAddress = argv[1];
+        LocalFree(argv);
+    }
+
     OleInitialize(nullptr);
+
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_BAR_CLASSES};
+    InitCommonControlsEx(&icc);
 
     // Register Flash.ocx class factory into this process's COM table.
     // Must be after OleInitialize (COM needs to be initialized).
@@ -197,7 +258,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         // Let WebBrowser handle keyboard input only when focus is in browser area
         if (g_pBrowser) {
             HWND hwndFocus = GetFocus();
-            if (hwndFocus && (hwndFocus == g_hwndBrowserArea || IsChild(g_hwndBrowserArea, hwndFocus))) {
+            HWND hwndBrowser = g_pBrowser->GetBrowserWindow();
+            if (hwndFocus && hwndBrowser &&
+                (hwndFocus == hwndBrowser || IsChild(hwndBrowser, hwndFocus))) {
                 if (g_pBrowser->TranslateAccelerator(&msg))
                     continue;
             }

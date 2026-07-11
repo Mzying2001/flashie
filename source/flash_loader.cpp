@@ -4,25 +4,36 @@
 
 #include "flash_loader.h"
 #include "debug.h"
-#include <shlwapi.h>
-#include <stdint.h>
+#include "flash.h"      // MIDL-generated Flash COM interface definitions
+
+#include <detours.h>
+#include <jscriptcc/CCPreprocessor.h>
+
+#include <string>
 #include <string.h>
-#include <ocidl.h>     // IQuickActivate, IPersistPropertyBag
+#include <stdint.h>
+#include <intrin.h>
+#include <shlwapi.h>
+#include <ocidl.h>      // IQuickActivate and debug-probed OLE interfaces
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
-#include "flash.h"      // MIDL-generated Flash COM interface definitions
+#include <activscp.h>   // IActiveScriptParse (architecture-selected IID)
 
 // Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
+
+// In-box JScript Active Scripting engines. VBScript implements the same parse
+// interface, so the class ID must be checked before installing JScriptCC.
+static const CLSID CLSID_JScript_ =
+    {0xF414C260, 0x6AC0, 0x11CF, {0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58}};
+static const CLSID CLSID_JScript9_ =
+    {0x16D51579, 0xA30B, 0x4C8B, {0xA2, 0x76, 0x0F, 0xF4, 0xDC, 0x41, 0xE7, 0x55}};
 
 // Static member
 IClassFactory* FlashLoader::s_pFlashFactory = nullptr;
 
 // =====================================================================
 // Section 2: Function Pointer Typedefs
-//
-// Original function signatures for hooked APIs. Each typedef
-// corresponds to a trampoline used to call the real implementation.
 // =====================================================================
 
 // --- COM / OLE ---
@@ -45,9 +56,6 @@ typedef HRESULT (STDAPICALLTYPE *FN_CoGetClassObjectFromURL)(
     DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv);
 
-typedef HRESULT (STDAPICALLTYPE *FN_CoInternetIsFeatureEnabled)(
-    DWORD dwFeature, DWORD dwFlags);
-
 typedef HRESULT (STDAPICALLTYPE *FN_CLSIDFromProgID)(
     LPCOLESTR lpszProgID, LPCLSID lpclsid);
 
@@ -62,6 +70,11 @@ typedef LSTATUS (WINAPI *FN_RegQueryValueExW)(
     LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
 
 typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
+
+// --- File ---
+
+typedef BOOL (WINAPI *FN_DeleteFileA)(LPCSTR lpFileName);
+typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
 
 // --- Windows Lockdown Policy (WLDP) ---
 
@@ -80,331 +93,74 @@ typedef HRESULT (WINAPI *FN_LoadRegTypeLib)(
 typedef HRESULT (WINAPI *FN_LoadTypeLibEx)(
     LPCOLESTR szFile, REGKIND regkind, ITypeLib** pptlib);
 
+// --- Script Engine ---
+
+// IActiveScriptParse::ParseScriptText (vtable index 5)
+typedef HRESULT (STDMETHODCALLTYPE *FN_ParseScriptText)(
+    void* pThis, LPCOLESTR pstrCode, LPCOLESTR pstrItemName,
+    IUnknown* punkContext, LPCOLESTR pstrDelimiter,
+    DWORD_PTR dwSourceContextCookie, ULONG ulStartingLineNumber,
+    DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo);
+
 // --- Flash object vtable ---
 
 typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(
     void* pThis, REFIID riid, void** ppv);
 
 // =====================================================================
-// Section 3: Instruction Length Decoder
-//
-// Minimal x86/x64 instruction length decoder for function prologues.
-// Used by the inline hook infrastructure to compute trampoline sizes.
+// Section 3: Detours Hook Infrastructure
 // =====================================================================
 
-// Returns instruction length at 'code', or 0 if unrecognized.
-static int InsnLength(const BYTE* code)
-{
-    const BYTE* p = code;
+// Original function pointers for hooked APIs. InstallHooks resolves all
+// required targets before attaching them in one Detours transaction.
+static FN_CoGetClassObject            s_origCoGetClassObject = nullptr;
+static FN_CoCreateInstance            s_origCoCreateInstance = nullptr;
+static FN_RegOpenKeyExW               s_origRegOpenKeyExW = nullptr;
+static FN_RegQueryValueExW            s_origRegQueryValueExW = nullptr;
+static FN_RegCloseKey                 s_origRegCloseKey = nullptr;
+static FN_DeleteFileA                 s_origDeleteFileA = nullptr;
+static FN_DeleteFileW                 s_origDeleteFileW = nullptr;
+static FN_CoGetClassObjectFromURL     s_origCoGetClassObjectFromURL = nullptr;
+static FN_WldpIsClassInApprovedList   s_origWldpIsClassInApprovedList = nullptr;
+static FN_WldpQueryDynamicCodeTrust   s_origWldpQueryDynamicCodeTrust = nullptr;
+static FN_LoadRegTypeLib              s_origLoadRegTypeLib = nullptr;
+static FN_CLSIDFromProgID             s_origCLSIDFromProgID = nullptr;
+static FN_FlashQueryInterface         s_origFlashQI = nullptr;
+static bool                           s_flashQIHooked = false;
+static SRWLOCK                        s_flashHookLock = SRWLOCK_INIT;
 
-#ifdef _WIN64
-    // REX prefix (0x40-0x4F)
-    if (*p >= 0x40 && *p <= 0x4F)
-        p++;
-#endif
-
-    BYTE op = *p++;
-
-    // 1-byte: PUSH/POP reg, NOP, RET, INT3
-    if ((op >= 0x50 && op <= 0x5F) || op == 0x90 || op == 0xC3 || op == 0xCC)
-        return static_cast<int>(p - code);
-
-#ifndef _WIN64
-    // x86: INC/DEC reg
-    if (op >= 0x40 && op <= 0x4F)
-        return static_cast<int>(p - code);
-#endif
-
-    // 2-byte opcode escape (0F xx)
-    bool twoByteOpcode = false;
-    if (op == 0x0F) {
-        BYTE op2 = *p++;
-        switch (op2) {
-        case 0x1F: // multi-byte NOP
-        case 0xB6: case 0xB7: // MOVZX
-        case 0xBE: case 0xBF: // MOVSX
-            twoByteOpcode = true;
-            break;
-        default:
-            return 0;
-        }
-    }
-
-    int immSize = 0;
-    bool hasModRM = twoByteOpcode;
-
-    if (!twoByteOpcode) {
-        switch (op) {
-        // ALU r/m, r  and  r, r/m
-        case 0x00: case 0x01: case 0x02: case 0x03:
-        case 0x08: case 0x09: case 0x0A: case 0x0B:
-        case 0x10: case 0x11: case 0x12: case 0x13:
-        case 0x18: case 0x19: case 0x1A: case 0x1B:
-        case 0x20: case 0x21: case 0x22: case 0x23:
-        case 0x28: case 0x29: case 0x2A: case 0x2B:
-        case 0x30: case 0x31: case 0x32: case 0x33:
-        case 0x38: case 0x39: case 0x3A: case 0x3B:
-        case 0x84: case 0x85: // TEST
-        case 0x86: case 0x87: // XCHG
-        case 0x88: case 0x89: case 0x8A: case 0x8B: // MOV
-        case 0x8D: // LEA
-        case 0x8F: // POP r/m
-        case 0xD1: case 0xD3: // SHL/SHR/etc.
-        case 0xF7: // NOT/NEG/MUL/DIV
-        case 0xFF: // INC/DEC/CALL/JMP r/m
-            hasModRM = true;
-            break;
-        case 0x80: case 0x82: case 0x83: // Group1 r/m, imm8
-        case 0xC0: case 0xC1: // SHL/SHR r/m, imm8
-        case 0xC6: // MOV r/m8, imm8
-        case 0x6B: // IMUL r, r/m, imm8
-            hasModRM = true; immSize = 1; break;
-        case 0x81: // Group1 r/m, imm32
-        case 0x69: // IMUL r, r/m, imm32
-        case 0xC7: // MOV r/m, imm32
-            hasModRM = true; immSize = 4; break;
-
-        // MOV reg, imm8
-        case 0xB0: case 0xB1: case 0xB2: case 0xB3:
-        case 0xB4: case 0xB5: case 0xB6: case 0xB7:
-            return static_cast<int>(p - code) + 1;
-        // MOV reg, imm32/64
-        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-#ifdef _WIN64
-            return static_cast<int>(p - code) + ((code[0] & 0x48) == 0x48 ? 8 : 4);
-#else
-            return static_cast<int>(p - code) + 4;
-#endif
-        // ALU AL/AX/EAX, imm8
-        case 0x04: case 0x0C: case 0x14: case 0x1C:
-        case 0x24: case 0x2C: case 0x34: case 0x3C:
-            return static_cast<int>(p - code) + 1;
-        // ALU AL/AX/EAX, imm32
-        case 0x05: case 0x0D: case 0x15: case 0x1D:
-        case 0x25: case 0x2D: case 0x35: case 0x3D:
-            return static_cast<int>(p - code) + 4;
-
-        // PUSH imm8 / PUSH imm32
-        case 0x6A:
-            return static_cast<int>(p - code) + 1;
-        case 0x68:
-            return static_cast<int>(p - code) + 4;
-
-        // CALL rel32 / JMP rel32
-        case 0xE8: case 0xE9:
-            return static_cast<int>(p - code) + 4;
-
-        // JMP rel8
-        case 0xEB:
-            return static_cast<int>(p - code) + 1;
-
-        // MOV eax,moffs32 / MOV moffs32,eax
-        case 0xA1: case 0xA3:
-#ifdef _WIN64
-            return static_cast<int>(p - code) + 8;
-#else
-            return static_cast<int>(p - code) + 4;
-#endif
-
-        default:
-            return 0;
-        }
-    }
-
-    if (hasModRM) {
-        BYTE modrm = *p++;
-        BYTE mod = (modrm >> 6) & 3;
-        BYTE rm  = modrm & 7;
-
-        if (mod != 3 && rm == 4) // SIB byte
-            p++;
-
-        if (mod == 0) {
-            if (rm == 5) {
-                p += 4; // disp32 (RIP-relative on x64)
-#ifdef _WIN64
-                return 0; // RIP-relative — cannot safely relocate
-#endif
-            }
-        } else if (mod == 1) {
-            p += 1; // disp8
-        } else if (mod == 2) {
-            p += 4; // disp32
-        }
-
-        p += immSize;
-    }
-
-    return static_cast<int>(p - code);
-}
-
-// Calculate how many bytes to copy (sum of complete instructions >= hookSize).
-// Returns 0 if an instruction can't be decoded.
-static int CalcPrologueSize(const BYTE* code, int hookSize)
-{
-    int total = 0;
-    while (total < hookSize) {
-        int len = InsnLength(code + total);
-        if (len == 0) return 0;
-        total += len;
-    }
-    return total;
-}
-
-// =====================================================================
-// Section 4: Inline Hook (Detour) Infrastructure
-// =====================================================================
-
-#ifdef _WIN64
-static constexpr int MIN_HOOK_SIZE = 14; // FF 25 00 00 00 00 + 8-byte addr
-#else
-static constexpr int MIN_HOOK_SIZE = 5;  // E9 + 4-byte rel32
-#endif
-
-struct InlineHook {
-    void* pTarget     = nullptr; // Original function address
-    void* pTrampoline = nullptr; // Executable trampoline to call original
-    int   copySize    = 0;       // Bytes copied to trampoline
-    bool  active      = false;
-};
-
-// Centralized hook storage — indexed by HookId
-enum HookId {
-    HK_CoGetClassObject,
-    HK_CoCreateInstance,
-    HK_RegOpenKeyExW,
-    HK_RegQueryValueExW,
-    HK_RegCloseKey,
-    HK_CoGetClassObjectFromURL,
-    HK_CoInternetIsFeatureEnabled,
-    HK_WldpIsClassInApprovedList,
-    HK_WldpQueryDynamicCodeTrust,
-    HK_LoadRegTypeLib,
-    HK_CLSIDFromProgID,
-    HK_FlashQI,
-    HK_COUNT
-};
-
-static InlineHook s_hooks[HK_COUNT] = {};
-
-static bool InstallDetour(void* targetFunc, void* hookFunc, InlineHook& hook)
-{
-    if (!targetFunc || !hookFunc) return false;
-
-    // Determine how many prologue bytes to copy
-    int copySize = CalcPrologueSize(static_cast<const BYTE*>(targetFunc), MIN_HOOK_SIZE);
-    if (copySize == 0) return false;
-
-    // Allocate executable trampoline: saved bytes + jump-back
-    SIZE_T trampolineSize = copySize + MIN_HOOK_SIZE + 16; // extra padding
-    hook.pTrampoline = VirtualAlloc(nullptr, trampolineSize,
-                                    MEM_COMMIT | MEM_RESERVE,
-                                    PAGE_EXECUTE_READWRITE);
-    if (!hook.pTrampoline) return false;
-
-    hook.pTarget  = targetFunc;
-    hook.copySize = copySize;
-
-    // Copy original prologue bytes to trampoline
-    memcpy(hook.pTrampoline, targetFunc, copySize);
-
-    // Append jump-back to (targetFunc + copySize)
-    BYTE* jmpBack = static_cast<BYTE*>(hook.pTrampoline) + copySize;
-    void* resumeAddr = static_cast<BYTE*>(targetFunc) + copySize;
-
-#ifdef _WIN64
-    // FF 25 00 00 00 00 [8-byte absolute address]
-    jmpBack[0] = 0xFF;
-    jmpBack[1] = 0x25;
-    memset(jmpBack + 2, 0, 4);
-    memcpy(jmpBack + 6, &resumeAddr, 8);
-#else
-    // E9 [4-byte relative offset]
-    jmpBack[0] = 0xE9;
-    intptr_t rel = reinterpret_cast<intptr_t>(resumeAddr)
-                 - reinterpret_cast<intptr_t>(jmpBack + 5);
-    int32_t rel32 = static_cast<int32_t>(rel);
-    memcpy(jmpBack + 1, &rel32, 4);
-#endif
-
-    // Patch the target function prologue
-    DWORD oldProtect;
-    if (!VirtualProtect(targetFunc, copySize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        VirtualFree(hook.pTrampoline, 0, MEM_RELEASE);
-        hook.pTrampoline = nullptr;
-        return false;
-    }
-
-    BYTE* p = static_cast<BYTE*>(targetFunc);
-
-#ifdef _WIN64
-    // 14-byte absolute jump: FF 25 00 00 00 00 [8-byte address]
-    p[0] = 0xFF;
-    p[1] = 0x25;
-    memset(p + 2, 0, 4);
-    memcpy(p + 6, &hookFunc, 8);
-    // NOP any remaining bytes so debuggers show clean disassembly
-    for (int i = 14; i < copySize; i++) p[i] = 0x90;
-#else
-    // 5-byte relative jump: E9 [relative32]
-    p[0] = 0xE9;
-    intptr_t hookRel = reinterpret_cast<intptr_t>(hookFunc)
-                     - reinterpret_cast<intptr_t>(p + 5);
-    int32_t hookRel32 = static_cast<int32_t>(hookRel);
-    memcpy(p + 1, &hookRel32, 4);
-    for (int i = 5; i < copySize; i++) p[i] = 0x90;
-#endif
-
-    VirtualProtect(targetFunc, copySize, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), targetFunc, copySize);
-
-    hook.active = true;
-    return true;
-}
-
-static void RemoveDetour(InlineHook& hook)
-{
-    if (!hook.active) return;
-
-    // Restore original prologue bytes
-    DWORD oldProtect;
-    if (VirtualProtect(hook.pTarget, hook.copySize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy(hook.pTarget, hook.pTrampoline, hook.copySize);
-        VirtualProtect(hook.pTarget, hook.copySize, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), hook.pTarget, hook.copySize);
-    }
-
-    VirtualFree(hook.pTrampoline, 0, MEM_RELEASE);
-    hook.pTrampoline = nullptr;
-    hook.pTarget     = nullptr;
-    hook.copySize    = 0;
-    hook.active      = false;
-}
-
-// Resolve a function from a prioritized list of modules and install a detour.
-static bool ResolveAndHook(const char* funcName, const wchar_t* logName,
-    void* hookFunc, InlineHook& hook,
-    HMODULE hPrimary, HMODULE hFallback = nullptr)
+static void* ResolveTarget(
+    HMODULE hPrimary, const char* funcName, HMODULE hFallback = nullptr)
 {
     void* pTarget = nullptr;
+
     if (hPrimary)
         pTarget = reinterpret_cast<void*>(GetProcAddress(hPrimary, funcName));
+
     if (!pTarget && hFallback)
         pTarget = reinterpret_cast<void*>(GetProcAddress(hFallback, funcName));
-    bool ok = pTarget && InstallDetour(pTarget, hookFunc, hook);
-    DbgTrace(L"[FlashIE] Hook %s: %s (addr=%p)\n", logName, ok ? L"OK" : L"FAIL", pTarget);
-    return ok;
+
+    return pTarget;
+}
+
+static void ResetApiHookPointers()
+{
+    s_origCoGetClassObject = nullptr;
+    s_origCoCreateInstance = nullptr;
+    s_origRegOpenKeyExW = nullptr;
+    s_origRegQueryValueExW = nullptr;
+    s_origRegCloseKey = nullptr;
+    s_origDeleteFileA = nullptr;
+    s_origDeleteFileW = nullptr;
+    s_origCoGetClassObjectFromURL = nullptr;
+    s_origWldpIsClassInApprovedList = nullptr;
+    s_origWldpQueryDynamicCodeTrust = nullptr;
+    s_origLoadRegTypeLib = nullptr;
+    s_origCLSIDFromProgID = nullptr;
 }
 
 // =====================================================================
-// Section 5: Fake Registry Key System
-//
-// Fake Flash CLSID registration using REAL HKEY handles.
-// We can't use sentinel values because Windows internal code (rpcrt4,
-// ole32) dereferences HKEY as a pointer to an internal structure,
-// causing AV. Instead, we open real existing keys (read-only, no
-// writes!) and track them in a table.
+// Section 4: Fake Registry Key System
 // =====================================================================
 
 enum FakeKeyType {
@@ -424,6 +180,7 @@ enum FakeKeyType {
     FK_INSTALLED_VER,    // HKCR\CLSID\{...}\InstalledVersion
     FK_IMPL_CATEGORY,    // ...\Implemented Categories\{CATID_SafeFor*}
     FK_FLASHPLAYER_VER,  // HKLM\SOFTWARE\Macromedia\FlashPlayer[ActiveX]
+    FK_BROWSER_EMULATION,// Real FEATURE_BROWSER_EMULATION key with one fake value
 };
 
 struct FakeKeyEntry {
@@ -434,64 +191,92 @@ struct FakeKeyEntry {
 static const int MAX_FAKE_KEYS = 64;
 static FakeKeyEntry s_fakeKeys[MAX_FAKE_KEYS] = {};
 static int s_fakeKeyCount = 0;
+static SRWLOCK s_fakeKeyLock = SRWLOCK_INIT;
+
+static bool TrackKey(HKEY hKey, FakeKeyType type)
+{
+    bool tracked = false;
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    if (s_fakeKeyCount < MAX_FAKE_KEYS) {
+        s_fakeKeys[s_fakeKeyCount].hKey = hKey;
+        s_fakeKeys[s_fakeKeyCount].type = type;
+        s_fakeKeyCount++;
+        tracked = true;
+    }
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+    return tracked;
+}
 
 static HKEY AllocFakeKey(FakeKeyType type)
 {
     HKEY hReal = nullptr;
-    auto pfn = reinterpret_cast<FN_RegOpenKeyExW>(s_hooks[HK_RegOpenKeyExW].pTrampoline);
-    if (pfn) {
-        pfn(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hReal);
+    if (s_origRegOpenKeyExW) {
+        s_origRegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hReal);
     }
     if (!hReal) return nullptr;
-    if (s_fakeKeyCount < MAX_FAKE_KEYS) {
-        s_fakeKeys[s_fakeKeyCount].hKey = hReal;
-        s_fakeKeys[s_fakeKeyCount].type = type;
-        s_fakeKeyCount++;
+
+    if (!TrackKey(hReal, type)) {
+        if (s_origRegCloseKey)
+            s_origRegCloseKey(hReal);
+        return nullptr;
     }
     return hReal;
 }
 
 static FakeKeyType GetFakeKeyType(HKEY hKey)
 {
-    for (int i = 0; i < s_fakeKeyCount; i++) {
-        if (s_fakeKeys[i].hKey == hKey) return s_fakeKeys[i].type;
-    }
-    return FK_NONE;
-}
-
-static bool IsFakeHKey(HKEY hKey)
-{
-    return GetFakeKeyType(hKey) != FK_NONE;
-}
-
-static void CloseFakeKey(HKEY hKey)
-{
+    FakeKeyType type = FK_NONE;
+    AcquireSRWLockShared(&s_fakeKeyLock);
     for (int i = 0; i < s_fakeKeyCount; i++) {
         if (s_fakeKeys[i].hKey == hKey) {
-            auto pfn = reinterpret_cast<FN_RegCloseKey>(s_hooks[HK_RegCloseKey].pTrampoline);
-            if (pfn) pfn(hKey);
+            type = s_fakeKeys[i].type;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_fakeKeyLock);
+    return type;
+}
+
+static bool CloseFakeKey(HKEY hKey)
+{
+    bool found = false;
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    for (int i = 0; i < s_fakeKeyCount; i++) {
+        if (s_fakeKeys[i].hKey == hKey) {
             s_fakeKeys[i] = s_fakeKeys[s_fakeKeyCount - 1];
             s_fakeKeyCount--;
-            return;
+            found = true;
+            break;
         }
+    }
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+
+    if (found && s_origRegCloseKey)
+        s_origRegCloseKey(hKey);
+    return found;
+}
+
+static void CloseAllTrackedKeys()
+{
+    HKEY handles[MAX_FAKE_KEYS] = {};
+    int count = 0;
+
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    count = s_fakeKeyCount;
+    for (int i = 0; i < count; i++)
+        handles[i] = s_fakeKeys[i].hKey;
+    memset(s_fakeKeys, 0, sizeof(s_fakeKeys));
+    s_fakeKeyCount = 0;
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+
+    if (s_origRegCloseKey) {
+        for (int i = 0; i < count; i++)
+            s_origRegCloseKey(handles[i]);
     }
 }
 
 // =====================================================================
-// Section 6: COM Wrapper Classes
-//
-// LoggingClassFactory: Wraps the real Flash class factory to log
-//   CreateInstance calls and trigger QI/activation hooks on new objects.
-//
-// FlashSafetyTearoff: IObjectSafety tearoff for Flash objects.
-//   MSHTML requires IObjectSafety for scripting access; Flash.ocx
-//   does not expose it, so we inject it via a QI hook.
-//
-// PropertyBagWrapper: Wraps MSHTML's IPropertyBag to force
-//   allowScriptAccess="always" so ExternalInterface works.
-//
-// FlashPersistPBagTearoff: Wraps Flash's IPersistPropertyBag to
-//   intercept Load() and inject the PropertyBagWrapper.
+// Section 5: COM Wrapper Classes
 // =====================================================================
 
 // Forward declaration: installs IObjectSafety hook on Flash's QueryInterface
@@ -500,10 +285,12 @@ static void MaybeHookFlashQI(IUnknown* pObj);
 static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 static void MaybeHookFlashQuickActivate(IUnknown* pObj);
+// Forward declaration: hooks IActiveScriptParse::ParseScriptText for JScriptCC preprocessing
+static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
-    ULONG m_ref;
+    LONG m_ref;
 public:
     LoggingClassFactory(IClassFactory* real) : m_real(real), m_ref(1) { m_real->AddRef(); }
     ~LoggingClassFactory() { m_real->Release(); }
@@ -518,9 +305,11 @@ public:
         DbgTrace(L"[FlashIE] Factory::QI {%08X-...} -> 0x%08X\n", riid.Data1, hr);
         return hr;
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return ++m_ref; }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = --m_ref;
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
         if (ref == 0) delete this;
         return ref;
     }
@@ -574,21 +363,25 @@ public:
 // causes MSHTML to reject the safety assertion and block scripting.
 class FlashSafetyTearoff : public IObjectSafety {
     IUnknown* m_pFlash;
+    LONG m_ref;
 public:
-    explicit FlashSafetyTearoff(IUnknown* pFlash) : m_pFlash(pFlash) {}
+    // Consumes the reference returned by QI(IID_IUnknown).
+    explicit FlashSafetyTearoff(IUnknown* pFlash) : m_pFlash(pFlash), m_ref(1) {}
     ~FlashSafetyTearoff() { if (m_pFlash) m_pFlash->Release(); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (riid == IID_IObjectSafety) {
             *ppv = static_cast<IObjectSafety*>(this);
-            m_pFlash->AddRef();
+            AddRef();
             return S_OK;
         }
         return m_pFlash->QueryInterface(riid, ppv);
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = m_pFlash->Release();
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
         if (ref == 0) delete this;
         return ref;
     }
@@ -607,137 +400,62 @@ public:
 };
 
 // =====================================================================
-// PropertyBagWrapper: wraps MSHTML's IPropertyBag to force
-// allowScriptAccess="always" so ExternalInterface works cross-domain.
-// =====================================================================
-class PropertyBagWrapper : public IPropertyBag {
-    IPropertyBag* m_pReal;
-    LONG m_ref;
-public:
-    explicit PropertyBagWrapper(IPropertyBag* pReal) : m_pReal(pReal), m_ref(1) {
-        m_pReal->AddRef();
-    }
-    ~PropertyBagWrapper() { m_pReal->Release(); }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IPropertyBag) {
-            *ppv = static_cast<IPropertyBag*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_ref); }
-    STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = InterlockedDecrement(&m_ref);
-        if (ref == 0) delete this;
-        return ref;
-    }
-
-    STDMETHODIMP Read(LPCOLESTR pszPropName, VARIANT* pVar, IErrorLog* pLog) override {
-        if (pszPropName && _wcsicmp(pszPropName, L"allowScriptAccess") == 0) {
-            VariantInit(pVar);
-            pVar->vt = VT_BSTR;
-            pVar->bstrVal = SysAllocString(L"always");
-            return S_OK;
-        }
-        return m_pReal->Read(pszPropName, pVar, pLog);
-    }
-
-    STDMETHODIMP Write(LPCOLESTR pszPropName, VARIANT* pVar) override {
-        return m_pReal->Write(pszPropName, pVar);
-    }
-};
-
-// =====================================================================
-// FlashPersistPBagTearoff: wraps Flash's IPersistPropertyBag to inject
-// allowScriptAccess="always" during Load.
-// =====================================================================
-class FlashPersistPBagTearoff : public IPersistPropertyBag {
-    IUnknown* m_pFlash;
-    IPersistPropertyBag* m_pReal;
-public:
-    FlashPersistPBagTearoff(IUnknown* pFlash, IPersistPropertyBag* pReal)
-        : m_pFlash(pFlash), m_pReal(pReal) {}
-    ~FlashPersistPBagTearoff() {
-        if (m_pReal) m_pReal->Release();
-        if (m_pFlash) m_pFlash->Release();
-    }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IPersistPropertyBag || riid == IID_IPersist) {
-            *ppv = static_cast<IPersistPropertyBag*>(this);
-            m_pFlash->AddRef();
-            return S_OK;
-        }
-        return m_pFlash->QueryInterface(riid, ppv);
-    }
-    STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
-    STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = m_pFlash->Release();
-        if (ref == 0) delete this;
-        return ref;
-    }
-
-    STDMETHODIMP GetClassID(CLSID* pClassID) override {
-        return m_pReal->GetClassID(pClassID);
-    }
-    STDMETHODIMP InitNew() override { return m_pReal->InitNew(); }
-
-    STDMETHODIMP Load(IPropertyBag* pBag, IErrorLog* pLog) override {
-        auto* wrapper = new PropertyBagWrapper(pBag);
-        HRESULT hr = m_pReal->Load(wrapper, pLog);
-        wrapper->Release();
-        return hr;
-    }
-
-    STDMETHODIMP Save(IPropertyBag* pBag, BOOL fClearDirty, BOOL fSaveAll) override {
-        return m_pReal->Save(pBag, fClearDirty, fSaveAll);
-    }
-};
-
-// =====================================================================
-// Section 7: Shared Static State
+// Section 6: Shared Static State
 // =====================================================================
 
 // Logging wrapper around the real Flash class factory
 static LoggingClassFactory* s_pLoggingFactory = nullptr;
+static SRWLOCK s_factoryLock = SRWLOCK_INIT;
 
-// HKEY tracking for FEATURE_BROWSER_EMULATION (fake without registry writes)
-static HKEY s_hkeyBrowserEmulation = nullptr;
 static wchar_t s_szExeName[MAX_PATH] = {};
 
 // Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
+static HMODULE g_hOcxModule = nullptr;
+
+// Script engine ParseScriptText hook state. Different JScript implementations
+// have different shared vtables, so each original slot is tracked separately.
+struct ScriptVtableHook {
+    void** vtable;
+    FN_ParseScriptText original;
+};
+static const int MAX_SCRIPT_HOOKS = 4;
+static ScriptVtableHook s_scriptHooks[MAX_SCRIPT_HOOKS] = {};
+static int s_scriptHookCount = 0;
+static SRWLOCK s_scriptHookLock = SRWLOCK_INIT;
 
 // =====================================================================
-// Section 8a: COM Hooks
+// Section 7a: COM Hooks
 // =====================================================================
 
-// Return the active Flash class factory (logging wrapper if available).
-static IClassFactory* GetFlashFactory()
+// Return a referenced factory snapshot so shutdown cannot invalidate it while
+// a process-wide COM hook is using it.
+static IClassFactory* AcquireFlashFactory(REFCLSID rclsid)
 {
-    return s_pLoggingFactory ? static_cast<IClassFactory*>(s_pLoggingFactory)
-                             : FlashLoader::s_pFlashFactory;
-}
+    if (!IsEqualCLSID(rclsid, CLSID_ShockwaveFlash))
+        return nullptr;
 
-static bool IsFlashCLSID(REFCLSID rclsid)
-{
-    return FlashLoader::s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash);
+    IClassFactory* factory = nullptr;
+    AcquireSRWLockShared(&s_factoryLock);
+    if (FlashLoader::s_pFlashFactory && s_pLoggingFactory) {
+        factory = static_cast<IClassFactory*>(s_pLoggingFactory);
+        factory->AddRef();
+    }
+    ReleaseSRWLockShared(&s_factoryLock);
+    return factory;
 }
 
 HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObject(
     REFCLSID rclsid, DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoGetClassObject(Flash) -> hr=0x%08X ppv=%p\n", hr, ppv ? *ppv : nullptr);
         return hr;
     }
-    HRESULT hr = reinterpret_cast<FN_CoGetClassObject>(s_hooks[HK_CoGetClassObject].pTrampoline)(
-        rclsid, dwClsContext, pvReserved, riid, ppv);
+    HRESULT hr = s_origCoGetClassObject(rclsid, dwClsContext, pvReserved, riid, ppv);
     DbgTrace(L"[FlashIE] CoGetClassObject({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
     return hr;
 }
@@ -746,14 +464,17 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->CreateInstance(pUnkOuter, riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->CreateInstance(pUnkOuter, riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoCreateInstance(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
-    HRESULT hr = reinterpret_cast<FN_CoCreateInstance>(s_hooks[HK_CoCreateInstance].pTrampoline)(
-        rclsid, pUnkOuter, dwClsContext, riid, ppv);
+    HRESULT hr = s_origCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
     DbgTrace(L"[FlashIE] CoCreateInstance({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
+    // Hook script engine ParseScriptText to preprocess via JScriptCC
+    if (SUCCEEDED(hr) && ppv && *ppv)
+        MaybeHookScriptParseText(rclsid, static_cast<IUnknown*>(*ppv));
     return hr;
 }
 
@@ -766,13 +487,13 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObjectFromURL(
     DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoGetClassObjectFromURL(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
-    return reinterpret_cast<FN_CoGetClassObjectFromURL>(
-        s_hooks[HK_CoGetClassObjectFromURL].pTrampoline)(
+    return s_origCoGetClassObjectFromURL(
         rclsid, szCodeURL, dwFileVersionMS, dwFileVersionLS,
         szContentType, pBindCtx, dwClsContext, pvReserved, riid, ppv);
 }
@@ -800,19 +521,17 @@ static HRESULT STDAPICALLTYPE Hooked_CLSIDFromProgID(
             }
         }
     }
-    return reinterpret_cast<FN_CLSIDFromProgID>(
-        s_hooks[HK_CLSIDFromProgID].pTrampoline)(lpszProgID, lpclsid);
+    return s_origCLSIDFromProgID(lpszProgID, lpclsid);
 }
 
 // =====================================================================
-// Section 8b: Registry Hooks
+// Section 7b: Registry Hooks
 //
 // Intercepts registry access to:
 // - Bypass Flash ActiveX kill bit (KB4561600)
 // - Fake Flash CLSID registration (InprocServer32, TypeLib, ProgID, etc.)
 // - Fake MIME type -> CLSID mapping
 // - Fake FEATURE_BROWSER_EMULATION value
-// - Clear Compatibility Flags kill bit
 // =====================================================================
 
 // Helper to check if a subkey path ends with a specific suffix (case-insensitive)
@@ -827,28 +546,35 @@ static bool SubKeyEndsWith(LPCWSTR lpSubKey, LPCWSTR suffix)
 // Helper: fill a REG_SZ value into the query result buffer
 static LSTATUS FakeRegSz(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, const wchar_t* val)
 {
+    if (lpData && !lpcbData)
+        return ERROR_INVALID_PARAMETER;
+
     DWORD needed = (DWORD)((wcslen(val) + 1) * sizeof(wchar_t));
     if (lpType) *lpType = REG_SZ;
     if (lpcbData) {
         DWORD avail = *lpcbData;
         *lpcbData = needed;
-        if (lpData) {
-            if (avail >= needed)
-                memcpy(lpData, val, needed);
-            else
-                return ERROR_MORE_DATA;
-        }
+        if (lpData && avail < needed)
+            return ERROR_MORE_DATA;
+        if (lpData)
+            memcpy(lpData, val, needed);
     }
     return ERROR_SUCCESS;
 }
 
 static LSTATUS FakeRegDword(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, DWORD val)
 {
+    if (lpData && !lpcbData)
+        return ERROR_INVALID_PARAMETER;
+
     if (lpType) *lpType = REG_DWORD;
     if (lpcbData) {
-        if (lpData && *lpcbData >= sizeof(DWORD))
-            memcpy(lpData, &val, sizeof(DWORD));
+        DWORD avail = *lpcbData;
         *lpcbData = sizeof(DWORD);
+        if (lpData && avail < sizeof(DWORD))
+            return ERROR_MORE_DATA;
+        if (lpData)
+            memcpy(lpData, &val, sizeof(DWORD));
     }
     return ERROR_SUCCESS;
 }
@@ -862,10 +588,9 @@ struct FakeSubKeyEntry {
 };
 
 static const FakeSubKeyEntry s_fakeSubKeys[] = {
-    { L"CLSID",                    FK_PROGID_CLSID,  FK_PROGID_ROOT },
+    { L"CLSID",                    FK_PROGID_CLSID,   FK_PROGID_ROOT },
     { L"CurVer",                   FK_PROGID_CURVER,  FK_NONE },
     { L"InprocServer32",           FK_INPROC,         FK_NONE },
-    { L"InProcServer32",           FK_INPROC,         FK_NONE },
     { L"MiscStatus\\1",            FK_MISCSTATUS1,    FK_NONE },
     { L"1",                        FK_MISCSTATUS1,    FK_NONE },
     { L"MiscStatus",               FK_MISCSTATUS,     FK_NONE },
@@ -885,7 +610,6 @@ struct ClsidSuffixEntry {
 
 static const ClsidSuffixEntry s_clsidSuffixes[] = {
     { L"InprocServer32",           FK_INPROC },
-    { L"InProcServer32",           FK_INPROC },
     { L"MiscStatus\\1",            FK_MISCSTATUS1 },
     { L"MiscStatus",               FK_MISCSTATUS },
     { L"ProgID",                   FK_PROGID },
@@ -908,23 +632,69 @@ static LSTATUS ReturnFakeKey(FakeKeyType type, PHKEY phkResult,
     return ERROR_FILE_NOT_FOUND;
 }
 
-// Check if lpSubKey contains a ShockwaveFlash ProgID with valid version (<=34).
-static bool IsFlashProgIDPath(LPCWSTR lpSubKey)
+static bool IsPathBoundary(wchar_t ch)
 {
-    const wchar_t* progid = wcsstr(lpSubKey, L"ShockwaveFlash.ShockwaveFlash");
-    if (!progid) return false;
-    const wchar_t* afterBase = progid + 29;
-    if (*afterBase == L'.') {
-        int ver = _wtoi(afterBase + 1);
-        if (ver > 34) return false;
-    }
-    return (*afterBase == L'\0' || *afterBase == L'.' || *afterBase == L'\\');
+    return ch == L'\0' || ch == L'\\';
 }
 
-// Case-insensitive check for Flash CLSID substring in a path.
+static const wchar_t* FindPathElementI(LPCWSTR path, LPCWSTR element)
+{
+    size_t elementLength = wcslen(element);
+    const wchar_t* cursor = path;
+    while (const wchar_t* match = StrStrIW(cursor, element)) {
+        bool validStart = match == path || match[-1] == L'\\';
+        if (validStart && IsPathBoundary(match[elementLength]))
+            return match;
+        cursor = match + 1;
+    }
+    return nullptr;
+}
+
+// Check if lpSubKey contains a complete ShockwaveFlash ProgID path element
+// with an optional all-numeric version suffix no greater than 34.
+static bool IsFlashProgIDPath(LPCWSTR lpSubKey)
+{
+    static const wchar_t base[] = L"ShockwaveFlash.ShockwaveFlash";
+    const wchar_t* cursor = lpSubKey;
+
+    while (const wchar_t* progid = StrStrIW(cursor, base)) {
+        if (progid != lpSubKey && progid[-1] != L'\\') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        const wchar_t* suffix = progid + _countof(base) - 1;
+        if (IsPathBoundary(*suffix))
+            return true;
+        if (*suffix != L'.') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        const wchar_t* digit = suffix + 1;
+        if (*digit < L'0' || *digit > L'9') {
+            cursor = progid + 1;
+            continue;
+        }
+
+        unsigned version = 0;
+        while (*digit >= L'0' && *digit <= L'9') {
+            version = version * 10 + static_cast<unsigned>(*digit - L'0');
+            if (version > 34)
+                break;
+            digit++;
+        }
+        if (version <= 34 && IsPathBoundary(*digit))
+            return true;
+        cursor = progid + 1;
+    }
+    return false;
+}
+
+// Registry class paths use the complete braced GUID as one path element.
 static bool PathContainsFlashCLSID(LPCWSTR lpSubKey)
 {
-    return wcsstr(lpSubKey, L"D27CDB6E") || wcsstr(lpSubKey, L"d27cdb6e");
+    return FindPathElementI(lpSubKey, FLASH_CLSID_STR) != nullptr;
 }
 
 LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
@@ -932,8 +702,11 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     REGSAM samDesired, PHKEY phkResult)
 {
     // ---- Handle subkey opens under fake Flash HKEY handles ----
-    if (IsFakeHKey(hKey) && lpSubKey && phkResult) {
-        FakeKeyType parentType = GetFakeKeyType(hKey);
+    FakeKeyType parentType = GetFakeKeyType(hKey);
+    if (parentType == FK_BROWSER_EMULATION)
+        return s_origRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+
+    if (parentType != FK_NONE && lpSubKey && phkResult) {
         FakeKeyType subType = FK_NONE;
 
         for (const auto& e : s_fakeSubKeys) {
@@ -960,8 +733,8 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
 
         // ---- Flash kill bit bypass ----
         if (hasFlashClsid) {
-            if (wcsstr(lpSubKey, L"ActiveX Compatibility") ||
-                wcsstr(lpSubKey, L"Extension Compatibility")) {
+            if (FindPathElementI(lpSubKey, L"ActiveX Compatibility") ||
+                FindPathElementI(lpSubKey, L"Extension Compatibility")) {
                 DbgTrace(L"[FlashIE] RegOpenKeyExW BLOCKED (kill bit): %s\n", lpSubKey);
                 return ERROR_FILE_NOT_FOUND;
             }
@@ -969,7 +742,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
 
         // ---- Fake Flash ProgID registration ----
         if (IsFlashProgIDPath(lpSubKey) && phkResult) {
-            FakeKeyType type = (wcsstr(lpSubKey, L"\\CLSID") || SubKeyEndsWith(lpSubKey, L"CLSID"))
+            FakeKeyType type = SubKeyEndsWith(lpSubKey, L"\\CLSID")
                 ? FK_PROGID_CLSID : FK_PROGID_ROOT;
             return ReturnFakeKey(type, phkResult, lpSubKey,
                 type == FK_PROGID_CLSID ? L"ProgID\\CLSID" : L"ProgID root");
@@ -998,42 +771,47 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
         }
 
         // ---- Fake MIME type -> CLSID mapping ----
-        if ((wcsstr(lpSubKey, L"x-shockwave-flash") ||
-             wcsstr(lpSubKey, L"x-Shockwave-Flash")) &&
-            wcsstr(lpSubKey, L"Content Type"))
+        if (FindPathElementI(lpSubKey, L"application/x-shockwave-flash") &&
+            FindPathElementI(lpSubKey, L"Content Type"))
             return ReturnFakeKey(FK_MIME, phkResult, lpSubKey, L"MIME mapping");
 
         // ---- Fake Flash Player version info ----
         // SWFObject and similar JS detection check Macromedia\FlashPlayer registry keys.
-        if (wcsstr(lpSubKey, L"Macromedia\\FlashPlayer") && phkResult)
+        if ((FindPathElementI(lpSubKey, L"Macromedia\\FlashPlayer") ||
+             FindPathElementI(lpSubKey, L"Macromedia\\FlashPlayerActiveX")) && phkResult)
             return ReturnFakeKey(FK_FLASHPLAYER_VER, phkResult, lpSubKey, L"FlashPlayer version");
 
         // ---- FEATURE_BROWSER_EMULATION tracking ----
-        if (wcsstr(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
-            LSTATUS res = reinterpret_cast<FN_RegOpenKeyExW>(
-                s_hooks[HK_RegOpenKeyExW].pTrampoline)(
+        if (FindPathElementI(lpSubKey, L"FEATURE_BROWSER_EMULATION")) {
+            LSTATUS res = s_origRegOpenKeyExW(
                 hKey, lpSubKey, ulOptions, samDesired, phkResult);
             if (res == ERROR_SUCCESS && phkResult)
-                s_hkeyBrowserEmulation = *phkResult;
+                TrackKey(*phkResult, FK_BROWSER_EMULATION);
             return res;
         }
     }
-    LSTATUS res = reinterpret_cast<FN_RegOpenKeyExW>(s_hooks[HK_RegOpenKeyExW].pTrampoline)(
+    LSTATUS res = s_origRegOpenKeyExW(
         hKey, lpSubKey, ulOptions, samDesired, phkResult);
     DbgTrace(L"[FlashIE] RegOpenKeyExW: %s -> 0x%X\n", lpSubKey ? lpSubKey : L"(null)", res);
     return res;
 }
 
-// Belt-and-suspenders kill bit bypass.
-// If CompatFlagsFromClsid already has the key open (cached handle),
-// it reads "Compatibility Flags". We intercept the value read and
-// return 0 (no flags) instead of 0x400 (COMPAT_EVIL_DONT_LOAD).
 LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
     HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved,
     LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
 {
     // ---- Fake Flash CLSID registration values ----
     FakeKeyType fkt = GetFakeKeyType(hKey);
+    if (fkt == FK_BROWSER_EMULATION) {
+        if (lpValueName && s_szExeName[0] &&
+            _wcsicmp(lpValueName, s_szExeName) == 0) {
+            DbgTrace(L"[FlashIE] RegQueryValueExW: FEATURE_BROWSER_EMULATION -> 11001\n");
+            return FakeRegDword(lpType, lpData, lpcbData, 11001);
+        }
+        return s_origRegQueryValueExW(
+            hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+    }
+
     if (fkt != FK_NONE) {
         switch (fkt) {
         case FK_CLSID_ROOT:
@@ -1147,102 +925,88 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
         }
     }
 
-    // ---- FEATURE_BROWSER_EMULATION ----
-    if (s_hkeyBrowserEmulation && hKey == s_hkeyBrowserEmulation &&
-        lpValueName && s_szExeName[0] && _wcsicmp(lpValueName, s_szExeName) == 0) {
-        DbgTrace(L"[FlashIE] RegQueryValueExW: FEATURE_BROWSER_EMULATION -> 11001\n");
-        return FakeRegDword(lpType, lpData, lpcbData, 11001);
-    }
-
-    // ---- Clear kill bit from Compatibility Flags ----
-    if (lpValueName && _wcsicmp(lpValueName, L"Compatibility Flags") == 0) {
-        LSTATUS res = reinterpret_cast<FN_RegQueryValueExW>(
-            s_hooks[HK_RegQueryValueExW].pTrampoline)(
-            hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
-        if (res == ERROR_SUCCESS && lpData && lpcbData && *lpcbData >= sizeof(DWORD)) {
-            DWORD val = *reinterpret_cast<DWORD*>(lpData);
-            if (val & 0x400) {
-                DbgTrace(L"[FlashIE] RegQueryValueExW: cleared kill bit (was 0x%X)\n", val);
-                *reinterpret_cast<DWORD*>(lpData) = val & ~0x400;
-            }
-        }
-        return res;
-    }
-
-    return reinterpret_cast<FN_RegQueryValueExW>(s_hooks[HK_RegQueryValueExW].pTrampoline)(
+    return s_origRegQueryValueExW(
         hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
 }
 
 LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 {
-    if (IsFakeHKey(hKey)) {
-        CloseFakeKey(hKey);
+    if (CloseFakeKey(hKey)) {
         return ERROR_SUCCESS;
     }
-    return reinterpret_cast<FN_RegCloseKey>(s_hooks[HK_RegCloseKey].pTrampoline)(hKey);
+    return s_origRegCloseKey(hKey);
 }
 
 // =====================================================================
-// Section 8c: Security & Feature Hooks
+// Section 7c: Security Hooks
 // =====================================================================
 
-// Disable all IE Feature Controls. MSHTML checks features like
-// FEATURE_RESTRICT_ACTIVEXINSTALL and FEATURE_SAFE_BINDTOOBJECT before
-// allowing ActiveX. Returning S_FALSE means "feature not enabled".
-HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoInternetIsFeatureEnabled(
-    DWORD dwFeature, DWORD dwFlags)
+static bool IsFlashCodeImage(HANDLE fileHandle, void* baseImage)
 {
-    HRESULT hrOrig = reinterpret_cast<FN_CoInternetIsFeatureEnabled>(
-        s_hooks[HK_CoInternetIsFeatureEnabled].pTrampoline)(dwFeature, dwFlags);
-
-    // S_OK = feature enabled (blocks), S_FALSE = feature not enabled (allows).
-    // Only log non-spammy features (skip feature 0 = OBJECT_CACHING)
-    static int s_featureLogCount = 0;
-    if (dwFeature != 0 && s_featureLogCount < 50) {
-        s_featureLogCount++;
-        DbgTrace(L"[FlashIE] CoInternetIsFeatureEnabled(feature=%u, flags=0x%X) orig=0x%08X -> S_FALSE\n",
-                 dwFeature, dwFlags, hrOrig);
+    if (baseImage && g_hOcxModule) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(baseImage, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+            mbi.AllocationBase == g_hOcxModule) {
+            return true;
+        }
     }
-    return S_FALSE;
+
+    if (fileHandle && fileHandle != INVALID_HANDLE_VALUE && g_szOcxPath[0]) {
+        wchar_t path[MAX_PATH + 4] = {};
+        DWORD length = GetFinalPathNameByHandleW(
+            fileHandle, path, _countof(path), FILE_NAME_NORMALIZED);
+        if (length > 0 && length < _countof(path)) {
+            const wchar_t* normalized = path;
+            if (wcsncmp(normalized, L"\\\\?\\", 4) == 0)
+                normalized += 4;
+            if (_wcsicmp(normalized, g_szOcxPath) == 0)
+                return true;
+        }
+    }
+
+    return false;
 }
 
 // Windows 10+ MSHTML calls wldp!WldpIsClassInApprovedList to check if
-// an ActiveX CLSID is approved for instantiation. We approve everything.
+// an ActiveX CLSID is approved for instantiation. Only the local Flash class
+// is exempted; every other class keeps the system policy result.
 HRESULT WINAPI FlashLoader::Hooked_WldpIsClassInApprovedList(
     const CLSID* classID, void* hostInfo, BOOL* isApproved, DWORD optionalFlags)
 {
-    if (classID)
-        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList({%08X-...}) -> approved\n", classID->Data1);
-    else
-        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList(null) -> approved\n");
+    if (classID && IsEqualCLSID(*classID, CLSID_ShockwaveFlash)) {
+        if (isApproved) *isApproved = TRUE;
+        DbgTrace(L"[FlashIE] WldpIsClassInApprovedList(Flash) -> approved\n");
+        return S_OK;
+    }
 
-    if (isApproved) *isApproved = TRUE;
-    return S_OK;
+    return s_origWldpIsClassInApprovedList(
+        classID, hostInfo, isApproved, optionalFlags);
 }
 
 HRESULT WINAPI FlashLoader::Hooked_WldpQueryDynamicCodeTrust(
     HANDLE fileHandle, void* baseImage, DWORD imageSize)
 {
-    DbgTrace(L"[FlashIE] WldpQueryDynamicCodeTrust -> S_OK (trusted)\n");
-    return S_OK;
+    if (IsFlashCodeImage(fileHandle, baseImage)) {
+        DbgTrace(L"[FlashIE] WldpQueryDynamicCodeTrust(Flash.ocx) -> trusted\n");
+        return S_OK;
+    }
+
+    return s_origWldpQueryDynamicCodeTrust(fileHandle, baseImage, imageSize);
 }
 
 // =====================================================================
-// Section 8d: Flash QI Hook
+// Section 7d: Flash QI Hook
 //
-// Intercepts IObjectSafety and IPersistPropertyBag queries on Flash
-// objects. Injects IObjectSafety support (required by MSHTML for
-// scripting access) and wraps IPersistPropertyBag to force
-// allowScriptAccess="always".
+// Intercepts IObjectSafety queries on Flash objects. Injecting this
+// interface is required by MSHTML for scripting access. Property-bag
+// values, including allowScriptAccess, remain controlled by the page.
 // =====================================================================
 
 static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void** ppv)
 {
-    auto origQI = reinterpret_cast<FN_FlashQueryInterface>(s_hooks[HK_FlashQI].pTrampoline);
-
     if (IsEqualIID(riid, IID_IObjectSafety)) {
         IUnknown* pFlashUnk = nullptr;
-        origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
+        s_origFlashQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
         if (pFlashUnk) {
             *ppv = static_cast<IObjectSafety*>(new FlashSafetyTearoff(pFlashUnk));
             DbgTrace(L"[FlashIE] Flash::QI(IObjectSafety) -> HOOKED tearoff\n");
@@ -1250,50 +1014,50 @@ static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void**
         }
     }
 
-    if (IsEqualIID(riid, IID_IPersistPropertyBag)) {
-        IPersistPropertyBag* pReal = nullptr;
-        HRESULT hr = origQI(pThis, riid, reinterpret_cast<void**>(&pReal));
-        if (SUCCEEDED(hr) && pReal) {
-            IUnknown* pFlashUnk = nullptr;
-            origQI(pThis, IID_IUnknown, reinterpret_cast<void**>(&pFlashUnk));
-            if (pFlashUnk) {
-                *ppv = static_cast<IPersistPropertyBag*>(
-                    new FlashPersistPBagTearoff(pFlashUnk, pReal));
-                return S_OK;
-            }
-            pReal->Release();
-        }
-        return hr;
-    }
-
-    return origQI(pThis, riid, ppv);
+    return s_origFlashQI(pThis, riid, ppv);
 }
 
 static void MaybeHookFlashQI(IUnknown* pObj)
 {
-    if (s_hooks[HK_FlashQI].active) return;
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_flashQIHooked) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        return;
+    }
     void** vtable = *reinterpret_cast<void***>(pObj);
     void* pFlashQI = vtable[0];
-    if (InstallDetour(pFlashQI, reinterpret_cast<void*>(Hooked_FlashQI), s_hooks[HK_FlashQI])) {
+
+    s_origFlashQI = reinterpret_cast<FN_FlashQueryInterface>(pFlashQI);
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(reinterpret_cast<void**>(&s_origFlashQI),
+                 reinterpret_cast<void*>(Hooked_FlashQI));
+    LONG error = DetourTransactionCommit();
+    if (error == NO_ERROR) {
+        s_flashQIHooked = true;
         DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: OK (addr=%p)\n", pFlashQI);
     } else {
-        DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED\n");
+        DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED (error=%d)\n", error);
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 }
 
 // =====================================================================
-// Section 8e: Flash forced in-place activation
+// Section 7e: Flash Forced In-Place Activation
 //
 // MSHTML creates Flash objects but defers DoVerb(INPLACEACTIVATE)
 // until a user click (Windows 10 Flash phase-out behavior).
 // We hook Flash's IOleObject::SetClientSite; once MSHTML sets the site,
-// we schedule a timer to call DoVerb(OLEIVERB_INPLACEACTIVATE) forcing
-// the control to activate without user interaction.
+// we schedule an owning-STA timer to obtain the in-place site's HWND/RECT
+// and call DoVerb(OLEIVERB_INPLACEACTIVATE), forcing the control to activate
+// without user interaction. SetClientSite and QuickActivate vtable slots are
+// restored during deactivation.
 // =====================================================================
 
 typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
     IOleObject* pThis, IOleClientSite* pClientSite);
 static FN_OleSetClientSite s_origSetClientSite = nullptr;
+static void** s_hookedOleVtable = nullptr;
 
 struct PendingActivation {
     IOleObject* pObj;
@@ -1314,6 +1078,52 @@ static int s_deferredCount = 0;
 static UINT_PTR s_deferredTimer = 0;
 static int s_deferredRetries = 0;
 static const int MAX_DEFERRED_RETRIES = 50; // 50 × 200ms = 10s
+static volatile LONG s_activationThreadId = 0;
+
+static bool IsActivationThread()
+{
+    LONG current = static_cast<LONG>(GetCurrentThreadId());
+    LONG owner = InterlockedCompareExchange(&s_activationThreadId, current, 0);
+    return owner == 0 || owner == current;
+}
+
+static HRESULT ActivateInPlace(IOleObject* pObj, IOleClientSite* pSite)
+{
+    IOleInPlaceSite* inPlaceSite = nullptr;
+    HRESULT hr = pSite->QueryInterface(
+        IID_IOleInPlaceSite, reinterpret_cast<void**>(&inPlaceSite));
+    if (FAILED(hr) || !inPlaceSite)
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+
+    HWND parent = nullptr;
+    hr = inPlaceSite->GetWindow(&parent);
+
+    RECT posRect = {};
+    if (SUCCEEDED(hr) && parent) {
+        IOleInPlaceFrame* frame = nullptr;
+        IOleInPlaceUIWindow* doc = nullptr;
+        RECT clipRect = {};
+        OLEINPLACEFRAMEINFO frameInfo = {};
+        frameInfo.cb = sizeof(frameInfo);
+
+        HRESULT contextHr = inPlaceSite->GetWindowContext(
+            &frame, &doc, &posRect, &clipRect, &frameInfo);
+        if (frame) frame->Release();
+        if (doc) doc->Release();
+
+        if (FAILED(contextHr) && !GetClientRect(parent, &posRect))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+    } else if (SUCCEEDED(hr)) {
+        hr = E_HANDLE;
+    }
+
+    inPlaceSite->Release();
+    if (FAILED(hr))
+        return hr;
+
+    return pObj->DoVerb(
+        OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, parent, &posRect);
+}
 
 static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
@@ -1323,7 +1133,7 @@ static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWO
         IOleObject* pObj = s_deferred[i].pObj;
         IOleClientSite* pSite = s_deferred[i].pSite;
         if (pObj && pSite) {
-            pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+            ActivateInPlace(pObj, pSite);
         }
     }
 
@@ -1349,7 +1159,7 @@ static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
         IOleObject* pObj = s_pending[i].pObj;
         IOleClientSite* pSite = s_pending[i].pSite;
         if (pObj && pSite) {
-            HRESULT hr = pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+            HRESULT hr = ActivateInPlace(pObj, pSite);
             DbgTrace(L"[FlashIE] ForceActivate DoVerb -> hr=0x%08X\n", hr);
 
             // Save for deferred re-activation: Flash in display:none iframes
@@ -1404,7 +1214,8 @@ static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
     HRESULT hr = s_origSetClientSite(pThis, pClientSite);
 
     // When MSHTML sets a non-null client site, queue forced activation
-    if (SUCCEEDED(hr) && pClientSite && s_pendingCount < MAX_PENDING) {
+    if (SUCCEEDED(hr) && pClientSite && IsActivationThread() &&
+        s_pendingCount < MAX_PENDING) {
         pThis->AddRef();
         pClientSite->AddRef();
         s_pending[s_pendingCount].pObj = pThis;
@@ -1421,22 +1232,30 @@ static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
 
 static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 {
-    if (s_origSetClientSite) return; // already hooked
-
     IOleObject* pOle = nullptr;
     pObj->QueryInterface(IID_IOleObject, reinterpret_cast<void**>(&pOle));
     if (!pOle) return;
 
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_origSetClientSite) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        pOle->Release();
+        return;
+    }
+
     void** vtable = *reinterpret_cast<void***>(pOle);
     // IOleObject::SetClientSite is vtable slot 3 (after QI, AddRef, Release)
-    s_origSetClientSite = reinterpret_cast<FN_OleSetClientSite>(vtable[3]);
+    FN_OleSetClientSite original = reinterpret_cast<FN_OleSetClientSite>(vtable[3]);
 
     DWORD oldProtect;
     if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        s_origSetClientSite = original;
+        s_hookedOleVtable = vtable;
         vtable[3] = reinterpret_cast<void*>(Hooked_OleSetClientSite);
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IOleObject::SetClientSite: OK\n");
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 
     pOle->Release();
 }
@@ -1449,6 +1268,7 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
 static FN_QuickActivate s_origQuickActivate = nullptr;
+static void** s_hookedQuickVtable = nullptr;
 
 static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl)
@@ -1456,6 +1276,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
     HRESULT hr = s_origQuickActivate(pThis, pQAContainer, pQAControl);
 
     if (SUCCEEDED(hr) && pQAContainer && pQAContainer->pClientSite &&
+        IsActivationThread() &&
         s_pendingCount < MAX_PENDING) {
         // Get IOleObject from the Flash control to call DoVerb later
         IOleObject* pOle = nullptr;
@@ -1479,28 +1300,52 @@ static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
 
 static void MaybeHookFlashQuickActivate(IUnknown* pObj)
 {
-    if (s_origQuickActivate) return; // already hooked
-
     IQuickActivate* pQA = nullptr;
     pObj->QueryInterface(IID_IQuickActivate, reinterpret_cast<void**>(&pQA));
     if (!pQA) return;
 
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_origQuickActivate) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        pQA->Release();
+        return;
+    }
+
     void** vtable = *reinterpret_cast<void***>(pQA);
     // IQuickActivate::QuickActivate is vtable slot 3 (after QI, AddRef, Release)
-    s_origQuickActivate = reinterpret_cast<FN_QuickActivate>(vtable[3]);
+    FN_QuickActivate original = reinterpret_cast<FN_QuickActivate>(vtable[3]);
 
     DWORD oldProtect;
     if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        s_origQuickActivate = original;
+        s_hookedQuickVtable = vtable;
         vtable[3] = reinterpret_cast<void*>(Hooked_QuickActivate);
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IQuickActivate::QuickActivate: OK\n");
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 
     pQA->Release();
 }
 
+static bool RestoreFlashVtableSlot(
+    void** vtable, void* hook, void* original)
+{
+    if (!vtable || !original)
+        return true;
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+
+    if (vtable[3] == hook)
+        vtable[3] = original;
+    return VirtualProtect(
+        &vtable[3], sizeof(void*), oldProtect, &oldProtect) != FALSE;
+}
+
 // =====================================================================
-// Section 8f: TypeLib Hook
+// Section 7f: TypeLib Hook
 //
 // Flash.ocx's TypeLib GUID is {D27CDB6B-AE6D-11CF-96B8-444553540000}.
 // Without registry entries, OLEAUT32 can't find it and returns
@@ -1525,8 +1370,7 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
             return hr;
         }
     }
-    HRESULT hr = reinterpret_cast<FN_LoadRegTypeLib>(
-        s_hooks[HK_LoadRegTypeLib].pTrampoline)(rguid, wVerMajor, wVerMinor, lcid, pptlib);
+    HRESULT hr = s_origLoadRegTypeLib(rguid, wVerMajor, wVerMinor, lcid, pptlib);
     if (FAILED(hr)) {
         DbgTrace(L"[FlashIE] LoadRegTypeLib({%08X-...}) v%u.%u -> 0x%08X\n",
                  rguid.Data1, wVerMajor, wVerMinor, hr);
@@ -1535,7 +1379,208 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 }
 
 // =====================================================================
-// Section 9: Public API (Activate, InstallHooks, Deactivate)
+// Section 7g: Script Engine ParseScriptText Hook
+//
+// Hooks IActiveScriptParse::ParseScriptText on JScript engines.
+// Script code is preprocessed through JScriptCC's Conditional Compilation
+// engine (@cc_on / @if / @set / @end) before execution. If preprocessing
+// succeeds, the expanded code is passed to the original engine; otherwise
+// the original code is executed unmodified. All errors are reported via
+// DbgTrace (OutputDebugStringW).
+// =====================================================================
+
+static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
+    void* pThis, LPCOLESTR pstrCode, LPCOLESTR pstrItemName,
+    IUnknown* punkContext, LPCOLESTR pstrDelimiter,
+    DWORD_PTR dwSourceContextCookie, ULONG ulStartingLineNumber,
+    DWORD dwFlags, VARIANT* pvarResult, EXCEPINFO* pexcepinfo)
+{
+    void** vtable = *reinterpret_cast<void***>(pThis);
+    FN_ParseScriptText original = nullptr;
+    AcquireSRWLockShared(&s_scriptHookLock);
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        if (s_scriptHooks[i].vtable == vtable) {
+            original = s_scriptHooks[i].original;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_scriptHookLock);
+    if (!original)
+        return E_UNEXPECTED;
+
+    if (pstrCode) {
+        // Convert UTF-16 source to UTF-8 for JScriptCC
+        int codeLen = static_cast<int>(wcslen(pstrCode));
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, nullptr, 0, nullptr, nullptr);
+        if (utf8Len > 0) {
+            std::string utf8Source(utf8Len, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, &utf8Source[0], utf8Len, nullptr, nullptr);
+
+            // Run JScriptCC conditional compilation preprocessor
+            std::string preprocessed;
+            jscriptcc::CCErrorList errors;
+            jscriptcc::CCPreprocessor preprocessor;
+
+            const auto architecture = sizeof(void*) == 8
+                ? jscriptcc::TargetArchitecture::Win64
+                : jscriptcc::TargetArchitecture::Win32;
+
+            bool ok = preprocessor.process(
+                utf8Source, preprocessed, jscriptcc::CCEnvironment(architecture), &errors);
+
+            // Report any preprocessing errors
+            for (const auto& err : errors) {
+                DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
+                         err.line, err.column, err.message.c_str());
+            }
+
+            if (ok && !preprocessed.empty()) {
+                // Convert preprocessed UTF-8 back to UTF-16
+                int wideLen = MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), nullptr, 0);
+                if (wideLen > 0) {
+                    std::wstring preprocessedWide(wideLen, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), &preprocessedWide[0], wideLen);
+
+                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) begin ===\n");
+                    if (pstrItemName && pstrItemName[0])
+                        DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
+                    DbgTrace(L"[FlashIE]   code: %s\n", preprocessedWide.c_str());
+                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
+
+                    return original(pThis, preprocessedWide.c_str(), pstrItemName,
+                        punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
+                        dwFlags, pvarResult, pexcepinfo);
+                }
+            }
+
+            // Preprocessing failed or produced empty output — fall through to original code
+            if (!ok) {
+                DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
+            }
+        }
+    }
+
+    return original(pThis, pstrCode, pstrItemName, punkContext,
+        pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
+        dwFlags, pvarResult, pexcepinfo);
+}
+
+static bool IsJScriptEngine(REFCLSID rclsid)
+{
+    return IsEqualCLSID(rclsid, CLSID_JScript_) ||
+           IsEqualCLSID(rclsid, CLSID_JScript9_);
+}
+
+static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
+{
+    if (!IsJScriptEngine(rclsid))
+        return;
+
+    void* pParse = nullptr;
+    if (FAILED(pObj->QueryInterface(IID_IActiveScriptParse, &pParse)) || !pParse)
+        return;
+
+    void** vtable = *reinterpret_cast<void***>(pParse);
+    // IActiveScriptParse::ParseScriptText is vtable slot 5
+    // (after QI=0, AddRef=1, Release=2, InitNew=3, AddScriptlet=4)
+    void* pTarget = vtable[5];
+
+    AcquireSRWLockExclusive(&s_scriptHookLock);
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        if (s_scriptHooks[i].vtable == vtable) {
+            ReleaseSRWLockExclusive(&s_scriptHookLock);
+            static_cast<IUnknown*>(pParse)->Release();
+            return;
+        }
+    }
+    if (s_scriptHookCount >= MAX_SCRIPT_HOOKS) {
+        ReleaseSRWLockExclusive(&s_scriptHookLock);
+        DbgTrace(L"[FlashIE] Script vtable hook table is full\n");
+        static_cast<IUnknown*>(pParse)->Release();
+        return;
+    }
+
+    DWORD oldProtect;
+    if (VirtualProtect(&vtable[5], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        vtable[5] = reinterpret_cast<void*>(Hooked_ParseScriptText);
+        VirtualProtect(&vtable[5], sizeof(void*), oldProtect, &oldProtect);
+        s_scriptHooks[s_scriptHookCount].vtable = vtable;
+        s_scriptHooks[s_scriptHookCount].original =
+            reinterpret_cast<FN_ParseScriptText>(pTarget);
+        s_scriptHookCount++;
+        DbgTrace(L"[FlashIE] Hook IActiveScriptParse::ParseScriptText: OK (addr=%p)\n",
+                 pTarget);
+    }
+    ReleaseSRWLockExclusive(&s_scriptHookLock);
+
+    static_cast<IUnknown*>(pParse)->Release();
+}
+
+// =====================================================================
+// Section 7h: SharedObject First-Save Compatibility
+//
+// The bundled ActiveX player treats a missing old .sol as a failed replace
+// operation. For that one narrowly scoped case, report the deletion as
+// successful so Flash can continue its own .sxx -> .sol commit.
+// =====================================================================
+
+static bool IsFlashCaller(void* returnAddress)
+{
+    if (!returnAddress || !g_hOcxModule)
+        return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    return VirtualQuery(returnAddress, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+           mbi.AllocationBase == g_hOcxModule;
+}
+
+static bool HasSolExtension(LPCWSTR path)
+{
+    if (!path)
+        return false;
+    size_t length = wcslen(path);
+    return length >= 4 && _wcsicmp(path + length - 4, L".sol") == 0;
+}
+
+static bool HasSolExtension(LPCSTR path)
+{
+    if (!path)
+        return false;
+    size_t length = strlen(path);
+    return length >= 4 && _stricmp(path + length - 4, ".sol") == 0;
+}
+
+static BOOL ReturnMissingSolDeleteAsSuccess(
+    BOOL result, DWORD error, bool isFlashSol)
+{
+    if (!result && error == ERROR_FILE_NOT_FOUND && isFlashSol) {
+        DbgTrace(L"[FlashIE] Treating missing first-save SOL as deleted\n");
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    SetLastError(error);
+    return result;
+}
+
+BOOL WINAPI FlashLoader::Hooked_DeleteFileW(LPCWSTR lpFileName)
+{
+    bool isFlashSol = IsFlashCaller(_ReturnAddress()) && HasSolExtension(lpFileName);
+    BOOL result = s_origDeleteFileW(lpFileName);
+    DWORD error = GetLastError();
+    return ReturnMissingSolDeleteAsSuccess(result, error, isFlashSol);
+}
+
+BOOL WINAPI FlashLoader::Hooked_DeleteFileA(LPCSTR lpFileName)
+{
+    bool isFlashSol = IsFlashCaller(_ReturnAddress()) && HasSolExtension(lpFileName);
+    BOOL result = s_origDeleteFileA(lpFileName);
+    DWORD error = GetLastError();
+    return ReturnMissingSolDeleteAsSuccess(result, error, isFlashSol);
+}
+
+// =====================================================================
+// Section 8: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
 
 bool FlashLoader::Activate()
@@ -1550,6 +1595,7 @@ bool FlashLoader::Activate()
     SetDllDirectoryW(szDir);
 
     m_hModule = LoadLibraryW(g_szOcxPath);
+    g_hOcxModule = m_hModule;
 
     // Pin Flash.ocx in memory — prevent COM from unloading it when all
     // Flash objects are released.  Our hooks (factory pointers, etc.)
@@ -1572,6 +1618,7 @@ bool FlashLoader::Activate()
     if (!pfnGetClassObject) {
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
+        g_hOcxModule = nullptr;
         return false;
     }
 
@@ -1580,23 +1627,30 @@ bool FlashLoader::Activate()
     if (FAILED(hr) || !m_pFactory) {
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
+        g_hOcxModule = nullptr;
         return false;
     }
 
-    // Publish for the hook functions
-    s_pFlashFactory = m_pFactory;
-
     // Create logging wrapper around the real factory
-    s_pLoggingFactory = new LoggingClassFactory(m_pFactory);
+    LoggingClassFactory* loggingFactory = new LoggingClassFactory(m_pFactory);
+    AcquireSRWLockExclusive(&s_factoryLock);
+    s_pFlashFactory = m_pFactory;
+    s_pLoggingFactory = loggingFactory;
+    ReleaseSRWLockExclusive(&s_factoryLock);
 
     // Register the LOGGING wrapper (not raw factory) via CoRegisterClassObject.
     // This ensures that even when COM routes through the registered class object
     // (e.g., cross-domain iframes), our wrapper is used and SetClientSite/
     // QuickActivate hooks are triggered for forced activation.
-    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, s_pLoggingFactory,
+    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, loggingFactory,
                           CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
                           &m_dwCookie);
     DbgTrace(L"[FlashIE] CoRegisterClassObject -> hr=0x%08X cookie=%u\n", hrReg, m_dwCookie);
+    if (FAILED(hrReg)) {
+        m_dwCookie = 0;
+        Deactivate();
+        return false;
+    }
 
     // Cache exe name for FEATURE_BROWSER_EMULATION hook
     WCHAR szExe[MAX_PATH];
@@ -1606,9 +1660,10 @@ bool FlashLoader::Activate()
     return true;
 }
 
-void FlashLoader::InstallHooks()
+bool FlashLoader::InstallHooks()
 {
-    if (m_hooked || !m_pFactory) return;
+    if (m_hooked) return true;
+    if (!m_pFactory) return false;
 
     // --- Step 1: Force-load IE DLLs so we can hook them ---
     LoadLibraryW(L"mshtml.dll");
@@ -1619,93 +1674,220 @@ void FlashLoader::InstallHooks()
     HMODULE hCombase    = GetModuleHandleW(L"combase.dll");
     HMODULE hOle32      = GetModuleHandleW(L"ole32.dll");
     HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+    HMODULE hKernel32   = GetModuleHandleW(L"kernel32.dll");
     HMODULE hAdvapi32   = GetModuleHandleW(L"advapi32.dll");
     HMODULE hUrlmon     = GetModuleHandleW(L"urlmon.dll");
     HMODULE hOleAut32   = GetModuleHandleW(L"oleaut32.dll");
     HMODULE hWldp       = GetModuleHandleW(L"wldp.dll");
     if (!hWldp) hWldp   = LoadLibraryW(L"wldp.dll");
 
-    // --- Step 3: Install inline hooks ---
-    // Order: registry hooks first (kill bit bypass), then COM hooks
+    // --- Step 3: Resolve every required target before modifying code ---
+    s_origRegOpenKeyExW = reinterpret_cast<FN_RegOpenKeyExW>(
+        ResolveTarget(hKernelBase, "RegOpenKeyExW", hAdvapi32));
+    s_origRegQueryValueExW = reinterpret_cast<FN_RegQueryValueExW>(
+        ResolveTarget(hKernelBase, "RegQueryValueExW", hAdvapi32));
+    s_origRegCloseKey = reinterpret_cast<FN_RegCloseKey>(
+        ResolveTarget(hKernelBase, "RegCloseKey", hAdvapi32));
+    s_origDeleteFileA = reinterpret_cast<FN_DeleteFileA>(
+        ResolveTarget(hKernel32, "DeleteFileA", hKernelBase));
+    s_origDeleteFileW = reinterpret_cast<FN_DeleteFileW>(
+        ResolveTarget(hKernel32, "DeleteFileW", hKernelBase));
+    s_origCoGetClassObject = reinterpret_cast<FN_CoGetClassObject>(
+        ResolveTarget(hCombase, "CoGetClassObject", hOle32));
+    s_origCoCreateInstance = reinterpret_cast<FN_CoCreateInstance>(
+        ResolveTarget(hCombase, "CoCreateInstance", hOle32));
+    s_origCLSIDFromProgID = reinterpret_cast<FN_CLSIDFromProgID>(
+        ResolveTarget(hCombase, "CLSIDFromProgID", hOle32));
+    s_origCoGetClassObjectFromURL = reinterpret_cast<FN_CoGetClassObjectFromURL>(
+        ResolveTarget(hUrlmon, "CoGetClassObjectFromURL"));
+    s_origLoadRegTypeLib = reinterpret_cast<FN_LoadRegTypeLib>(
+        ResolveTarget(hOleAut32, "LoadRegTypeLib"));
 
-    // Registry hooks
-    ResolveAndHook("RegOpenKeyExW", L"RegOpenKeyExW",
-        reinterpret_cast<void*>(&Hooked_RegOpenKeyExW), s_hooks[HK_RegOpenKeyExW],
-        hKernelBase, hAdvapi32);
+    if (!s_origRegOpenKeyExW || !s_origRegQueryValueExW || !s_origRegCloseKey ||
+        !s_origDeleteFileA || !s_origDeleteFileW ||
+        !s_origCoGetClassObject || !s_origCoCreateInstance || !s_origCLSIDFromProgID ||
+        !s_origCoGetClassObjectFromURL || !s_origLoadRegTypeLib) {
+        ResetApiHookPointers();
+        return false;
+    }
 
-    ResolveAndHook("RegQueryValueExW", L"RegQueryValueExW",
-        reinterpret_cast<void*>(&Hooked_RegQueryValueExW), s_hooks[HK_RegQueryValueExW],
-        hKernelBase, hAdvapi32);
+    // WLDP does not exist on older Windows versions. Install both hooks only
+    // when the OS exports the complete API pair.
+    if (hWldp) {
+        s_origWldpIsClassInApprovedList = reinterpret_cast<FN_WldpIsClassInApprovedList>(
+            ResolveTarget(hWldp, "WldpIsClassInApprovedList"));
+        s_origWldpQueryDynamicCodeTrust = reinterpret_cast<FN_WldpQueryDynamicCodeTrust>(
+            ResolveTarget(hWldp, "WldpQueryDynamicCodeTrust"));
+        if (!s_origWldpIsClassInApprovedList || !s_origWldpQueryDynamicCodeTrust) {
+            s_origWldpIsClassInApprovedList = nullptr;
+            s_origWldpQueryDynamicCodeTrust = nullptr;
+        }
+    }
 
-    ResolveAndHook("RegCloseKey", L"RegCloseKey",
-        reinterpret_cast<void*>(&Hooked_RegCloseKey), s_hooks[HK_RegCloseKey],
-        hKernelBase, hAdvapi32);
+    // --- Step 4: Attach the complete set atomically ---
+    LONG error = DetourTransactionBegin();
+    const bool transactionStarted = error == NO_ERROR;
+    if (error == NO_ERROR)
+        error = DetourUpdateThread(GetCurrentThread());
 
-    // COM hooks
-    ResolveAndHook("CoGetClassObject", L"CoGetClassObject",
-        reinterpret_cast<void*>(&Hooked_CoGetClassObject), s_hooks[HK_CoGetClassObject],
-        hCombase, hOle32);
+    #define ATTACH(orig, func) \
+        if (error == NO_ERROR && orig) \
+            error = DetourAttach(reinterpret_cast<void**>(&orig), reinterpret_cast<void*>(&func));
 
-    ResolveAndHook("CoCreateInstance", L"CoCreateInstance",
-        reinterpret_cast<void*>(&Hooked_CoCreateInstance), s_hooks[HK_CoCreateInstance],
-        hCombase, hOle32);
+    ATTACH(s_origRegOpenKeyExW,             Hooked_RegOpenKeyExW);
+    ATTACH(s_origRegQueryValueExW,          Hooked_RegQueryValueExW);
+    ATTACH(s_origRegCloseKey,               Hooked_RegCloseKey);
+    ATTACH(s_origDeleteFileA,               Hooked_DeleteFileA);
+    ATTACH(s_origDeleteFileW,               Hooked_DeleteFileW);
+    ATTACH(s_origCoGetClassObject,          Hooked_CoGetClassObject);
+    ATTACH(s_origCoCreateInstance,          Hooked_CoCreateInstance);
+    ATTACH(s_origCLSIDFromProgID,           Hooked_CLSIDFromProgID);
+    ATTACH(s_origCoGetClassObjectFromURL,   Hooked_CoGetClassObjectFromURL);
+    ATTACH(s_origWldpIsClassInApprovedList, Hooked_WldpIsClassInApprovedList);
+    ATTACH(s_origWldpQueryDynamicCodeTrust, Hooked_WldpQueryDynamicCodeTrust);
+    ATTACH(s_origLoadRegTypeLib,            Hooked_LoadRegTypeLib);
 
-    ResolveAndHook("CLSIDFromProgID", L"CLSIDFromProgID",
-        reinterpret_cast<void*>(&Hooked_CLSIDFromProgID), s_hooks[HK_CLSIDFromProgID],
-        hCombase, hOle32);
+    #undef ATTACH
 
-    // URL moniker hooks
-    ResolveAndHook("CoGetClassObjectFromURL", L"CoGetClassObjectFromURL",
-        reinterpret_cast<void*>(&Hooked_CoGetClassObjectFromURL), s_hooks[HK_CoGetClassObjectFromURL],
-        hUrlmon);
+    if (error != NO_ERROR) {
+        if (transactionStarted)
+            DetourTransactionAbort();
+        ResetApiHookPointers();
+        return false;
+    }
 
-    ResolveAndHook("CoInternetIsFeatureEnabled", L"CoInternetIsFeatureEnabled",
-        reinterpret_cast<void*>(&Hooked_CoInternetIsFeatureEnabled), s_hooks[HK_CoInternetIsFeatureEnabled],
-        hUrlmon);
-
-    // WLDP hooks (Windows 10+ ActiveX approval)
-    ResolveAndHook("WldpIsClassInApprovedList", L"WldpIsClassInApprovedList",
-        reinterpret_cast<void*>(&Hooked_WldpIsClassInApprovedList), s_hooks[HK_WldpIsClassInApprovedList],
-        hWldp);
-
-    ResolveAndHook("WldpQueryDynamicCodeTrust", L"WldpQueryDynamicCodeTrust",
-        reinterpret_cast<void*>(&Hooked_WldpQueryDynamicCodeTrust), s_hooks[HK_WldpQueryDynamicCodeTrust],
-        hWldp);
-
-    // TypeLib hook
-    ResolveAndHook("LoadRegTypeLib", L"LoadRegTypeLib",
-        reinterpret_cast<void*>(&Hooked_LoadRegTypeLib), s_hooks[HK_LoadRegTypeLib],
-        hOleAut32);
+    error = DetourTransactionCommit();
+    if (error != NO_ERROR) {
+        ResetApiHookPointers();
+        return false;
+    }
 
     m_hooked = true;
+    return true;
 }
 
 void FlashLoader::Deactivate()
 {
+    LONG activationOwner = InterlockedCompareExchange(&s_activationThreadId, 0, 0);
+    if (activationOwner != 0 && activationOwner != static_cast<LONG>(GetCurrentThreadId())) {
+        DbgTrace(L"[FlashIE] Deactivate must run on the Flash activation STA\n");
+        return;
+    }
+
     FlushPendingActivations();
+    CloseAllTrackedKeys();
 
     if (m_hooked) {
-        for (int i = 0; i < HK_COUNT; i++)
-            RemoveDetour(s_hooks[i]);
+        AcquireSRWLockExclusive(&s_flashHookLock);
+        bool restoredOle = RestoreFlashVtableSlot(
+            s_hookedOleVtable, reinterpret_cast<void*>(Hooked_OleSetClientSite),
+            reinterpret_cast<void*>(s_origSetClientSite));
+        bool restoredQuick = RestoreFlashVtableSlot(
+            s_hookedQuickVtable, reinterpret_cast<void*>(Hooked_QuickActivate),
+            reinterpret_cast<void*>(s_origQuickActivate));
+        if (!restoredOle || !restoredQuick) {
+            DbgTrace(L"[FlashIE] Failed to restore a Flash activation vtable\n");
+            ReleaseSRWLockExclusive(&s_flashHookLock);
+            return;
+        }
+        s_hookedOleVtable = nullptr;
+        s_origSetClientSite = nullptr;
+        s_hookedQuickVtable = nullptr;
+        s_origQuickActivate = nullptr;
+
+        // Detach all API-level Detours hooks in a single transaction
+        LONG error = DetourTransactionBegin();
+        const bool transactionStarted = error == NO_ERROR;
+        if (error == NO_ERROR)
+            error = DetourUpdateThread(GetCurrentThread());
+
+        #define DETACH(orig, func) \
+            if (error == NO_ERROR && orig) \
+                error = DetourDetach(reinterpret_cast<void**>(&orig), reinterpret_cast<void*>(&func));
+
+        DETACH(s_origRegOpenKeyExW,              Hooked_RegOpenKeyExW);
+        DETACH(s_origRegQueryValueExW,           Hooked_RegQueryValueExW);
+        DETACH(s_origRegCloseKey,                Hooked_RegCloseKey);
+        DETACH(s_origDeleteFileA,                Hooked_DeleteFileA);
+        DETACH(s_origDeleteFileW,                Hooked_DeleteFileW);
+        DETACH(s_origCoGetClassObject,           Hooked_CoGetClassObject);
+        DETACH(s_origCoCreateInstance,           Hooked_CoCreateInstance);
+        DETACH(s_origCLSIDFromProgID,            Hooked_CLSIDFromProgID);
+        DETACH(s_origCoGetClassObjectFromURL,    Hooked_CoGetClassObjectFromURL);
+        DETACH(s_origWldpIsClassInApprovedList,  Hooked_WldpIsClassInApprovedList);
+        DETACH(s_origWldpQueryDynamicCodeTrust,  Hooked_WldpQueryDynamicCodeTrust);
+        DETACH(s_origLoadRegTypeLib,             Hooked_LoadRegTypeLib);
+
+        #undef DETACH
+
+        // Detach Flash QI hook separately (installed via MaybeHookFlashQI)
+        if (error == NO_ERROR && s_flashQIHooked && s_origFlashQI)
+            error = DetourDetach(reinterpret_cast<void**>(&s_origFlashQI),
+                                 reinterpret_cast<void*>(Hooked_FlashQI));
+
+        if (error != NO_ERROR) {
+            if (transactionStarted)
+                DetourTransactionAbort();
+            DbgTrace(L"[FlashIE] Detour detach transaction failed: %d\n", error);
+            ReleaseSRWLockExclusive(&s_flashHookLock);
+            return;
+        }
+
+        error = DetourTransactionCommit();
+        if (error != NO_ERROR) {
+            DbgTrace(L"[FlashIE] Detour detach commit failed: %d\n", error);
+            ReleaseSRWLockExclusive(&s_flashHookLock);
+            return;
+        }
+
+        ResetApiHookPointers();
+        s_origFlashQI = nullptr;
+        s_flashQIHooked = false;
         m_hooked = false;
+        ReleaseSRWLockExclusive(&s_flashHookLock);
     }
 
-    s_pFlashFactory = nullptr;
-    if (s_pLoggingFactory) {
-        s_pLoggingFactory->Release();
-        s_pLoggingFactory = nullptr;
+    // Restore all script engine vtable hooks.
+    AcquireSRWLockExclusive(&s_scriptHookLock);
+    for (int i = 0; i < s_scriptHookCount; i++) {
+        ScriptVtableHook& hook = s_scriptHooks[i];
+        if (!hook.vtable || !hook.original)
+            continue;
+        DWORD oldProtect;
+        if (VirtualProtect(&hook.vtable[5], sizeof(void*),
+                           PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            if (hook.vtable[5] == reinterpret_cast<void*>(Hooked_ParseScriptText))
+                hook.vtable[5] = reinterpret_cast<void*>(hook.original);
+            VirtualProtect(&hook.vtable[5], sizeof(void*), oldProtect, &oldProtect);
+        }
+        hook = {};
     }
+    s_scriptHookCount = 0;
+    ReleaseSRWLockExclusive(&s_scriptHookLock);
+
+    LoggingClassFactory* loggingFactory = nullptr;
+    AcquireSRWLockExclusive(&s_factoryLock);
+    s_pFlashFactory = nullptr;
+    loggingFactory = s_pLoggingFactory;
+    s_pLoggingFactory = nullptr;
+    ReleaseSRWLockExclusive(&s_factoryLock);
+    if (loggingFactory)
+        loggingFactory->Release();
 
     if (m_dwCookie) {
         CoRevokeClassObject(m_dwCookie);
         m_dwCookie = 0;
     }
+
     if (m_pFactory) {
         m_pFactory->Release();
         m_pFactory = nullptr;
     }
+    
     if (m_hModule) {
+        g_hOcxModule = nullptr;
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
     }
+    InterlockedExchange(&s_activationThreadId, 0);
 }
