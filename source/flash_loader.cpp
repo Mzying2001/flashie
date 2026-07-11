@@ -13,7 +13,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <shlwapi.h>
-#include <ocidl.h>      // IQuickActivate, IPersistPropertyBag
+#include <ocidl.h>      // IQuickActivate and debug-probed OLE interfaces
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
 #include <activscp.h>   // IActiveScriptParse (architecture-selected IID)
@@ -105,7 +105,8 @@ typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(
 // Section 3: Detours Hook Infrastructure
 // =====================================================================
 
-// Original function pointers for hooked APIs (set by DetourAttach)
+// Original function pointers for hooked APIs. InstallHooks resolves all
+// required targets before attaching them in one Detours transaction.
 static FN_CoGetClassObject            s_origCoGetClassObject = nullptr;
 static FN_CoCreateInstance            s_origCoCreateInstance = nullptr;
 static FN_RegOpenKeyExW               s_origRegOpenKeyExW = nullptr;
@@ -521,7 +522,6 @@ static HRESULT STDAPICALLTYPE Hooked_CLSIDFromProgID(
 // - Fake Flash CLSID registration (InprocServer32, TypeLib, ProgID, etc.)
 // - Fake MIME type -> CLSID mapping
 // - Fake FEATURE_BROWSER_EMULATION value
-// - Clear Compatibility Flags kill bit
 // =====================================================================
 
 // Helper to check if a subkey path ends with a specific suffix (case-insensitive)
@@ -928,7 +928,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 }
 
 // =====================================================================
-// Section 7c: Security & Feature Hooks
+// Section 7c: Security Hooks
 // =====================================================================
 
 static bool IsFlashCodeImage(HANDLE fileHandle, void* baseImage)
@@ -1038,8 +1038,10 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 // MSHTML creates Flash objects but defers DoVerb(INPLACEACTIVATE)
 // until a user click (Windows 10 Flash phase-out behavior).
 // We hook Flash's IOleObject::SetClientSite; once MSHTML sets the site,
-// we schedule a timer to call DoVerb(OLEIVERB_INPLACEACTIVATE) forcing
-// the control to activate without user interaction.
+// we schedule an owning-STA timer to obtain the in-place site's HWND/RECT
+// and call DoVerb(OLEIVERB_INPLACEACTIVATE), forcing the control to activate
+// without user interaction. SetClientSite and QuickActivate vtable slots are
+// restored during deactivation.
 // =====================================================================
 
 typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
