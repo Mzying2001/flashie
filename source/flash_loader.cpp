@@ -118,6 +118,7 @@ static FN_LoadRegTypeLib              s_origLoadRegTypeLib = nullptr;
 static FN_CLSIDFromProgID             s_origCLSIDFromProgID = nullptr;
 static FN_FlashQueryInterface         s_origFlashQI = nullptr;
 static bool                           s_flashQIHooked = false;
+static SRWLOCK                        s_flashHookLock = SRWLOCK_INIT;
 
 static void* ResolveTarget(
     HMODULE hPrimary, const char* funcName, HMODULE hFallback = nullptr)
@@ -178,6 +179,7 @@ struct FakeKeyEntry {
 static const int MAX_FAKE_KEYS = 64;
 static FakeKeyEntry s_fakeKeys[MAX_FAKE_KEYS] = {};
 static int s_fakeKeyCount = 0;
+static SRWLOCK s_fakeKeyLock = SRWLOCK_INIT;
 
 static HKEY AllocFakeKey(FakeKeyType type)
 {
@@ -186,37 +188,48 @@ static HKEY AllocFakeKey(FakeKeyType type)
         s_origRegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hReal);
     }
     if (!hReal) return nullptr;
+
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
     if (s_fakeKeyCount < MAX_FAKE_KEYS) {
         s_fakeKeys[s_fakeKeyCount].hKey = hReal;
         s_fakeKeys[s_fakeKeyCount].type = type;
         s_fakeKeyCount++;
     }
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
     return hReal;
 }
 
 static FakeKeyType GetFakeKeyType(HKEY hKey)
 {
-    for (int i = 0; i < s_fakeKeyCount; i++) {
-        if (s_fakeKeys[i].hKey == hKey) return s_fakeKeys[i].type;
-    }
-    return FK_NONE;
-}
-
-static bool IsFakeHKey(HKEY hKey)
-{
-    return GetFakeKeyType(hKey) != FK_NONE;
-}
-
-static void CloseFakeKey(HKEY hKey)
-{
+    FakeKeyType type = FK_NONE;
+    AcquireSRWLockShared(&s_fakeKeyLock);
     for (int i = 0; i < s_fakeKeyCount; i++) {
         if (s_fakeKeys[i].hKey == hKey) {
-            if (s_origRegCloseKey) s_origRegCloseKey(hKey);
-            s_fakeKeys[i] = s_fakeKeys[s_fakeKeyCount - 1];
-            s_fakeKeyCount--;
-            return;
+            type = s_fakeKeys[i].type;
+            break;
         }
     }
+    ReleaseSRWLockShared(&s_fakeKeyLock);
+    return type;
+}
+
+static bool CloseFakeKey(HKEY hKey)
+{
+    bool found = false;
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    for (int i = 0; i < s_fakeKeyCount; i++) {
+        if (s_fakeKeys[i].hKey == hKey) {
+            s_fakeKeys[i] = s_fakeKeys[s_fakeKeyCount - 1];
+            s_fakeKeyCount--;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+
+    if (found && s_origRegCloseKey)
+        s_origRegCloseKey(hKey);
+    return found;
 }
 
 // =====================================================================
@@ -234,7 +247,7 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
-    ULONG m_ref;
+    LONG m_ref;
 public:
     LoggingClassFactory(IClassFactory* real) : m_real(real), m_ref(1) { m_real->AddRef(); }
     ~LoggingClassFactory() { m_real->Release(); }
@@ -249,9 +262,11 @@ public:
         DbgTrace(L"[FlashIE] Factory::QI {%08X-...} -> 0x%08X\n", riid.Data1, hr);
         return hr;
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return ++m_ref; }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = --m_ref;
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
         if (ref == 0) delete this;
         return ref;
     }
@@ -347,6 +362,7 @@ public:
 
 // Logging wrapper around the real Flash class factory
 static LoggingClassFactory* s_pLoggingFactory = nullptr;
+static SRWLOCK s_factoryLock = SRWLOCK_INIT;
 
 // HKEY tracking for FEATURE_BROWSER_EMULATION (fake without registry writes)
 static HKEY s_hkeyBrowserEmulation = nullptr;
@@ -365,29 +381,36 @@ struct ScriptVtableHook {
 static const int MAX_SCRIPT_HOOKS = 4;
 static ScriptVtableHook s_scriptHooks[MAX_SCRIPT_HOOKS] = {};
 static int s_scriptHookCount = 0;
+static SRWLOCK s_scriptHookLock = SRWLOCK_INIT;
 
 // =====================================================================
 // Section 7a: COM Hooks
 // =====================================================================
 
-// Return the active Flash class factory (logging wrapper if available).
-static IClassFactory* GetFlashFactory()
+// Return a referenced factory snapshot so shutdown cannot invalidate it while
+// a process-wide COM hook is using it.
+static IClassFactory* AcquireFlashFactory(REFCLSID rclsid)
 {
-    return s_pLoggingFactory ? static_cast<IClassFactory*>(s_pLoggingFactory)
-                             : FlashLoader::s_pFlashFactory;
-}
+    if (!IsEqualCLSID(rclsid, CLSID_ShockwaveFlash))
+        return nullptr;
 
-static bool IsFlashCLSID(REFCLSID rclsid)
-{
-    return FlashLoader::s_pFlashFactory && IsEqualCLSID(rclsid, CLSID_ShockwaveFlash);
+    IClassFactory* factory = nullptr;
+    AcquireSRWLockShared(&s_factoryLock);
+    if (FlashLoader::s_pFlashFactory && s_pLoggingFactory) {
+        factory = static_cast<IClassFactory*>(s_pLoggingFactory);
+        factory->AddRef();
+    }
+    ReleaseSRWLockShared(&s_factoryLock);
+    return factory;
 }
 
 HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObject(
     REFCLSID rclsid, DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoGetClassObject(Flash) -> hr=0x%08X ppv=%p\n", hr, ppv ? *ppv : nullptr);
         return hr;
     }
@@ -400,8 +423,9 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->CreateInstance(pUnkOuter, riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->CreateInstance(pUnkOuter, riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoCreateInstance(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
@@ -422,8 +446,9 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoGetClassObjectFromURL(
     DWORD dwClsContext, LPVOID pvReserved,
     REFIID riid, LPVOID* ppv)
 {
-    if (IsFlashCLSID(rclsid)) {
-        HRESULT hr = GetFlashFactory()->QueryInterface(riid, ppv);
+    if (IClassFactory* factory = AcquireFlashFactory(rclsid)) {
+        HRESULT hr = factory->QueryInterface(riid, ppv);
+        factory->Release();
         DbgTrace(L"[FlashIE] CoGetClassObjectFromURL(Flash) -> hr=0x%08X\n", hr);
         return hr;
     }
@@ -586,8 +611,8 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
     REGSAM samDesired, PHKEY phkResult)
 {
     // ---- Handle subkey opens under fake Flash HKEY handles ----
-    if (IsFakeHKey(hKey) && lpSubKey && phkResult) {
-        FakeKeyType parentType = GetFakeKeyType(hKey);
+    FakeKeyType parentType = GetFakeKeyType(hKey);
+    if (parentType != FK_NONE && lpSubKey && phkResult) {
         FakeKeyType subType = FK_NONE;
 
         for (const auto& e : s_fakeSubKeys) {
@@ -813,8 +838,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
 
 LSTATUS WINAPI FlashLoader::Hooked_RegCloseKey(HKEY hKey)
 {
-    if (IsFakeHKey(hKey)) {
-        CloseFakeKey(hKey);
+    if (CloseFakeKey(hKey)) {
         return ERROR_SUCCESS;
     }
     return s_origRegCloseKey(hKey);
@@ -902,7 +926,11 @@ static HRESULT STDMETHODCALLTYPE Hooked_FlashQI(void* pThis, REFIID riid, void**
 
 static void MaybeHookFlashQI(IUnknown* pObj)
 {
-    if (s_flashQIHooked) return;
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_flashQIHooked) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        return;
+    }
     void** vtable = *reinterpret_cast<void***>(pObj);
     void* pFlashQI = vtable[0];
 
@@ -918,6 +946,7 @@ static void MaybeHookFlashQI(IUnknown* pObj)
     } else {
         DbgTrace(L"[FlashIE] Hook Flash::QueryInterface: FAILED (error=%d)\n", error);
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 }
 
 // =====================================================================
@@ -953,6 +982,14 @@ static int s_deferredCount = 0;
 static UINT_PTR s_deferredTimer = 0;
 static int s_deferredRetries = 0;
 static const int MAX_DEFERRED_RETRIES = 50; // 50 × 200ms = 10s
+static volatile LONG s_activationThreadId = 0;
+
+static bool IsActivationThread()
+{
+    LONG current = static_cast<LONG>(GetCurrentThreadId());
+    LONG owner = InterlockedCompareExchange(&s_activationThreadId, current, 0);
+    return owner == 0 || owner == current;
+}
 
 static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
@@ -1043,7 +1080,8 @@ static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
     HRESULT hr = s_origSetClientSite(pThis, pClientSite);
 
     // When MSHTML sets a non-null client site, queue forced activation
-    if (SUCCEEDED(hr) && pClientSite && s_pendingCount < MAX_PENDING) {
+    if (SUCCEEDED(hr) && pClientSite && IsActivationThread() &&
+        s_pendingCount < MAX_PENDING) {
         pThis->AddRef();
         pClientSite->AddRef();
         s_pending[s_pendingCount].pObj = pThis;
@@ -1060,11 +1098,16 @@ static HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
 
 static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 {
-    if (s_origSetClientSite) return; // already hooked
-
     IOleObject* pOle = nullptr;
     pObj->QueryInterface(IID_IOleObject, reinterpret_cast<void**>(&pOle));
     if (!pOle) return;
+
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_origSetClientSite) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        pOle->Release();
+        return;
+    }
 
     void** vtable = *reinterpret_cast<void***>(pOle);
     // IOleObject::SetClientSite is vtable slot 3 (after QI, AddRef, Release)
@@ -1076,6 +1119,7 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IOleObject::SetClientSite: OK\n");
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 
     pOle->Release();
 }
@@ -1095,6 +1139,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
     HRESULT hr = s_origQuickActivate(pThis, pQAContainer, pQAControl);
 
     if (SUCCEEDED(hr) && pQAContainer && pQAContainer->pClientSite &&
+        IsActivationThread() &&
         s_pendingCount < MAX_PENDING) {
         // Get IOleObject from the Flash control to call DoVerb later
         IOleObject* pOle = nullptr;
@@ -1118,11 +1163,16 @@ static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
 
 static void MaybeHookFlashQuickActivate(IUnknown* pObj)
 {
-    if (s_origQuickActivate) return; // already hooked
-
     IQuickActivate* pQA = nullptr;
     pObj->QueryInterface(IID_IQuickActivate, reinterpret_cast<void**>(&pQA));
     if (!pQA) return;
+
+    AcquireSRWLockExclusive(&s_flashHookLock);
+    if (s_origQuickActivate) {
+        ReleaseSRWLockExclusive(&s_flashHookLock);
+        pQA->Release();
+        return;
+    }
 
     void** vtable = *reinterpret_cast<void***>(pQA);
     // IQuickActivate::QuickActivate is vtable slot 3 (after QI, AddRef, Release)
@@ -1134,6 +1184,7 @@ static void MaybeHookFlashQuickActivate(IUnknown* pObj)
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IQuickActivate::QuickActivate: OK\n");
     }
+    ReleaseSRWLockExclusive(&s_flashHookLock);
 
     pQA->Release();
 }
@@ -1191,12 +1242,14 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
 {
     void** vtable = *reinterpret_cast<void***>(pThis);
     FN_ParseScriptText original = nullptr;
+    AcquireSRWLockShared(&s_scriptHookLock);
     for (int i = 0; i < s_scriptHookCount; i++) {
         if (s_scriptHooks[i].vtable == vtable) {
             original = s_scriptHooks[i].original;
             break;
         }
     }
+    ReleaseSRWLockShared(&s_scriptHookLock);
     if (!original)
         return E_UNEXPECTED;
 
@@ -1277,13 +1330,16 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
     // (after QI=0, AddRef=1, Release=2, InitNew=3, AddScriptlet=4)
     void* pTarget = vtable[5];
 
+    AcquireSRWLockExclusive(&s_scriptHookLock);
     for (int i = 0; i < s_scriptHookCount; i++) {
         if (s_scriptHooks[i].vtable == vtable) {
+            ReleaseSRWLockExclusive(&s_scriptHookLock);
             static_cast<IUnknown*>(pParse)->Release();
             return;
         }
     }
     if (s_scriptHookCount >= MAX_SCRIPT_HOOKS) {
+        ReleaseSRWLockExclusive(&s_scriptHookLock);
         DbgTrace(L"[FlashIE] Script vtable hook table is full\n");
         static_cast<IUnknown*>(pParse)->Release();
         return;
@@ -1300,6 +1356,7 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
         DbgTrace(L"[FlashIE] Hook IActiveScriptParse::ParseScriptText: OK (addr=%p)\n",
                  pTarget);
     }
+    ReleaseSRWLockExclusive(&s_scriptHookLock);
 
     static_cast<IUnknown*>(pParse)->Release();
 }
@@ -1356,17 +1413,18 @@ bool FlashLoader::Activate()
         return false;
     }
 
-    // Publish for the hook functions
-    s_pFlashFactory = m_pFactory;
-
     // Create logging wrapper around the real factory
-    s_pLoggingFactory = new LoggingClassFactory(m_pFactory);
+    LoggingClassFactory* loggingFactory = new LoggingClassFactory(m_pFactory);
+    AcquireSRWLockExclusive(&s_factoryLock);
+    s_pFlashFactory = m_pFactory;
+    s_pLoggingFactory = loggingFactory;
+    ReleaseSRWLockExclusive(&s_factoryLock);
 
     // Register the LOGGING wrapper (not raw factory) via CoRegisterClassObject.
     // This ensures that even when COM routes through the registered class object
     // (e.g., cross-domain iframes), our wrapper is used and SetClientSite/
     // QuickActivate hooks are triggered for forced activation.
-    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, s_pLoggingFactory,
+    HRESULT hrReg = CoRegisterClassObject(CLSID_ShockwaveFlash, loggingFactory,
                           CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
                           &m_dwCookie);
     DbgTrace(L"[FlashIE] CoRegisterClassObject -> hr=0x%08X cookie=%u\n", hrReg, m_dwCookie);
@@ -1484,9 +1542,16 @@ bool FlashLoader::InstallHooks()
 
 void FlashLoader::Deactivate()
 {
+    LONG activationOwner = InterlockedCompareExchange(&s_activationThreadId, 0, 0);
+    if (activationOwner != 0 && activationOwner != static_cast<LONG>(GetCurrentThreadId())) {
+        DbgTrace(L"[FlashIE] Deactivate must run on the Flash activation STA\n");
+        return;
+    }
+
     FlushPendingActivations();
 
     if (m_hooked) {
+        AcquireSRWLockExclusive(&s_flashHookLock);
         // Detach all API-level Detours hooks in a single transaction
         LONG error = DetourTransactionBegin();
         const bool transactionStarted = error == NO_ERROR;
@@ -1519,12 +1584,14 @@ void FlashLoader::Deactivate()
             if (transactionStarted)
                 DetourTransactionAbort();
             DbgTrace(L"[FlashIE] Detour detach transaction failed: %d\n", error);
+            ReleaseSRWLockExclusive(&s_flashHookLock);
             return;
         }
 
         error = DetourTransactionCommit();
         if (error != NO_ERROR) {
             DbgTrace(L"[FlashIE] Detour detach commit failed: %d\n", error);
+            ReleaseSRWLockExclusive(&s_flashHookLock);
             return;
         }
 
@@ -1532,9 +1599,11 @@ void FlashLoader::Deactivate()
         s_origFlashQI = nullptr;
         s_flashQIHooked = false;
         m_hooked = false;
+        ReleaseSRWLockExclusive(&s_flashHookLock);
     }
 
     // Restore all script engine vtable hooks.
+    AcquireSRWLockExclusive(&s_scriptHookLock);
     for (int i = 0; i < s_scriptHookCount; i++) {
         ScriptVtableHook& hook = s_scriptHooks[i];
         if (!hook.vtable || !hook.original)
@@ -1549,13 +1618,16 @@ void FlashLoader::Deactivate()
         hook = {};
     }
     s_scriptHookCount = 0;
+    ReleaseSRWLockExclusive(&s_scriptHookLock);
 
+    LoggingClassFactory* loggingFactory = nullptr;
+    AcquireSRWLockExclusive(&s_factoryLock);
     s_pFlashFactory = nullptr;
-
-    if (s_pLoggingFactory) {
-        s_pLoggingFactory->Release();
-        s_pLoggingFactory = nullptr;
-    }
+    loggingFactory = s_pLoggingFactory;
+    s_pLoggingFactory = nullptr;
+    ReleaseSRWLockExclusive(&s_factoryLock);
+    if (loggingFactory)
+        loggingFactory->Release();
 
     if (m_dwCookie) {
         CoRevokeClassObject(m_dwCookie);
@@ -1572,4 +1644,5 @@ void FlashLoader::Deactivate()
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
     }
+    InterlockedExchange(&s_activationThreadId, 0);
 }
