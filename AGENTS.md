@@ -65,11 +65,12 @@ Four source files, four headers, plus two submodule dependencies:
 
 - **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. Initialization order: `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/WLDP/TypeLib hooks) → create browser. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
 
+- **`source/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
+
 ### Assets
 
 - **`assets/Flash32.ocx`** / **`assets/Flash64.ocx`** — Pre-patched Flash Player ActiveX (32-bit / 64-bit).
 - **`assets/Flash32_Win7.ocx`** / **`assets/Flash64_Win7.ocx`** — Flash Player ActiveX for Windows 7 and earlier (32-bit / 64-bit), selected with `-DFLASHIE_WINDOWS_TARGET=WIN7`. These controls have rendering problems on newer Windows versions.
-- **`assets/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
 
 ## Core Requirement: Zero Registry Pollution
 

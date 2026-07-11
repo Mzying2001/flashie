@@ -55,7 +55,7 @@ add_executable(flashie WIN32
     source/browser.cpp
     source/flash.cpp
     source/flash_loader.cpp
-    assets/app.manifest
+    source/app.manifest
 )
 
 set_target_properties(flashie PROPERTIES OUTPUT_NAME "FlashIE")

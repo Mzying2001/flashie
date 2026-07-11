@@ -67,13 +67,13 @@ flashie/
 │   ├── browser.h/cpp         # OLE container for IE WebBrowser control
 │   ├── flash.h/cpp           # MIDL-generated Flash COM interface definitions
 │   ├── main.cpp              # Win32 window, toolbar, and initialization
-│   └── debug.h               # Debug output macro
+│   ├── debug.h               # Debug output macro
+│   └── app.manifest          # Registration-free COM manifest
 ├── assets/
 │   ├── Flash32.ocx           # 32-bit Flash Player ActiveX control
 │   ├── Flash64.ocx           # 64-bit Flash Player ActiveX control
 │   ├── Flash32_Win7.ocx      # 32-bit Windows 7-and-earlier control
 │   ├── Flash64_Win7.ocx      # 64-bit Windows 7-and-earlier control
-│   └── app.manifest          # Registration-free COM manifest
 ├── CMakeLists.txt            # Build configuration
 └── AGENTS.md                 # Architecture documentation
 ```

@@ -67,13 +67,13 @@ flashie/
 │   ├── browser.h/cpp         # IE WebBrowser 控件的 OLE 容器
 │   ├── flash.h/cpp           # MIDL 生成的 Flash COM 接口定义
 │   ├── main.cpp              # Win32 窗口、工具栏和初始化
-│   └── debug.h               # 调试输出宏
+│   ├── debug.h               # 调试输出宏
+│   └── app.manifest          # 免注册 COM 清单
 ├── assets/
 │   ├── Flash32.ocx           # 32 位 Flash Player ActiveX 控件
 │   ├── Flash64.ocx           # 64 位 Flash Player ActiveX 控件
 │   ├── Flash32_Win7.ocx      # 兼容 Windows 7 及更早系统的 32 位控件
 │   ├── Flash64_Win7.ocx      # 兼容 Windows 7 及更早系统的 64 位控件
-│   └── app.manifest          # 免注册 COM 清单
 ├── CMakeLists.txt            # 构建配置
 └── AGENTS.md                 # 架构文档
 ```
