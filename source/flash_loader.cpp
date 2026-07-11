@@ -962,6 +962,7 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
     IOleObject* pThis, IOleClientSite* pClientSite);
 static FN_OleSetClientSite s_origSetClientSite = nullptr;
+static void** s_hookedOleVtable = nullptr;
 
 struct PendingActivation {
     IOleObject* pObj;
@@ -1149,10 +1150,12 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 
     void** vtable = *reinterpret_cast<void***>(pOle);
     // IOleObject::SetClientSite is vtable slot 3 (after QI, AddRef, Release)
-    s_origSetClientSite = reinterpret_cast<FN_OleSetClientSite>(vtable[3]);
+    FN_OleSetClientSite original = reinterpret_cast<FN_OleSetClientSite>(vtable[3]);
 
     DWORD oldProtect;
     if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        s_origSetClientSite = original;
+        s_hookedOleVtable = vtable;
         vtable[3] = reinterpret_cast<void*>(Hooked_OleSetClientSite);
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IOleObject::SetClientSite: OK\n");
@@ -1170,6 +1173,7 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
 static FN_QuickActivate s_origQuickActivate = nullptr;
+static void** s_hookedQuickVtable = nullptr;
 
 static HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl)
@@ -1214,10 +1218,12 @@ static void MaybeHookFlashQuickActivate(IUnknown* pObj)
 
     void** vtable = *reinterpret_cast<void***>(pQA);
     // IQuickActivate::QuickActivate is vtable slot 3 (after QI, AddRef, Release)
-    s_origQuickActivate = reinterpret_cast<FN_QuickActivate>(vtable[3]);
+    FN_QuickActivate original = reinterpret_cast<FN_QuickActivate>(vtable[3]);
 
     DWORD oldProtect;
     if (VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        s_origQuickActivate = original;
+        s_hookedQuickVtable = vtable;
         vtable[3] = reinterpret_cast<void*>(Hooked_QuickActivate);
         VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &oldProtect);
         DbgTrace(L"[FlashIE] Hook Flash IQuickActivate::QuickActivate: OK\n");
@@ -1225,6 +1231,22 @@ static void MaybeHookFlashQuickActivate(IUnknown* pObj)
     ReleaseSRWLockExclusive(&s_flashHookLock);
 
     pQA->Release();
+}
+
+static bool RestoreFlashVtableSlot(
+    void** vtable, void* hook, void* original)
+{
+    if (!vtable || !original)
+        return true;
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+
+    if (vtable[3] == hook)
+        vtable[3] = original;
+    return VirtualProtect(
+        &vtable[3], sizeof(void*), oldProtect, &oldProtect) != FALSE;
 }
 
 // =====================================================================
@@ -1590,6 +1612,22 @@ void FlashLoader::Deactivate()
 
     if (m_hooked) {
         AcquireSRWLockExclusive(&s_flashHookLock);
+        bool restoredOle = RestoreFlashVtableSlot(
+            s_hookedOleVtable, reinterpret_cast<void*>(Hooked_OleSetClientSite),
+            reinterpret_cast<void*>(s_origSetClientSite));
+        bool restoredQuick = RestoreFlashVtableSlot(
+            s_hookedQuickVtable, reinterpret_cast<void*>(Hooked_QuickActivate),
+            reinterpret_cast<void*>(s_origQuickActivate));
+        if (!restoredOle || !restoredQuick) {
+            DbgTrace(L"[FlashIE] Failed to restore a Flash activation vtable\n");
+            ReleaseSRWLockExclusive(&s_flashHookLock);
+            return;
+        }
+        s_hookedOleVtable = nullptr;
+        s_origSetClientSite = nullptr;
+        s_hookedQuickVtable = nullptr;
+        s_origQuickActivate = nullptr;
+
         // Detach all API-level Detours hooks in a single transaction
         LONG error = DetourTransactionBegin();
         const bool transactionStarted = error == NO_ERROR;
