@@ -991,6 +991,44 @@ static bool IsActivationThread()
     return owner == 0 || owner == current;
 }
 
+static HRESULT ActivateInPlace(IOleObject* pObj, IOleClientSite* pSite)
+{
+    IOleInPlaceSite* inPlaceSite = nullptr;
+    HRESULT hr = pSite->QueryInterface(
+        IID_IOleInPlaceSite, reinterpret_cast<void**>(&inPlaceSite));
+    if (FAILED(hr) || !inPlaceSite)
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+
+    HWND parent = nullptr;
+    hr = inPlaceSite->GetWindow(&parent);
+
+    RECT posRect = {};
+    if (SUCCEEDED(hr) && parent) {
+        IOleInPlaceFrame* frame = nullptr;
+        IOleInPlaceUIWindow* doc = nullptr;
+        RECT clipRect = {};
+        OLEINPLACEFRAMEINFO frameInfo = {};
+        frameInfo.cb = sizeof(frameInfo);
+
+        HRESULT contextHr = inPlaceSite->GetWindowContext(
+            &frame, &doc, &posRect, &clipRect, &frameInfo);
+        if (frame) frame->Release();
+        if (doc) doc->Release();
+
+        if (FAILED(contextHr) && !GetClientRect(parent, &posRect))
+            hr = HRESULT_FROM_WIN32(GetLastError());
+    } else if (SUCCEEDED(hr)) {
+        hr = E_HANDLE;
+    }
+
+    inPlaceSite->Release();
+    if (FAILED(hr))
+        return hr;
+
+    return pObj->DoVerb(
+        OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, parent, &posRect);
+}
+
 static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
     s_deferredRetries++;
@@ -999,7 +1037,7 @@ static void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWO
         IOleObject* pObj = s_deferred[i].pObj;
         IOleClientSite* pSite = s_deferred[i].pSite;
         if (pObj && pSite) {
-            pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+            ActivateInPlace(pObj, pSite);
         }
     }
 
@@ -1025,7 +1063,7 @@ static void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
         IOleObject* pObj = s_pending[i].pObj;
         IOleClientSite* pSite = s_pending[i].pSite;
         if (pObj && pSite) {
-            HRESULT hr = pObj->DoVerb(OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, nullptr, nullptr);
+            HRESULT hr = ActivateInPlace(pObj, pSite);
             DbgTrace(L"[FlashIE] ForceActivate DoVerb -> hr=0x%08X\n", hr);
 
             // Save for deferred re-activation: Flash in display:none iframes
