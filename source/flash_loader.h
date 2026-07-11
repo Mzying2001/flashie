@@ -19,7 +19,7 @@ public:
     // mshtml.dll/urlmon.dll/ieframe.dll, then patches them.
     // Call BEFORE browser creation so hooks are in place when
     // MSHTML initializes.
-    void InstallHooks();
+    bool InstallHooks();
 
     // Cleanup. Must be called BEFORE OleUninitialize.
     void Deactivate();

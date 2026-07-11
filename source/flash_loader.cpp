@@ -119,9 +119,7 @@ static FN_CLSIDFromProgID             s_origCLSIDFromProgID = nullptr;
 static FN_FlashQueryInterface         s_origFlashQI = nullptr;
 static bool                           s_flashQIHooked = false;
 
-// Attach a Detours hook: resolve the target function, begin a transaction,
-// attach the hook, and commit. Returns true on success.
-static bool DetoursAttach(void** ppOriginal, void* pDetour,
+static void* ResolveTarget(
     HMODULE hPrimary, const char* funcName, HMODULE hFallback = nullptr)
 {
     void* pTarget = nullptr;
@@ -132,14 +130,21 @@ static bool DetoursAttach(void** ppOriginal, void* pDetour,
     if (!pTarget && hFallback)
         pTarget = reinterpret_cast<void*>(GetProcAddress(hFallback, funcName));
 
-    if (!pTarget) return false;
+    return pTarget;
+}
 
-    *ppOriginal = pTarget;
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    DetourAttach(ppOriginal, pDetour);
-    LONG error = DetourTransactionCommit();
-    return error == NO_ERROR;
+static void ResetApiHookPointers()
+{
+    s_origCoGetClassObject = nullptr;
+    s_origCoCreateInstance = nullptr;
+    s_origRegOpenKeyExW = nullptr;
+    s_origRegQueryValueExW = nullptr;
+    s_origRegCloseKey = nullptr;
+    s_origCoGetClassObjectFromURL = nullptr;
+    s_origWldpIsClassInApprovedList = nullptr;
+    s_origWldpQueryDynamicCodeTrust = nullptr;
+    s_origLoadRegTypeLib = nullptr;
+    s_origCLSIDFromProgID = nullptr;
 }
 
 // =====================================================================
@@ -1365,6 +1370,11 @@ bool FlashLoader::Activate()
                           CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE,
                           &m_dwCookie);
     DbgTrace(L"[FlashIE] CoRegisterClassObject -> hr=0x%08X cookie=%u\n", hrReg, m_dwCookie);
+    if (FAILED(hrReg)) {
+        m_dwCookie = 0;
+        Deactivate();
+        return false;
+    }
 
     // Cache exe name for FEATURE_BROWSER_EMULATION hook
     WCHAR szExe[MAX_PATH];
@@ -1374,9 +1384,10 @@ bool FlashLoader::Activate()
     return true;
 }
 
-void FlashLoader::InstallHooks()
+bool FlashLoader::InstallHooks()
 {
-    if (m_hooked || !m_pFactory) return;
+    if (m_hooked) return true;
+    if (!m_pFactory) return false;
 
     // --- Step 1: Force-load IE DLLs so we can hook them ---
     LoadLibraryW(L"mshtml.dll");
@@ -1393,39 +1404,82 @@ void FlashLoader::InstallHooks()
     HMODULE hWldp       = GetModuleHandleW(L"wldp.dll");
     if (!hWldp) hWldp   = LoadLibraryW(L"wldp.dll");
 
-    // --- Step 3: Install hooks via Detours ---
-    // Order: registry hooks first (kill bit bypass), then COM hooks
+    // --- Step 3: Resolve every required target before modifying code ---
+    s_origRegOpenKeyExW = reinterpret_cast<FN_RegOpenKeyExW>(
+        ResolveTarget(hKernelBase, "RegOpenKeyExW", hAdvapi32));
+    s_origRegQueryValueExW = reinterpret_cast<FN_RegQueryValueExW>(
+        ResolveTarget(hKernelBase, "RegQueryValueExW", hAdvapi32));
+    s_origRegCloseKey = reinterpret_cast<FN_RegCloseKey>(
+        ResolveTarget(hKernelBase, "RegCloseKey", hAdvapi32));
+    s_origCoGetClassObject = reinterpret_cast<FN_CoGetClassObject>(
+        ResolveTarget(hCombase, "CoGetClassObject", hOle32));
+    s_origCoCreateInstance = reinterpret_cast<FN_CoCreateInstance>(
+        ResolveTarget(hCombase, "CoCreateInstance", hOle32));
+    s_origCLSIDFromProgID = reinterpret_cast<FN_CLSIDFromProgID>(
+        ResolveTarget(hCombase, "CLSIDFromProgID", hOle32));
+    s_origCoGetClassObjectFromURL = reinterpret_cast<FN_CoGetClassObjectFromURL>(
+        ResolveTarget(hUrlmon, "CoGetClassObjectFromURL"));
+    s_origLoadRegTypeLib = reinterpret_cast<FN_LoadRegTypeLib>(
+        ResolveTarget(hOleAut32, "LoadRegTypeLib"));
 
-    // Registry hooks
-    DetoursAttach(reinterpret_cast<void**>(&s_origRegOpenKeyExW),
-        reinterpret_cast<void*>(&Hooked_RegOpenKeyExW), hKernelBase, "RegOpenKeyExW", hAdvapi32);
-    DetoursAttach(reinterpret_cast<void**>(&s_origRegQueryValueExW),
-        reinterpret_cast<void*>(&Hooked_RegQueryValueExW), hKernelBase, "RegQueryValueExW", hAdvapi32);
-    DetoursAttach(reinterpret_cast<void**>(&s_origRegCloseKey),
-        reinterpret_cast<void*>(&Hooked_RegCloseKey), hKernelBase, "RegCloseKey", hAdvapi32);
+    if (!s_origRegOpenKeyExW || !s_origRegQueryValueExW || !s_origRegCloseKey ||
+        !s_origCoGetClassObject || !s_origCoCreateInstance || !s_origCLSIDFromProgID ||
+        !s_origCoGetClassObjectFromURL || !s_origLoadRegTypeLib) {
+        ResetApiHookPointers();
+        return false;
+    }
 
-    // COM hooks
-    DetoursAttach(reinterpret_cast<void**>(&s_origCoGetClassObject),
-        reinterpret_cast<void*>(&Hooked_CoGetClassObject), hCombase, "CoGetClassObject", hOle32);
-    DetoursAttach(reinterpret_cast<void**>(&s_origCoCreateInstance),
-        reinterpret_cast<void*>(&Hooked_CoCreateInstance), hCombase, "CoCreateInstance", hOle32);
-    DetoursAttach(reinterpret_cast<void**>(&s_origCLSIDFromProgID),
-        reinterpret_cast<void*>(&Hooked_CLSIDFromProgID), hCombase, "CLSIDFromProgID", hOle32);
+    // WLDP does not exist on older Windows versions. Install both hooks only
+    // when the OS exports the complete API pair.
+    if (hWldp) {
+        s_origWldpIsClassInApprovedList = reinterpret_cast<FN_WldpIsClassInApprovedList>(
+            ResolveTarget(hWldp, "WldpIsClassInApprovedList"));
+        s_origWldpQueryDynamicCodeTrust = reinterpret_cast<FN_WldpQueryDynamicCodeTrust>(
+            ResolveTarget(hWldp, "WldpQueryDynamicCodeTrust"));
+        if (!s_origWldpIsClassInApprovedList || !s_origWldpQueryDynamicCodeTrust) {
+            s_origWldpIsClassInApprovedList = nullptr;
+            s_origWldpQueryDynamicCodeTrust = nullptr;
+        }
+    }
 
-    // URL moniker hooks
-    DetoursAttach(reinterpret_cast<void**>(&s_origCoGetClassObjectFromURL),
-        reinterpret_cast<void*>(&Hooked_CoGetClassObjectFromURL), hUrlmon, "CoGetClassObjectFromURL");
-    // WLDP hooks (Windows 10+ ActiveX approval)
-    DetoursAttach(reinterpret_cast<void**>(&s_origWldpIsClassInApprovedList),
-        reinterpret_cast<void*>(&Hooked_WldpIsClassInApprovedList), hWldp, "WldpIsClassInApprovedList");
-    DetoursAttach(reinterpret_cast<void**>(&s_origWldpQueryDynamicCodeTrust),
-        reinterpret_cast<void*>(&Hooked_WldpQueryDynamicCodeTrust), hWldp, "WldpQueryDynamicCodeTrust");
+    // --- Step 4: Attach the complete set atomically ---
+    LONG error = DetourTransactionBegin();
+    const bool transactionStarted = error == NO_ERROR;
+    if (error == NO_ERROR)
+        error = DetourUpdateThread(GetCurrentThread());
 
-    // TypeLib hook
-    DetoursAttach(reinterpret_cast<void**>(&s_origLoadRegTypeLib),
-        reinterpret_cast<void*>(&Hooked_LoadRegTypeLib), hOleAut32, "LoadRegTypeLib");
+    #define ATTACH(orig, func) \
+        if (error == NO_ERROR && orig) \
+            error = DetourAttach(reinterpret_cast<void**>(&orig), reinterpret_cast<void*>(&func));
+
+    ATTACH(s_origRegOpenKeyExW,             Hooked_RegOpenKeyExW);
+    ATTACH(s_origRegQueryValueExW,          Hooked_RegQueryValueExW);
+    ATTACH(s_origRegCloseKey,               Hooked_RegCloseKey);
+    ATTACH(s_origCoGetClassObject,          Hooked_CoGetClassObject);
+    ATTACH(s_origCoCreateInstance,          Hooked_CoCreateInstance);
+    ATTACH(s_origCLSIDFromProgID,           Hooked_CLSIDFromProgID);
+    ATTACH(s_origCoGetClassObjectFromURL,   Hooked_CoGetClassObjectFromURL);
+    ATTACH(s_origWldpIsClassInApprovedList, Hooked_WldpIsClassInApprovedList);
+    ATTACH(s_origWldpQueryDynamicCodeTrust, Hooked_WldpQueryDynamicCodeTrust);
+    ATTACH(s_origLoadRegTypeLib,            Hooked_LoadRegTypeLib);
+
+    #undef ATTACH
+
+    if (error != NO_ERROR) {
+        if (transactionStarted)
+            DetourTransactionAbort();
+        ResetApiHookPointers();
+        return false;
+    }
+
+    error = DetourTransactionCommit();
+    if (error != NO_ERROR) {
+        ResetApiHookPointers();
+        return false;
+    }
 
     m_hooked = true;
+    return true;
 }
 
 void FlashLoader::Deactivate()
@@ -1434,11 +1488,14 @@ void FlashLoader::Deactivate()
 
     if (m_hooked) {
         // Detach all API-level Detours hooks in a single transaction
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
+        LONG error = DetourTransactionBegin();
+        const bool transactionStarted = error == NO_ERROR;
+        if (error == NO_ERROR)
+            error = DetourUpdateThread(GetCurrentThread());
 
         #define DETACH(orig, func) \
-            if (orig) { DetourDetach(reinterpret_cast<void**>(&orig), reinterpret_cast<void*>(&func)); orig = nullptr; }
+            if (error == NO_ERROR && orig) \
+                error = DetourDetach(reinterpret_cast<void**>(&orig), reinterpret_cast<void*>(&func));
 
         DETACH(s_origRegOpenKeyExW,              Hooked_RegOpenKeyExW);
         DETACH(s_origRegQueryValueExW,           Hooked_RegQueryValueExW);
@@ -1454,14 +1511,26 @@ void FlashLoader::Deactivate()
         #undef DETACH
 
         // Detach Flash QI hook separately (installed via MaybeHookFlashQI)
-        if (s_flashQIHooked && s_origFlashQI) {
-            DetourDetach(reinterpret_cast<void**>(&s_origFlashQI),
-                         reinterpret_cast<void*>(Hooked_FlashQI));
-            s_origFlashQI = nullptr;
-            s_flashQIHooked = false;
+        if (error == NO_ERROR && s_flashQIHooked && s_origFlashQI)
+            error = DetourDetach(reinterpret_cast<void**>(&s_origFlashQI),
+                                 reinterpret_cast<void*>(Hooked_FlashQI));
+
+        if (error != NO_ERROR) {
+            if (transactionStarted)
+                DetourTransactionAbort();
+            DbgTrace(L"[FlashIE] Detour detach transaction failed: %d\n", error);
+            return;
         }
 
-        DetourTransactionCommit();
+        error = DetourTransactionCommit();
+        if (error != NO_ERROR) {
+            DbgTrace(L"[FlashIE] Detour detach commit failed: %d\n", error);
+            return;
+        }
+
+        ResetApiHookPointers();
+        s_origFlashQI = nullptr;
+        s_flashQIHooked = false;
         m_hooked = false;
     }
 
