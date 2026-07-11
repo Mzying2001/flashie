@@ -50,7 +50,7 @@ STDMETHODIMP COleInPlaceSite::GetWindowContext(
     m_pSite->m_pInPlaceFrame->AddRef();
     *ppDoc = nullptr;
 
-    GetClientRect(m_pSite->m_hWnd, lprcPosRect);
+    *lprcPosRect = m_pSite->m_rcPos;
     *lprcClipRect = *lprcPosRect;
 
     lpFrameInfo->fMDIApp = FALSE;
@@ -292,6 +292,7 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 {
     m_pSite = new COleSite();
     m_pSite->m_hWnd = hwndParent;
+    m_pSite->m_rcPos = rc;
     m_pSite->m_pBrowserHost = this;
 
     FORMATETC fe = {};
@@ -318,6 +319,18 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 
     m_pWebBrowser->QueryInterface(IID_IOleInPlaceActiveObject,
                                   reinterpret_cast<void**>(&m_pIPActiveObj));
+
+    HWND hwndActive = nullptr;
+    if (m_pIPActiveObj && SUCCEEDED(m_pIPActiveObj->GetWindow(&hwndActive))) {
+        while (hwndActive) {
+            HWND hwndParentWindow = GetParent(hwndActive);
+            if (hwndParentWindow == hwndParent) {
+                m_hwndBrowser = hwndActive;
+                break;
+            }
+            hwndActive = hwndParentWindow;
+        }
+    }
 
     ConnectEvents();
 
@@ -352,6 +365,9 @@ void BrowserHost::Stop()      { if (m_pWebBrowser) m_pWebBrowser->Stop(); }
 
 void BrowserHost::Resize(const RECT& rc)
 {
+    if (m_pSite)
+        m_pSite->m_rcPos = rc;
+
     if (m_pWebBrowser) {
         m_pWebBrowser->put_Left(rc.left);
         m_pWebBrowser->put_Top(rc.top);
@@ -402,6 +418,7 @@ void BrowserHost::DisconnectEvents()
 
 void BrowserHost::Destroy()
 {
+    m_hwndBrowser = nullptr;
     DisconnectEvents();
 
     if (m_pIPActiveObj) {

@@ -25,7 +25,6 @@ enum ControlID {
 static FlashLoader  g_flashLoader;
 static BrowserHost* g_pBrowser        = nullptr;
 static HWND         g_hwndMain        = nullptr;
-static HWND         g_hwndBrowserArea = nullptr;
 static HWND         g_hwndBack        = nullptr;
 static HWND         g_hwndForward     = nullptr;
 static HWND         g_hwndRefresh     = nullptr;
@@ -69,9 +68,8 @@ static void LayoutControls(int cx, int cy)
     MoveWindow(g_hwndAddress, x, y, addrWidth, BUTTON_HEIGHT, TRUE);
     MoveWindow(g_hwndGo, goX, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
 
-    MoveWindow(g_hwndBrowserArea, 0, TOOLBAR_HEIGHT, cx, cy - TOOLBAR_HEIGHT, TRUE);
     if (g_pBrowser) {
-        RECT rc = {0, 0, cx, cy - TOOLBAR_HEIGHT};
+        RECT rc = {0, TOOLBAR_HEIGHT, cx, cy};
         g_pBrowser->Resize(rc);
     }
 }
@@ -91,11 +89,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_ADDRESS), hInst, nullptr);
         g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_GO),      hInst, nullptr);
 
-        g_hwndBrowserArea = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-            0, TOOLBAR_HEIGHT, rc.right, rc.bottom - TOOLBAR_HEIGHT,
-            hwnd, nullptr, hInst, nullptr);
-
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
@@ -107,8 +100,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         g_pBrowser = new BrowserHost();
-        RECT rcBrowser = {0, 0, rc.right, rc.bottom - TOOLBAR_HEIGHT};
-        if (g_pBrowser->Initialize(g_hwndBrowserArea, rcBrowser)) {
+        RECT rcBrowser = {0, TOOLBAR_HEIGHT, rc.right, rc.bottom};
+        if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
             g_pBrowser->Navigate(L"about:blank");
@@ -144,8 +137,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_PARENTNOTIFY:
         if (!g_isClosing && LOWORD(wParam) == WM_DESTROY) {
             HWND hwndDestroyed = reinterpret_cast<HWND>(lParam);
-            if (g_hwndBrowserArea && hwndDestroyed &&
-                IsChild(g_hwndBrowserArea, hwndDestroyed)) {
+            if (g_pBrowser && hwndDestroyed == g_pBrowser->GetBrowserWindow()) {
                 g_isClosing = true;
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
@@ -218,7 +210,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         // Let WebBrowser handle keyboard input only when focus is in browser area
         if (g_pBrowser) {
             HWND hwndFocus = GetFocus();
-            if (hwndFocus && (hwndFocus == g_hwndBrowserArea || IsChild(g_hwndBrowserArea, hwndFocus))) {
+            HWND hwndBrowser = g_pBrowser->GetBrowserWindow();
+            if (hwndFocus && hwndBrowser &&
+                (hwndFocus == hwndBrowser || IsChild(hwndBrowser, hwndFocus))) {
                 if (g_pBrowser->TranslateAccelerator(&msg))
                     continue;
             }

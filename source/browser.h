@@ -141,6 +141,7 @@ private:
     IStorage*          m_lpStorage = nullptr;
     IOleObject*        m_lpOleObject = nullptr;
     IOleInPlaceObject* m_lpInPlaceObject = nullptr;
+    RECT               m_rcPos = {};
     COleClientSite*    m_pClientSite = nullptr;
     COleInPlaceSite*   m_pInPlaceSite = nullptr;
     COleInPlaceFrame*  m_pInPlaceFrame = nullptr;
@@ -177,12 +178,14 @@ public:
     }
 
     IWebBrowser2* GetWebBrowser() { return m_pWebBrowser; }
+    HWND GetBrowserWindow() const { return m_hwndBrowser; }
 
 private:
     COleSite*                m_pSite = nullptr;
     IWebBrowser2*            m_pWebBrowser = nullptr;
     IOleObject*              m_pOleObject = nullptr;
     IOleInPlaceActiveObject* m_pIPActiveObj = nullptr;
+    HWND                     m_hwndBrowser = nullptr;
     DWORD                    m_dwEventCookie = 0;
 
     NavigateCompleteCallback m_navCallback = nullptr;
