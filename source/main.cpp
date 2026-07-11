@@ -2,6 +2,7 @@
 #include <ole2.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <commctrl.h>
 #include <stdio.h>
 #include <string>
 #include "flash_loader.h"
@@ -22,6 +23,7 @@ enum ControlID {
     ID_STOP,
     ID_ADDRESS,
     ID_GO,
+    ID_STATUS,
 };
 
 static FlashLoader  g_flashLoader;
@@ -33,6 +35,7 @@ static HWND         g_hwndRefresh     = nullptr;
 static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
+static HWND         g_hwndStatus      = nullptr;
 static bool         g_isClosing       = false;
 static std::wstring g_initialAddress  = L"about:blank";
 
@@ -56,8 +59,22 @@ static void OnTitleChange(const wchar_t* title, void*)
     SetWindowTextW(g_hwndMain, buf);
 }
 
+static void OnStatusTextChange(const wchar_t* text, void*)
+{
+    if (g_hwndStatus)
+        SendMessageW(g_hwndStatus, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text));
+}
+
 static void LayoutControls(int cx, int cy)
 {
+    int statusHeight = 0;
+    if (g_hwndStatus) {
+        SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
+        RECT rcStatus;
+        if (GetWindowRect(g_hwndStatus, &rcStatus))
+            statusHeight = rcStatus.bottom - rcStatus.top;
+    }
+
     int x = MARGIN;
     int y = (TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
     MoveWindow(g_hwndBack,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
@@ -72,7 +89,7 @@ static void LayoutControls(int cx, int cy)
     MoveWindow(g_hwndGo, goX, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
 
     if (g_pBrowser) {
-        RECT rc = {0, TOOLBAR_HEIGHT, cx, cy};
+        RECT rc = {0, TOOLBAR_HEIGHT, cx, cy - statusHeight};
         g_pBrowser->Resize(rc);
     }
 }
@@ -91,6 +108,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STOP),    hInst, nullptr);
         g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_ADDRESS), hInst, nullptr);
         g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_GO),      hInst, nullptr);
+        g_hwndStatus  = CreateWindowExW(0, STATUSCLASSNAMEW, L"Ready",
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(ID_STATUS), hInst, nullptr);
 
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
@@ -107,6 +127,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
+            g_pBrowser->SetStatusTextChangeCallback(OnStatusTextChange, nullptr);
             g_pBrowser->Navigate(g_initialAddress.c_str());
         }
 
@@ -177,6 +198,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     }
 
     OleInitialize(nullptr);
+
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_BAR_CLASSES};
+    InitCommonControlsEx(&icc);
 
     // Register Flash.ocx class factory into this process's COM table.
     // Must be after OleInitialize (COM needs to be initialized).

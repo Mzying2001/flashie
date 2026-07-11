@@ -153,6 +153,7 @@ private:
 // ---------------------------------------------------------------
 using NavigateCompleteCallback = void(*)(const wchar_t* url, void* ctx);
 using TitleChangeCallback = void(*)(const wchar_t* title, void* ctx);
+using StatusTextChangeCallback = void(*)(const wchar_t* text, void* ctx);
 
 class BrowserHost {
     friend class COleSite;
@@ -176,6 +177,9 @@ public:
     void SetTitleChangeCallback(TitleChangeCallback cb, void* ctx) {
         m_titleCallback = cb; m_titleCtx = ctx;
     }
+    void SetStatusTextChangeCallback(StatusTextChangeCallback cb, void* ctx) {
+        m_statusTextCallback = cb; m_statusTextCtx = ctx;
+    }
 
     IWebBrowser2* GetWebBrowser() { return m_pWebBrowser; }
     HWND GetBrowserWindow() const { return m_hwndBrowser; }
@@ -192,6 +196,8 @@ private:
     void*                    m_navCtx = nullptr;
     TitleChangeCallback      m_titleCallback = nullptr;
     void*                    m_titleCtx = nullptr;
+    StatusTextChangeCallback m_statusTextCallback = nullptr;
+    void*                    m_statusTextCtx = nullptr;
 
     void ConnectEvents();
     void DisconnectEvents();

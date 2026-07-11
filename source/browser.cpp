@@ -245,6 +245,26 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         return S_OK;
     }
 
+    case DISPID_STATUSTEXTCHANGE: {
+        if (pDispParams->cArgs >= 1 && m_pBrowserHost &&
+            m_pBrowserHost->m_statusTextCallback) {
+            VARIANT* pText = &pDispParams->rgvarg[0];
+            if (pText->vt == (VT_VARIANT | VT_BYREF))
+                pText = pText->pvarVal;
+
+            if (pText->vt == VT_BSTR) {
+                m_pBrowserHost->m_statusTextCallback(
+                    pText->bstrVal ? pText->bstrVal : L"",
+                    m_pBrowserHost->m_statusTextCtx);
+            } else if (pText->vt == (VT_BSTR | VT_BYREF) && pText->pbstrVal) {
+                m_pBrowserHost->m_statusTextCallback(
+                    *pText->pbstrVal ? *pText->pbstrVal : L"",
+                    m_pBrowserHost->m_statusTextCtx);
+            }
+        }
+        return S_OK;
+    }
+
     case DISPID_NEWWINDOW2: {
         // Cancel the new window — NewWindow3 handles navigation on IE8+.
         if (pDispParams->cArgs >= 2) {

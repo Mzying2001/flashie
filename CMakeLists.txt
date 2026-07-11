@@ -84,6 +84,7 @@ target_link_libraries(flashie PRIVATE
     uuid
     shell32
     shlwapi
+    comctl32
     urlmon
 )
 
