@@ -8,7 +8,6 @@
 #include "flash_loader.h"
 #include "browser.h"
 
-
 static constexpr int TOOLBAR_HEIGHT = 32;
 static constexpr int BUTTON_WIDTH   = 60;
 static constexpr int BUTTON_HEIGHT  = 24;
@@ -67,10 +66,15 @@ static void OnStatusTextChange(const wchar_t* text, void*)
 
 static void OnLoadingStateChange(bool isLoading, void*)
 {
-    if (g_hwndRefresh)
-        EnableWindow(g_hwndRefresh, !isLoading);
-    if (g_hwndStop)
-        EnableWindow(g_hwndStop, isLoading);
+    if (g_hwndRefresh == nullptr || g_hwndStop == nullptr)
+        return;
+    if (isLoading) {
+        ShowWindow(g_hwndRefresh, SW_HIDE);
+        ShowWindow(g_hwndStop, SW_SHOW);
+    } else {
+        ShowWindow(g_hwndRefresh, SW_SHOW);
+        ShowWindow(g_hwndStop, SW_HIDE);
+    }
 }
 
 static void LayoutControls(int cx, int cy)
@@ -87,7 +91,7 @@ static void LayoutControls(int cx, int cy)
     int y = (TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
     MoveWindow(g_hwndBack,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
     MoveWindow(g_hwndForward, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
-    MoveWindow(g_hwndRefresh, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
+    MoveWindow(g_hwndRefresh, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
     MoveWindow(g_hwndStop,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
 
     int goX = cx - MARGIN - BUTTON_WIDTH;
