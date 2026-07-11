@@ -15,7 +15,7 @@ public:
     bool Activate();
 
     // Phase 2: Atomically install inline hooks (detours) on COM,
-    // registry, WLDP, and TypeLib APIs. Force-loads
+    // registry, file, WLDP, and TypeLib APIs. Force-loads
     // mshtml.dll/urlmon.dll/ieframe.dll and resolves every required
     // target before patching. Returns false without leaving a partial
     // hook set if resolution or the Detours transaction fails. Call
@@ -56,6 +56,9 @@ private:
         LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
 
     static LSTATUS WINAPI Hooked_RegCloseKey(HKEY hKey);
+
+    static BOOL WINAPI Hooked_DeleteFileA(LPCSTR lpFileName);
+    static BOOL WINAPI Hooked_DeleteFileW(LPCWSTR lpFileName);
 
     static HRESULT STDAPICALLTYPE Hooked_CoGetClassObjectFromURL(
         REFCLSID rclsid, LPCWSTR szCodeURL,

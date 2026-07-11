@@ -12,6 +12,7 @@
 #include <string>
 #include <string.h>
 #include <stdint.h>
+#include <intrin.h>
 #include <shlwapi.h>
 #include <ocidl.h>      // IQuickActivate and debug-probed OLE interfaces
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
@@ -70,6 +71,11 @@ typedef LSTATUS (WINAPI *FN_RegQueryValueExW)(
 
 typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
 
+// --- File ---
+
+typedef BOOL (WINAPI *FN_DeleteFileA)(LPCSTR lpFileName);
+typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
+
 // --- Windows Lockdown Policy (WLDP) ---
 
 typedef HRESULT (WINAPI *FN_WldpIsClassInApprovedList)(
@@ -112,6 +118,8 @@ static FN_CoCreateInstance            s_origCoCreateInstance = nullptr;
 static FN_RegOpenKeyExW               s_origRegOpenKeyExW = nullptr;
 static FN_RegQueryValueExW            s_origRegQueryValueExW = nullptr;
 static FN_RegCloseKey                 s_origRegCloseKey = nullptr;
+static FN_DeleteFileA                 s_origDeleteFileA = nullptr;
+static FN_DeleteFileW                 s_origDeleteFileW = nullptr;
 static FN_CoGetClassObjectFromURL     s_origCoGetClassObjectFromURL = nullptr;
 static FN_WldpIsClassInApprovedList   s_origWldpIsClassInApprovedList = nullptr;
 static FN_WldpQueryDynamicCodeTrust   s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -142,6 +150,8 @@ static void ResetApiHookPointers()
     s_origRegOpenKeyExW = nullptr;
     s_origRegQueryValueExW = nullptr;
     s_origRegCloseKey = nullptr;
+    s_origDeleteFileA = nullptr;
+    s_origDeleteFileW = nullptr;
     s_origCoGetClassObjectFromURL = nullptr;
     s_origWldpIsClassInApprovedList = nullptr;
     s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -402,6 +412,7 @@ static wchar_t s_szExeName[MAX_PATH] = {};
 // Path to Flash.ocx (next to exe)
 static wchar_t g_szOcxPath[MAX_PATH] = {};
 static HMODULE g_hOcxModule = nullptr;
+static std::wstring g_sharedObjectsRoot;
 
 // Script engine ParseScriptText hook state. Different JScript implementations
 // have different shared vtables, so each original slot is tracked separately.
@@ -1507,6 +1518,157 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
 }
 
 // =====================================================================
+// Section 7h: SharedObject First-Save Compatibility
+//
+// The bundled ActiveX player treats a missing old .sol as a failed replace
+// operation. For that one narrowly scoped case, report the deletion as
+// successful so Flash can continue its own .sxx -> .sol commit.
+// =====================================================================
+
+static bool IsFlashCaller(void* returnAddress)
+{
+    if (!returnAddress || !g_hOcxModule)
+        return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    return VirtualQuery(returnAddress, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+           mbi.AllocationBase == g_hOcxModule;
+}
+
+static bool HasParentTraversal(const std::wstring& path)
+{
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find(L'\\', start);
+        size_t length = end == std::wstring::npos ? path.size() - start : end - start;
+        if (length == 2 && path[start] == L'.' && path[start + 1] == L'.')
+            return true;
+        if (end == std::wstring::npos)
+            break;
+        start = end + 1;
+    }
+    return false;
+}
+
+static bool CanonicalizeAbsolutePath(LPCWSTR path, std::wstring& canonical)
+{
+    canonical.clear();
+    if (!path || !path[0])
+        return false;
+
+    std::wstring input(path);
+    for (wchar_t& ch : input) {
+        if (ch == L'/')
+            ch = L'\\';
+    }
+
+    if (input.size() < 3 || input[1] != L':' || input[2] != L'\\' ||
+        input.find(L':', 2) != std::wstring::npos || HasParentTraversal(input))
+        return false;
+
+    DWORD required = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
+    if (!required)
+        return false;
+
+    std::wstring full(required, L'\0');
+    DWORD written = GetFullPathNameW(input.c_str(), required, &full[0], nullptr);
+    if (!written || written >= required)
+        return false;
+    full.resize(written);
+    canonical.swap(full);
+    return true;
+}
+
+static void InitializeSharedObjectsRoot()
+{
+    g_sharedObjectsRoot.clear();
+
+    DWORD required = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+    if (required <= 1)
+        return;
+
+    std::wstring appData(required, L'\0');
+    DWORD written = GetEnvironmentVariableW(L"APPDATA", &appData[0], required);
+    if (!written || written >= required)
+        return;
+    appData.resize(written);
+
+    std::wstring root = appData + L"\\Macromedia\\Flash Player\\#SharedObjects";
+    if (!CanonicalizeAbsolutePath(root.c_str(), g_sharedObjectsRoot))
+        g_sharedObjectsRoot.clear();
+}
+
+static bool IsScopedSolPath(LPCWSTR path)
+{
+    std::wstring normalized;
+    if (!CanonicalizeAbsolutePath(path, normalized) || g_sharedObjectsRoot.empty())
+        return false;
+
+    size_t rootLength = g_sharedObjectsRoot.size();
+    if (normalized.size() <= rootLength + 4 || normalized[rootLength] != L'\\' ||
+        _wcsnicmp(normalized.c_str(), g_sharedObjectsRoot.c_str(), rootLength) != 0)
+        return false;
+
+    return _wcsicmp(normalized.c_str() + normalized.size() - 4, L".sol") == 0;
+}
+
+static bool ConvertAnsiPath(LPCSTR path, std::wstring& widePath)
+{
+    widePath.clear();
+    if (!path)
+        return false;
+
+    int required = MultiByteToWideChar(CP_ACP, 0, path, -1, nullptr, 0);
+    if (required <= 1)
+        return false;
+
+    widePath.resize(static_cast<size_t>(required));
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, &widePath[0], required)) {
+        widePath.clear();
+        return false;
+    }
+    widePath.resize(static_cast<size_t>(required - 1));
+    return true;
+}
+
+static BOOL ReturnMissingSolDeleteAsSuccess(
+    BOOL result, DWORD error, LPCWSTR path, void* returnAddress)
+{
+    if (!result && error == ERROR_FILE_NOT_FOUND &&
+        IsFlashCaller(returnAddress) && IsScopedSolPath(path)) {
+        DbgTrace(L"[FlashIE] Treating missing first-save SOL as deleted: %s\n", path);
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    SetLastError(error);
+    return result;
+}
+
+BOOL WINAPI FlashLoader::Hooked_DeleteFileW(LPCWSTR lpFileName)
+{
+    void* returnAddress = _ReturnAddress();
+    BOOL result = s_origDeleteFileW(lpFileName);
+    DWORD error = GetLastError();
+    return ReturnMissingSolDeleteAsSuccess(result, error, lpFileName, returnAddress);
+}
+
+BOOL WINAPI FlashLoader::Hooked_DeleteFileA(LPCSTR lpFileName)
+{
+    void* returnAddress = _ReturnAddress();
+    BOOL result = s_origDeleteFileA(lpFileName);
+    DWORD error = GetLastError();
+
+    std::wstring widePath;
+    if (!ConvertAnsiPath(lpFileName, widePath)) {
+        SetLastError(error);
+        return result;
+    }
+    return ReturnMissingSolDeleteAsSuccess(
+        result, error, widePath.c_str(), returnAddress);
+}
+
+// =====================================================================
 // Section 8: Public API (Activate, InstallHooks, Deactivate)
 // =====================================================================
 
@@ -1517,6 +1679,7 @@ bool FlashLoader::Activate()
     PathRemoveFileSpecW(szDir);
 
     PathCombineW(g_szOcxPath, szDir, L"Flash.ocx");
+    InitializeSharedObjectsRoot();
 
     // Ensure Flash.ocx's dependencies resolve from the exe directory
     SetDllDirectoryW(szDir);
@@ -1601,6 +1764,7 @@ bool FlashLoader::InstallHooks()
     HMODULE hCombase    = GetModuleHandleW(L"combase.dll");
     HMODULE hOle32      = GetModuleHandleW(L"ole32.dll");
     HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+    HMODULE hKernel32   = GetModuleHandleW(L"kernel32.dll");
     HMODULE hAdvapi32   = GetModuleHandleW(L"advapi32.dll");
     HMODULE hUrlmon     = GetModuleHandleW(L"urlmon.dll");
     HMODULE hOleAut32   = GetModuleHandleW(L"oleaut32.dll");
@@ -1614,6 +1778,10 @@ bool FlashLoader::InstallHooks()
         ResolveTarget(hKernelBase, "RegQueryValueExW", hAdvapi32));
     s_origRegCloseKey = reinterpret_cast<FN_RegCloseKey>(
         ResolveTarget(hKernelBase, "RegCloseKey", hAdvapi32));
+    s_origDeleteFileA = reinterpret_cast<FN_DeleteFileA>(
+        ResolveTarget(hKernel32, "DeleteFileA", hKernelBase));
+    s_origDeleteFileW = reinterpret_cast<FN_DeleteFileW>(
+        ResolveTarget(hKernel32, "DeleteFileW", hKernelBase));
     s_origCoGetClassObject = reinterpret_cast<FN_CoGetClassObject>(
         ResolveTarget(hCombase, "CoGetClassObject", hOle32));
     s_origCoCreateInstance = reinterpret_cast<FN_CoCreateInstance>(
@@ -1626,6 +1794,7 @@ bool FlashLoader::InstallHooks()
         ResolveTarget(hOleAut32, "LoadRegTypeLib"));
 
     if (!s_origRegOpenKeyExW || !s_origRegQueryValueExW || !s_origRegCloseKey ||
+        !s_origDeleteFileA || !s_origDeleteFileW ||
         !s_origCoGetClassObject || !s_origCoCreateInstance || !s_origCLSIDFromProgID ||
         !s_origCoGetClassObjectFromURL || !s_origLoadRegTypeLib) {
         ResetApiHookPointers();
@@ -1658,6 +1827,8 @@ bool FlashLoader::InstallHooks()
     ATTACH(s_origRegOpenKeyExW,             Hooked_RegOpenKeyExW);
     ATTACH(s_origRegQueryValueExW,          Hooked_RegQueryValueExW);
     ATTACH(s_origRegCloseKey,               Hooked_RegCloseKey);
+    ATTACH(s_origDeleteFileA,               Hooked_DeleteFileA);
+    ATTACH(s_origDeleteFileW,               Hooked_DeleteFileW);
     ATTACH(s_origCoGetClassObject,          Hooked_CoGetClassObject);
     ATTACH(s_origCoCreateInstance,          Hooked_CoCreateInstance);
     ATTACH(s_origCLSIDFromProgID,           Hooked_CLSIDFromProgID);
@@ -1727,6 +1898,8 @@ void FlashLoader::Deactivate()
         DETACH(s_origRegOpenKeyExW,              Hooked_RegOpenKeyExW);
         DETACH(s_origRegQueryValueExW,           Hooked_RegQueryValueExW);
         DETACH(s_origRegCloseKey,                Hooked_RegCloseKey);
+        DETACH(s_origDeleteFileA,                Hooked_DeleteFileA);
+        DETACH(s_origDeleteFileW,                Hooked_DeleteFileW);
         DETACH(s_origCoGetClassObject,           Hooked_CoGetClassObject);
         DETACH(s_origCoCreateInstance,           Hooked_CoCreateInstance);
         DETACH(s_origCLSIDFromProgID,            Hooked_CLSIDFromProgID);
@@ -1806,5 +1979,6 @@ void FlashLoader::Deactivate()
         FreeLibrary(m_hModule);
         m_hModule = nullptr;
     }
+    g_sharedObjectsRoot.clear();
     InterlockedExchange(&s_activationThreadId, 0);
 }
