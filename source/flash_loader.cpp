@@ -169,6 +169,7 @@ enum FakeKeyType {
     FK_INSTALLED_VER,    // HKCR\CLSID\{...}\InstalledVersion
     FK_IMPL_CATEGORY,    // ...\Implemented Categories\{CATID_SafeFor*}
     FK_FLASHPLAYER_VER,  // HKLM\SOFTWARE\Macromedia\FlashPlayer[ActiveX]
+    FK_BROWSER_EMULATION,// Real FEATURE_BROWSER_EMULATION key with one fake value
 };
 
 struct FakeKeyEntry {
@@ -181,6 +182,20 @@ static FakeKeyEntry s_fakeKeys[MAX_FAKE_KEYS] = {};
 static int s_fakeKeyCount = 0;
 static SRWLOCK s_fakeKeyLock = SRWLOCK_INIT;
 
+static bool TrackKey(HKEY hKey, FakeKeyType type)
+{
+    bool tracked = false;
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    if (s_fakeKeyCount < MAX_FAKE_KEYS) {
+        s_fakeKeys[s_fakeKeyCount].hKey = hKey;
+        s_fakeKeys[s_fakeKeyCount].type = type;
+        s_fakeKeyCount++;
+        tracked = true;
+    }
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+    return tracked;
+}
+
 static HKEY AllocFakeKey(FakeKeyType type)
 {
     HKEY hReal = nullptr;
@@ -189,13 +204,11 @@ static HKEY AllocFakeKey(FakeKeyType type)
     }
     if (!hReal) return nullptr;
 
-    AcquireSRWLockExclusive(&s_fakeKeyLock);
-    if (s_fakeKeyCount < MAX_FAKE_KEYS) {
-        s_fakeKeys[s_fakeKeyCount].hKey = hReal;
-        s_fakeKeys[s_fakeKeyCount].type = type;
-        s_fakeKeyCount++;
+    if (!TrackKey(hReal, type)) {
+        if (s_origRegCloseKey)
+            s_origRegCloseKey(hReal);
+        return nullptr;
     }
-    ReleaseSRWLockExclusive(&s_fakeKeyLock);
     return hReal;
 }
 
@@ -230,6 +243,25 @@ static bool CloseFakeKey(HKEY hKey)
     if (found && s_origRegCloseKey)
         s_origRegCloseKey(hKey);
     return found;
+}
+
+static void CloseAllTrackedKeys()
+{
+    HKEY handles[MAX_FAKE_KEYS] = {};
+    int count = 0;
+
+    AcquireSRWLockExclusive(&s_fakeKeyLock);
+    count = s_fakeKeyCount;
+    for (int i = 0; i < count; i++)
+        handles[i] = s_fakeKeys[i].hKey;
+    memset(s_fakeKeys, 0, sizeof(s_fakeKeys));
+    s_fakeKeyCount = 0;
+    ReleaseSRWLockExclusive(&s_fakeKeyLock);
+
+    if (s_origRegCloseKey) {
+        for (int i = 0; i < count; i++)
+            s_origRegCloseKey(handles[i]);
+    }
 }
 
 // =====================================================================
@@ -364,8 +396,6 @@ public:
 static LoggingClassFactory* s_pLoggingFactory = nullptr;
 static SRWLOCK s_factoryLock = SRWLOCK_INIT;
 
-// HKEY tracking for FEATURE_BROWSER_EMULATION (fake without registry writes)
-static HKEY s_hkeyBrowserEmulation = nullptr;
 static wchar_t s_szExeName[MAX_PATH] = {};
 
 // Path to Flash.ocx (next to exe)
@@ -506,28 +536,35 @@ static bool SubKeyEndsWith(LPCWSTR lpSubKey, LPCWSTR suffix)
 // Helper: fill a REG_SZ value into the query result buffer
 static LSTATUS FakeRegSz(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, const wchar_t* val)
 {
+    if (lpData && !lpcbData)
+        return ERROR_INVALID_PARAMETER;
+
     DWORD needed = (DWORD)((wcslen(val) + 1) * sizeof(wchar_t));
     if (lpType) *lpType = REG_SZ;
     if (lpcbData) {
         DWORD avail = *lpcbData;
         *lpcbData = needed;
-        if (lpData) {
-            if (avail >= needed)
-                memcpy(lpData, val, needed);
-            else
-                return ERROR_MORE_DATA;
-        }
+        if (lpData && avail < needed)
+            return ERROR_MORE_DATA;
+        if (lpData)
+            memcpy(lpData, val, needed);
     }
     return ERROR_SUCCESS;
 }
 
 static LSTATUS FakeRegDword(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, DWORD val)
 {
+    if (lpData && !lpcbData)
+        return ERROR_INVALID_PARAMETER;
+
     if (lpType) *lpType = REG_DWORD;
     if (lpcbData) {
-        if (lpData && *lpcbData >= sizeof(DWORD))
-            memcpy(lpData, &val, sizeof(DWORD));
+        DWORD avail = *lpcbData;
         *lpcbData = sizeof(DWORD);
+        if (lpData && avail < sizeof(DWORD))
+            return ERROR_MORE_DATA;
+        if (lpData)
+            memcpy(lpData, &val, sizeof(DWORD));
     }
     return ERROR_SUCCESS;
 }
@@ -656,6 +693,9 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
 {
     // ---- Handle subkey opens under fake Flash HKEY handles ----
     FakeKeyType parentType = GetFakeKeyType(hKey);
+    if (parentType == FK_BROWSER_EMULATION)
+        return s_origRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+
     if (parentType != FK_NONE && lpSubKey && phkResult) {
         FakeKeyType subType = FK_NONE;
 
@@ -736,7 +776,7 @@ LSTATUS WINAPI FlashLoader::Hooked_RegOpenKeyExW(
             LSTATUS res = s_origRegOpenKeyExW(
                 hKey, lpSubKey, ulOptions, samDesired, phkResult);
             if (res == ERROR_SUCCESS && phkResult)
-                s_hkeyBrowserEmulation = *phkResult;
+                TrackKey(*phkResult, FK_BROWSER_EMULATION);
             return res;
         }
     }
@@ -752,6 +792,16 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
 {
     // ---- Fake Flash CLSID registration values ----
     FakeKeyType fkt = GetFakeKeyType(hKey);
+    if (fkt == FK_BROWSER_EMULATION) {
+        if (lpValueName && s_szExeName[0] &&
+            _wcsicmp(lpValueName, s_szExeName) == 0) {
+            DbgTrace(L"[FlashIE] RegQueryValueExW: FEATURE_BROWSER_EMULATION -> 11001\n");
+            return FakeRegDword(lpType, lpData, lpcbData, 11001);
+        }
+        return s_origRegQueryValueExW(
+            hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+    }
+
     if (fkt != FK_NONE) {
         switch (fkt) {
         case FK_CLSID_ROOT:
@@ -863,13 +913,6 @@ LSTATUS WINAPI FlashLoader::Hooked_RegQueryValueExW(
         default:
             break;
         }
-    }
-
-    // ---- FEATURE_BROWSER_EMULATION ----
-    if (s_hkeyBrowserEmulation && hKey == s_hkeyBrowserEmulation &&
-        lpValueName && s_szExeName[0] && _wcsicmp(lpValueName, s_szExeName) == 0) {
-        DbgTrace(L"[FlashIE] RegQueryValueExW: FEATURE_BROWSER_EMULATION -> 11001\n");
-        return FakeRegDword(lpType, lpData, lpcbData, 11001);
     }
 
     return s_origRegQueryValueExW(
@@ -1649,6 +1692,7 @@ void FlashLoader::Deactivate()
     }
 
     FlushPendingActivations();
+    CloseAllTrackedKeys();
 
     if (m_hooked) {
         AcquireSRWLockExclusive(&s_flashHookLock);
