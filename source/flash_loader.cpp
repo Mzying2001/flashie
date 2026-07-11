@@ -297,21 +297,25 @@ public:
 // causes MSHTML to reject the safety assertion and block scripting.
 class FlashSafetyTearoff : public IObjectSafety {
     IUnknown* m_pFlash;
+    LONG m_ref;
 public:
-    explicit FlashSafetyTearoff(IUnknown* pFlash) : m_pFlash(pFlash) {}
+    // Consumes the reference returned by QI(IID_IUnknown).
+    explicit FlashSafetyTearoff(IUnknown* pFlash) : m_pFlash(pFlash), m_ref(1) {}
     ~FlashSafetyTearoff() { if (m_pFlash) m_pFlash->Release(); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (riid == IID_IObjectSafety) {
             *ppv = static_cast<IObjectSafety*>(this);
-            m_pFlash->AddRef();
+            AddRef();
             return S_OK;
         }
         return m_pFlash->QueryInterface(riid, ppv);
     }
-    STDMETHODIMP_(ULONG) AddRef() override { return m_pFlash->AddRef(); }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
     STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = m_pFlash->Release();
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
         if (ref == 0) delete this;
         return ref;
     }
