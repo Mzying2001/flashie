@@ -16,6 +16,7 @@
 #include <ocidl.h>      // IQuickActivate, IPersistPropertyBag
 #include <oleidl.h>     // IOleObject, IOleInPlaceObject, etc.
 #include <objsafe.h>    // IObjectSafety
+#include <activscp.h>   // IActiveScriptParse (architecture-selected IID)
 
 // Flash CLSID string form for comparisons
 static const wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
@@ -80,11 +81,6 @@ typedef HRESULT (WINAPI *FN_LoadTypeLibEx)(
     LPCOLESTR szFile, REGKIND regkind, ITypeLib** pptlib);
 
 // --- Script Engine ---
-
-// IActiveScriptParse32 {BB1A2AE2-A4F9-11CF-8F20-00805F2CD064}
-// NOTE: NOT BB1A2AE1 which is IID_IActiveScript (different interface!)
-static const IID IID_IActiveScriptParse_ =
-    {0xBB1A2AE2, 0xA4F9, 0x11CF, {0x8F, 0x20, 0x00, 0x80, 0x5F, 0x2C, 0xD0, 0x64}};
 
 // IActiveScriptParse::ParseScriptText (vtable index 5)
 typedef HRESULT (STDMETHODCALLTYPE *FN_ParseScriptText)(
@@ -1237,7 +1233,7 @@ static void MaybeHookScriptParseText(IUnknown* pObj)
     if (s_origParseScriptText) return; // already hooked
 
     void* pParse = nullptr;
-    if (FAILED(pObj->QueryInterface(IID_IActiveScriptParse_, &pParse)) || !pParse)
+    if (FAILED(pObj->QueryInterface(IID_IActiveScriptParse, &pParse)) || !pParse)
         return;
 
     void** vtable = *reinterpret_cast<void***>(pParse);
