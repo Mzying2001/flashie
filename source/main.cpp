@@ -98,7 +98,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
-        g_flashLoader.InstallHooks();
+        if (!g_flashLoader.InstallHooks() && g_flashLoader.IsActive()) {
+            MessageBoxW(hwnd, L"Failed to install the Flash compatibility hooks.\n"
+                        L"Flash support has been disabled for this session.",
+                        L"FlashIE", MB_ICONWARNING);
+            g_flashLoader.Deactivate();
+        }
 
         g_pBrowser = new BrowserHost();
         RECT rcBrowser = {0, 0, rc.right, rc.bottom - TOOLBAR_HEIGHT};

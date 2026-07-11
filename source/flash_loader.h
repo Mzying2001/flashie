@@ -14,14 +14,17 @@ public:
     // Must be called AFTER OleInitialize.
     bool Activate();
 
-    // Phase 2: Install inline hooks (detours) on COM, registry,
-    // security, and TypeLib APIs. Force-loads
-    // mshtml.dll/urlmon.dll/ieframe.dll, then patches them.
-    // Call BEFORE browser creation so hooks are in place when
-    // MSHTML initializes.
-    void InstallHooks();
+    // Phase 2: Atomically install inline hooks (detours) on COM,
+    // registry, WLDP, and TypeLib APIs. Force-loads
+    // mshtml.dll/urlmon.dll/ieframe.dll and resolves every required
+    // target before patching. Returns false without leaving a partial
+    // hook set if resolution or the Detours transaction fails. Call
+    // BEFORE browser creation so hooks are in place when MSHTML initializes.
+    bool InstallHooks();
 
-    // Cleanup. Must be called BEFORE OleUninitialize.
+    // Cleanup. Must be called on the Flash activation STA and BEFORE
+    // OleUninitialize. Flash-vtable restoration or Detours detach failures
+    // are logged and leave the corresponding hook state intact.
     void Deactivate();
 
     bool IsActive() const { return m_hModule != nullptr; }
@@ -60,9 +63,6 @@ private:
         LPCWSTR szContentType, LPBINDCTX pBindCtx,
         DWORD dwClsContext, LPVOID pvReserved,
         REFIID riid, LPVOID* ppv);
-
-    static HRESULT STDAPICALLTYPE Hooked_CoInternetIsFeatureEnabled(
-        DWORD dwFeature, DWORD dwFlags);
 
     static HRESULT WINAPI Hooked_WldpIsClassInApprovedList(
         const CLSID* classID, /*PWLDP_HOST_INFORMATION*/ void* hostInfo,
