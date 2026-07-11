@@ -32,6 +32,7 @@ static HWND         g_hwndRefresh     = nullptr;
 static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
+static bool         g_isClosing       = false;
 
 static void DoNavigate()
 {
@@ -108,7 +109,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_pBrowser = new BrowserHost();
         RECT rcBrowser = {0, 0, rc.right, rc.bottom - TOOLBAR_HEIGHT};
         if (g_pBrowser->Initialize(g_hwndBrowserArea, rcBrowser)) {
-
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
             g_pBrowser->Navigate(L"about:blank");
@@ -140,6 +140,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     }
+
+    case WM_PARENTNOTIFY:
+        if (!g_isClosing && LOWORD(wParam) == WM_DESTROY) {
+            HWND hwndDestroyed = reinterpret_cast<HWND>(lParam);
+            if (g_hwndBrowserArea && hwndDestroyed &&
+                IsChild(g_hwndBrowserArea, hwndDestroyed)) {
+                g_isClosing = true;
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        return 0;
+
+    case WM_CLOSE:
+        g_isClosing = true;
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_DESTROY:
         if (g_pBrowser) {
