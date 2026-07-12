@@ -243,7 +243,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     UpdateWindow(g_hwndMain);
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         // Address bar keyboard shortcuts
         if (msg.hwnd == g_hwndAddress && msg.message == WM_KEYDOWN) {
             if (msg.wParam == VK_RETURN) {
