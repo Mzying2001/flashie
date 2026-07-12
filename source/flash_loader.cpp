@@ -1409,54 +1409,39 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
         return E_UNEXPECTED;
 
     if (pstrCode) {
-        // Convert UTF-16 source to UTF-8 for JScriptCC
-        int codeLen = static_cast<int>(wcslen(pstrCode));
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, nullptr, 0, nullptr, nullptr);
-        if (utf8Len > 0) {
-            std::string utf8Source(utf8Len, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, &utf8Source[0], utf8Len, nullptr, nullptr);
+        std::wstring preprocessed;
+        jscriptcc::CCErrorList errors;
+        jscriptcc::CCPreprocessor preprocessor;
 
-            // Run JScriptCC conditional compilation preprocessor
-            std::string preprocessed;
-            jscriptcc::CCErrorList errors;
-            jscriptcc::CCPreprocessor preprocessor;
+        const auto architecture = sizeof(void*) == 8
+            ? jscriptcc::TargetArchitecture::Win64
+            : jscriptcc::TargetArchitecture::Win32;
 
-            const auto architecture = sizeof(void*) == 8
-                ? jscriptcc::TargetArchitecture::Win64
-                : jscriptcc::TargetArchitecture::Win32;
+        bool ok = preprocessor.process(
+            pstrCode, wcslen(pstrCode), preprocessed,
+            jscriptcc::CCEnvironment(architecture), &errors);
 
-            bool ok = preprocessor.process(
-                utf8Source, preprocessed, jscriptcc::CCEnvironment(architecture), &errors);
+        // Report any preprocessing errors
+        for (const auto& err : errors) {
+            DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
+                     err.line, err.column, err.message.c_str());
+        }
 
-            // Report any preprocessing errors
-            for (const auto& err : errors) {
-                DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
-                         err.line, err.column, err.message.c_str());
-            }
+        if (ok && !preprocessed.empty()) {
+            DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) begin ===\n");
+            if (pstrItemName && pstrItemName[0])
+                DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
+            DbgTrace(L"[FlashIE]   code: %s\n", preprocessed.c_str());
+            DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
 
-            if (ok && !preprocessed.empty()) {
-                // Convert preprocessed UTF-8 back to UTF-16
-                int wideLen = MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), nullptr, 0);
-                if (wideLen > 0) {
-                    std::wstring preprocessedWide(wideLen, L'\0');
-                    MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), &preprocessedWide[0], wideLen);
+            return original(pThis, preprocessed.c_str(), pstrItemName,
+                punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
+                dwFlags, pvarResult, pexcepinfo);
+        }
 
-                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) begin ===\n");
-                    if (pstrItemName && pstrItemName[0])
-                        DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
-                    DbgTrace(L"[FlashIE]   code: %s\n", preprocessedWide.c_str());
-                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
-
-                    return original(pThis, preprocessedWide.c_str(), pstrItemName,
-                        punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
-                        dwFlags, pvarResult, pexcepinfo);
-                }
-            }
-
-            // Preprocessing failed or produced empty output — fall through to original code
-            if (!ok) {
-                DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
-            }
+        // Preprocessing failed or produced empty output; fall through to original code.
+        if (!ok) {
+            DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
         }
     }
 
