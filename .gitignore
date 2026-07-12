@@ -73,7 +73,7 @@ Testing/
 .vscode/
 
 # Code review documents
-code-review/
+/code-review/
 
-# Documentation
-docs/
+# Local investigation notes
+/local-notes/
