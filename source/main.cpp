@@ -69,8 +69,8 @@ static void OnLoadingStateChange(bool isLoading, void*)
     if (g_hwndRefresh == nullptr || g_hwndStop == nullptr)
         return;
     if (isLoading) {
-        ShowWindow(g_hwndRefresh, SW_HIDE);
         ShowWindow(g_hwndStop, SW_SHOW);
+        ShowWindow(g_hwndRefresh, SW_HIDE);
     } else {
         ShowWindow(g_hwndRefresh, SW_SHOW);
         ShowWindow(g_hwndStop, SW_HIDE);
