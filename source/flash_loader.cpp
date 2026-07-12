@@ -76,6 +76,11 @@ typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
 typedef BOOL (WINAPI *FN_DeleteFileA)(LPCSTR lpFileName);
 typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
 
+typedef DWORD (WINAPI *FN_GetModuleFileNameA)(
+    HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+typedef DWORD (WINAPI *FN_GetModuleFileNameW)(
+    HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+
 // --- Windows Lockdown Policy (WLDP) ---
 
 typedef HRESULT (WINAPI *FN_WldpIsClassInApprovedList)(
@@ -120,6 +125,8 @@ static FN_RegQueryValueExW            s_origRegQueryValueExW = nullptr;
 static FN_RegCloseKey                 s_origRegCloseKey = nullptr;
 static FN_DeleteFileA                 s_origDeleteFileA = nullptr;
 static FN_DeleteFileW                 s_origDeleteFileW = nullptr;
+static FN_GetModuleFileNameA          s_origGetModuleFileNameA = nullptr;
+static FN_GetModuleFileNameW          s_origGetModuleFileNameW = nullptr;
 static FN_CoGetClassObjectFromURL     s_origCoGetClassObjectFromURL = nullptr;
 static FN_WldpIsClassInApprovedList   s_origWldpIsClassInApprovedList = nullptr;
 static FN_WldpQueryDynamicCodeTrust   s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -152,6 +159,8 @@ static void ResetApiHookPointers()
     s_origRegCloseKey = nullptr;
     s_origDeleteFileA = nullptr;
     s_origDeleteFileW = nullptr;
+    s_origGetModuleFileNameA = nullptr;
+    s_origGetModuleFileNameW = nullptr;
     s_origCoGetClassObjectFromURL = nullptr;
     s_origWldpIsClassInApprovedList = nullptr;
     s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -1502,11 +1511,16 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 7h: SharedObject First-Save Compatibility
+// Section 7h: Flash Browser Host Identity
 //
-// The bundled ActiveX player treats a missing old .sol as a failed replace
-// operation. For that one narrowly scoped case, report the deletion as
-// successful so Flash can continue its own .sxx -> .sol commit.
+// Flash ActiveX checks the current process executable name before enabling
+// its browser navigation path. The same unmodified SWF fails under
+// FlashIE.exe but navigates normally when the host is named iexplore.exe;
+// in the failing case, navigateToURL returns before calling IBindHost or
+// URLMon. Report the IE host basename only for calls originating in the
+// local Flash.ocx and only when it queries the current process
+// (hModule == nullptr). Explicit module queries and all non-Flash callers
+// continue to see the real executable path.
 // =====================================================================
 
 static bool IsFlashCaller(void* returnAddress)
@@ -1518,6 +1532,64 @@ static bool IsFlashCaller(void* returnAddress)
     return VirtualQuery(returnAddress, &mbi, sizeof(mbi)) == sizeof(mbi) &&
            mbi.AllocationBase == g_hOcxModule;
 }
+
+static DWORD WINAPI Hooked_GetModuleFileNameW(
+    HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
+{
+    // Flash enables its browser navigation path only for recognized hosts.
+    bool spoofHost = hModule == nullptr && IsFlashCaller(_ReturnAddress());
+    DWORD length = s_origGetModuleFileNameW(hModule, lpFilename, nSize);
+    DWORD originalError = GetLastError();
+    if (!spoofHost || !lpFilename || length == 0 || length >= nSize)
+        return length;
+
+    LPWSTR fileName = PathFindFileNameW(lpFilename);
+    static const wchar_t IE_HOST_NAME[] = L"iexplore.exe";
+    size_t prefixLength = static_cast<size_t>(fileName - lpFilename);
+    size_t hostLength = _countof(IE_HOST_NAME) - 1;
+    size_t resultLength = prefixLength + hostLength;
+    if (resultLength >= nSize) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nSize;
+    }
+
+    memcpy(fileName, IE_HOST_NAME, sizeof(IE_HOST_NAME));
+    SetLastError(originalError);
+    return static_cast<DWORD>(resultLength);
+}
+
+static DWORD WINAPI Hooked_GetModuleFileNameA(
+    HMODULE hModule, LPSTR lpFilename, DWORD nSize)
+{
+    // Keep the real directory so any path-based lookups remain process-local.
+    bool spoofHost = hModule == nullptr && IsFlashCaller(_ReturnAddress());
+    DWORD length = s_origGetModuleFileNameA(hModule, lpFilename, nSize);
+    DWORD originalError = GetLastError();
+    if (!spoofHost || !lpFilename || length == 0 || length >= nSize)
+        return length;
+
+    LPSTR fileName = PathFindFileNameA(lpFilename);
+    static const char IE_HOST_NAME[] = "iexplore.exe";
+    size_t prefixLength = static_cast<size_t>(fileName - lpFilename);
+    size_t hostLength = sizeof(IE_HOST_NAME) - 1;
+    size_t resultLength = prefixLength + hostLength;
+    if (resultLength >= nSize) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nSize;
+    }
+
+    memcpy(fileName, IE_HOST_NAME, sizeof(IE_HOST_NAME));
+    SetLastError(originalError);
+    return static_cast<DWORD>(resultLength);
+}
+
+// =====================================================================
+// Section 7i: SharedObject First-Save Compatibility
+//
+// The bundled ActiveX player treats a missing old .sol as a failed replace
+// operation. For that one narrowly scoped case, report the deletion as
+// successful so Flash can continue its own .sxx -> .sol commit.
+// =====================================================================
 
 static bool HasSolExtension(LPCWSTR path)
 {
@@ -1677,6 +1749,10 @@ bool FlashLoader::InstallHooks()
         ResolveTarget(hKernel32, "DeleteFileA", hKernelBase));
     s_origDeleteFileW = reinterpret_cast<FN_DeleteFileW>(
         ResolveTarget(hKernel32, "DeleteFileW", hKernelBase));
+    s_origGetModuleFileNameA = reinterpret_cast<FN_GetModuleFileNameA>(
+        ResolveTarget(hKernelBase, "GetModuleFileNameA", hKernel32));
+    s_origGetModuleFileNameW = reinterpret_cast<FN_GetModuleFileNameW>(
+        ResolveTarget(hKernelBase, "GetModuleFileNameW", hKernel32));
     s_origCoGetClassObject = reinterpret_cast<FN_CoGetClassObject>(
         ResolveTarget(hCombase, "CoGetClassObject", hOle32));
     s_origCoCreateInstance = reinterpret_cast<FN_CoCreateInstance>(
@@ -1690,6 +1766,7 @@ bool FlashLoader::InstallHooks()
 
     if (!s_origRegOpenKeyExW || !s_origRegQueryValueExW || !s_origRegCloseKey ||
         !s_origDeleteFileA || !s_origDeleteFileW ||
+        !s_origGetModuleFileNameA || !s_origGetModuleFileNameW ||
         !s_origCoGetClassObject || !s_origCoCreateInstance || !s_origCLSIDFromProgID ||
         !s_origCoGetClassObjectFromURL || !s_origLoadRegTypeLib) {
         ResetApiHookPointers();
@@ -1724,6 +1801,8 @@ bool FlashLoader::InstallHooks()
     ATTACH(s_origRegCloseKey,               Hooked_RegCloseKey);
     ATTACH(s_origDeleteFileA,               Hooked_DeleteFileA);
     ATTACH(s_origDeleteFileW,               Hooked_DeleteFileW);
+    ATTACH(s_origGetModuleFileNameA,        Hooked_GetModuleFileNameA);
+    ATTACH(s_origGetModuleFileNameW,        Hooked_GetModuleFileNameW);
     ATTACH(s_origCoGetClassObject,          Hooked_CoGetClassObject);
     ATTACH(s_origCoCreateInstance,          Hooked_CoCreateInstance);
     ATTACH(s_origCLSIDFromProgID,           Hooked_CLSIDFromProgID);
@@ -1795,6 +1874,8 @@ void FlashLoader::Deactivate()
         DETACH(s_origRegCloseKey,                Hooked_RegCloseKey);
         DETACH(s_origDeleteFileA,                Hooked_DeleteFileA);
         DETACH(s_origDeleteFileW,                Hooked_DeleteFileW);
+        DETACH(s_origGetModuleFileNameA,         Hooked_GetModuleFileNameA);
+        DETACH(s_origGetModuleFileNameW,         Hooked_GetModuleFileNameW);
         DETACH(s_origCoGetClassObject,           Hooked_CoGetClassObject);
         DETACH(s_origCoCreateInstance,           Hooked_CoCreateInstance);
         DETACH(s_origCLSIDFromProgID,            Hooked_CLSIDFromProgID);
