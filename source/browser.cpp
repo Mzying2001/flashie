@@ -266,7 +266,7 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
                     eventDispatch, m_pBrowserHost->m_pWebBrowser)) {
                 const wchar_t* url = GetVariantString(
                     &pDispParams->rgvarg[5]);
-                if (SwfMimeFilter::IsHttpSwfUrl(url))
+                if (SwfMimeFilter::IsSupportedSwfUrl(url))
                     SwfMimeFilter::Arm(url);
                 else
                     SwfMimeFilter::Cancel();
@@ -311,8 +311,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
     }
 
     case DISPID_FILEDOWNLOAD:
-        // If URLMon elected to download, it did not consume our MIME filter.
-        // Keep the native dialog as a fallback, but clear the pending filter.
+        // If URLMon elected to download, it did not consume our handler.
+        // Keep the native dialog as a fallback, but clear pending state.
         if (SwfMimeFilter::IsArmed())
             SwfMimeFilter::Cancel();
         return S_OK;
@@ -482,7 +482,7 @@ void BrowserHost::Refresh()
 
     BSTR location = nullptr;
     if (SUCCEEDED(m_pWebBrowser->get_LocationURL(&location)) && location &&
-        SwfMimeFilter::IsHttpSwfUrl(location)) {
+        SwfMimeFilter::IsSupportedSwfUrl(location)) {
         SwfMimeFilter::Arm(location);
     } else {
         SwfMimeFilter::Cancel();

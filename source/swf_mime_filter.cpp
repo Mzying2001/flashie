@@ -5,6 +5,7 @@
 #include "debug.h"
 
 #include <windows.h>
+#include <shlwapi.h>
 #include <urlmon.h>
 
 #include <algorithm>
@@ -15,6 +16,8 @@
 namespace {
 
 constexpr wchar_t FLASH_MIME_TYPE[] = L"application/x-shockwave-flash";
+constexpr DWORD MIME_FILTER_FLASH = 0x1;
+constexpr DWORD PROTOCOL_HANDLER_FILE = 0x2;
 
 // Process-local registration identity. It is never registered in COM or the
 // system registry; URLMon receives the in-memory class factory directly.
@@ -30,27 +33,45 @@ SwfMimeFilterFactory* g_factory = nullptr;
 std::wstring g_pendingUrl;
 ULONGLONG g_generation = 0;
 bool g_armed = false;
-bool g_registered = false;
+DWORD g_registeredHandlers = 0;
 SwfMimeProtocol* g_completionFilter = nullptr;
 UINT_PTR g_completionTimer = 0;
 
-bool NormalizeHttpUrl(
+enum class NavigationScheme {
+    Unsupported,
+    Http,
+    File,
+};
+
+NavigationScheme NormalizeNavigationUrl(
     const wchar_t* url, bool requireSwfPath, std::wstring& normalized)
 {
     normalized.clear();
     if (!url || !url[0])
-        return false;
+        return NavigationScheme::Unsupported;
 
     IUri* uri = nullptr;
-    HRESULT hr = CreateUri(url, Uri_CREATE_CANONICALIZE, 0, &uri);
+    HRESULT hr = CreateUri(url,
+        Uri_CREATE_CANONICALIZE |
+        Uri_CREATE_ALLOW_IMPLICIT_FILE_SCHEME,
+        0, &uri);
     if (FAILED(hr) || !uri)
-        return false;
+        return NavigationScheme::Unsupported;
 
     BSTR scheme = nullptr;
     BSTR path = nullptr;
     BSTR absolute = nullptr;
-    bool matches = SUCCEEDED(uri->GetSchemeName(&scheme)) && scheme &&
-        (_wcsicmp(scheme, L"http") == 0 || _wcsicmp(scheme, L"https") == 0) &&
+    NavigationScheme result = NavigationScheme::Unsupported;
+    if (SUCCEEDED(uri->GetSchemeName(&scheme)) && scheme) {
+        if (_wcsicmp(scheme, L"http") == 0 ||
+            _wcsicmp(scheme, L"https") == 0) {
+            result = NavigationScheme::Http;
+        } else if (_wcsicmp(scheme, L"file") == 0) {
+            result = NavigationScheme::File;
+        }
+    }
+
+    bool matches = result != NavigationScheme::Unsupported &&
         SUCCEEDED(uri->GetPath(&path)) && path;
 
     if (matches && requireSwfPath) {
@@ -72,7 +93,20 @@ bool NormalizeHttpUrl(
     SysFreeString(path);
     SysFreeString(scheme);
     uri->Release();
-    return matches;
+    return matches ? result : NavigationScheme::Unsupported;
+}
+
+bool IsExistingFileUrl(const std::wstring& url)
+{
+    std::wstring path(32768, L'\0');
+    DWORD pathLength = static_cast<DWORD>(path.size());
+    if (FAILED(PathCreateFromUrlW(
+            url.c_str(), path.data(), &pathLength, 0)))
+        return false;
+
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 std::wstring EscapeHtmlAttribute(const std::wstring& value)
@@ -125,23 +159,28 @@ std::string BuildWrapperHtml(const std::wstring& movieUrl)
     return WideToUtf8(html);
 }
 
-void UnregisterFilter()
+void UnregisterHandlers()
 {
     IInternetSession* session = nullptr;
     IClassFactory* factory = nullptr;
+    DWORD registeredHandlers = 0;
 
     AcquireSRWLockExclusive(&g_stateLock);
-    if (g_registered && g_session && g_factory) {
+    if (g_registeredHandlers && g_session && g_factory) {
         session = g_session;
         factory = reinterpret_cast<IClassFactory*>(g_factory);
         session->AddRef();
         factory->AddRef();
-        g_registered = false;
+        registeredHandlers = g_registeredHandlers;
+        g_registeredHandlers = 0;
     }
     ReleaseSRWLockExclusive(&g_stateLock);
 
     if (session && factory) {
-        session->UnregisterMimeFilter(factory, FLASH_MIME_TYPE);
+        if (registeredHandlers & PROTOCOL_HANDLER_FILE)
+            session->UnregisterNameSpace(factory, L"file");
+        if (registeredHandlers & MIME_FILTER_FLASH)
+            session->UnregisterMimeFilter(factory, FLASH_MIME_TYPE);
         factory->Release();
         session->Release();
     }
@@ -169,7 +208,10 @@ bool ClaimPendingNavigation(
 
     const wchar_t* bindingUrl = bindingUrlValue ? bindingUrlValue : url;
     std::wstring normalized;
-    bool normalizedHttp = NormalizeHttpUrl(bindingUrl, false, normalized);
+    NavigationScheme bindingScheme = NormalizeNavigationUrl(
+        bindingUrl, false, normalized);
+    bool normalizedBinding =
+        bindingScheme != NavigationScheme::Unsupported;
 
     DWORD bindFlags = 0;
     BINDINFO info = {};
@@ -183,9 +225,9 @@ bool ClaimPendingNavigation(
 
     bool claimed = false;
     AcquireSRWLockExclusive(&g_stateLock);
-    bool exactUrl = normalizedHttp &&
+    bool exactUrl = normalizedBinding &&
         _wcsicmp(normalized.c_str(), g_pendingUrl.c_str()) == 0;
-    bool topLevelRedirect = normalizedHttp &&
+    bool topLevelRedirect = bindingScheme == NavigationScheme::Http &&
         (!rootDocumentValue || !rootDocumentValue[0]) &&
         (!documentUrlValue || !documentUrlValue[0]);
     if (g_armed && (exactUrl || topLevelRedirect)) {
@@ -210,7 +252,7 @@ bool ClaimPendingNavigation(
     CoTaskMemFree(bindingUrlValue);
 
     if (claimed)
-        UnregisterFilter();
+        UnregisterHandlers();
     return claimed;
 }
 
@@ -558,16 +600,20 @@ void Shutdown()
         session->Release();
 }
 
-bool IsHttpSwfUrl(const wchar_t* url)
+bool IsSupportedSwfUrl(const wchar_t* url)
 {
     std::wstring normalized;
-    return NormalizeHttpUrl(url, true, normalized);
+    NavigationScheme scheme = NormalizeNavigationUrl(url, true, normalized);
+    return scheme != NavigationScheme::Unsupported &&
+        (scheme != NavigationScheme::File || IsExistingFileUrl(normalized));
 }
 
 bool Arm(const wchar_t* url)
 {
     std::wstring normalized;
-    if (!NormalizeHttpUrl(url, true, normalized))
+    NavigationScheme scheme = NormalizeNavigationUrl(url, true, normalized);
+    if (scheme == NavigationScheme::Unsupported ||
+        (scheme == NavigationScheme::File && !IsExistingFileUrl(normalized)))
         return false;
 
     Cancel();
@@ -588,8 +634,22 @@ bool Arm(const wchar_t* url)
         return false;
     }
 
+    DWORD registeredHandlers = 0;
     HRESULT hr = session->RegisterMimeFilter(
         factory, CLSID_FlashIeSwfMimeFilter, FLASH_MIME_TYPE);
+    if (SUCCEEDED(hr))
+        registeredHandlers |= MIME_FILTER_FLASH;
+    if (SUCCEEDED(hr) && scheme == NavigationScheme::File) {
+        // The built-in file: handler bypasses MIME filters and classifies SWF
+        // data as application/octet-stream, so intercept this one navigation
+        // at the namespace layer. ClaimPendingNavigation still requires an
+        // exact URL match, and the handler is removed before embed loads it.
+        hr = session->RegisterNameSpace(
+            factory, CLSID_FlashIeSwfMimeFilter, L"file", 0, nullptr, 0);
+        if (SUCCEEDED(hr))
+            registeredHandlers |= PROTOCOL_HANDLER_FILE;
+    }
+
     if (SUCCEEDED(hr)) {
         ULONGLONG generation = 0;
         std::wstring armedUrl;
@@ -597,14 +657,19 @@ bool Arm(const wchar_t* url)
         g_pendingUrl = std::move(normalized);
         g_generation++;
         g_armed = true;
-        g_registered = true;
+        g_registeredHandlers = registeredHandlers;
         generation = g_generation;
         armedUrl = g_pendingUrl;
         ReleaseSRWLockExclusive(&g_stateLock);
         DbgTrace(L"[FlashIE] SWF MIME armed generation=%llu url=%s\n",
                  generation, armedUrl.c_str());
     } else {
-        DbgTrace(L"[FlashIE] RegisterMimeFilter failed: 0x%08X\n", hr);
+        DbgTrace(L"[FlashIE] Register SWF URLMon handler failed: 0x%08X\n",
+                 hr);
+        if (registeredHandlers & PROTOCOL_HANDLER_FILE)
+            session->UnregisterNameSpace(factory, L"file");
+        if (registeredHandlers & MIME_FILTER_FLASH)
+            session->UnregisterMimeFilter(factory, FLASH_MIME_TYPE);
     }
 
     factory->Release();
@@ -620,7 +685,7 @@ void Cancel()
     g_armed = false;
     g_pendingUrl.clear();
     ReleaseSRWLockExclusive(&g_stateLock);
-    UnregisterFilter();
+    UnregisterHandlers();
     if (wasArmed)
         DbgTrace(L"[FlashIE] SWF MIME canceled\n");
 }
