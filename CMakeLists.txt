@@ -158,10 +158,10 @@ add_dependencies(flashie swc_es5_build)
 # Output filename is always Flash.ocx.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(FLASH_OCX_SOURCE
-        "${CMAKE_SOURCE_DIR}/assets/Flash64${FLASHIE_OCX_SUFFIX}.ocx")
+        "${CMAKE_SOURCE_DIR}/assets/flash/Flash64${FLASHIE_OCX_SUFFIX}.ocx")
 else()
     set(FLASH_OCX_SOURCE
-        "${CMAKE_SOURCE_DIR}/assets/Flash32${FLASHIE_OCX_SUFFIX}.ocx")
+        "${CMAKE_SOURCE_DIR}/assets/flash/Flash32${FLASHIE_OCX_SUFFIX}.ocx")
 endif()
 
 if(NOT EXISTS "${FLASH_OCX_SOURCE}")
