@@ -8,7 +8,11 @@
 
 #include <detours.h>
 #include <jscriptcc/CCPreprocessor.h>
+#include <swc_es5.h>
 
+#include <exception>
+#include <limits>
+#include <memory>
 #include <string>
 #include <string.h>
 #include <stdint.h>
@@ -76,6 +80,11 @@ typedef LSTATUS (WINAPI *FN_RegCloseKey)(HKEY hKey);
 typedef BOOL (WINAPI *FN_DeleteFileA)(LPCSTR lpFileName);
 typedef BOOL (WINAPI *FN_DeleteFileW)(LPCWSTR lpFileName);
 
+typedef DWORD (WINAPI *FN_GetModuleFileNameA)(
+    HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+typedef DWORD (WINAPI *FN_GetModuleFileNameW)(
+    HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+
 // --- Windows Lockdown Policy (WLDP) ---
 
 typedef HRESULT (WINAPI *FN_WldpIsClassInApprovedList)(
@@ -120,6 +129,8 @@ static FN_RegQueryValueExW            s_origRegQueryValueExW = nullptr;
 static FN_RegCloseKey                 s_origRegCloseKey = nullptr;
 static FN_DeleteFileA                 s_origDeleteFileA = nullptr;
 static FN_DeleteFileW                 s_origDeleteFileW = nullptr;
+static FN_GetModuleFileNameA          s_origGetModuleFileNameA = nullptr;
+static FN_GetModuleFileNameW          s_origGetModuleFileNameW = nullptr;
 static FN_CoGetClassObjectFromURL     s_origCoGetClassObjectFromURL = nullptr;
 static FN_WldpIsClassInApprovedList   s_origWldpIsClassInApprovedList = nullptr;
 static FN_WldpQueryDynamicCodeTrust   s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -152,6 +163,8 @@ static void ResetApiHookPointers()
     s_origRegCloseKey = nullptr;
     s_origDeleteFileA = nullptr;
     s_origDeleteFileW = nullptr;
+    s_origGetModuleFileNameA = nullptr;
+    s_origGetModuleFileNameW = nullptr;
     s_origCoGetClassObjectFromURL = nullptr;
     s_origWldpIsClassInApprovedList = nullptr;
     s_origWldpQueryDynamicCodeTrust = nullptr;
@@ -285,7 +298,7 @@ static void MaybeHookFlashQI(IUnknown* pObj);
 static void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 static void MaybeHookFlashQuickActivate(IUnknown* pObj);
-// Forward declaration: hooks IActiveScriptParse::ParseScriptText for JScriptCC preprocessing
+// Forward declaration: hooks ParseScriptText for JScriptCC and SWC processing
 static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj);
 
 class LoggingClassFactory : public IClassFactory {
@@ -472,7 +485,7 @@ HRESULT STDAPICALLTYPE FlashLoader::Hooked_CoCreateInstance(
     }
     HRESULT hr = s_origCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
     DbgTrace(L"[FlashIE] CoCreateInstance({%08X-...}) -> hr=0x%08X\n", rclsid.Data1, hr);
-    // Hook script engine ParseScriptText to preprocess via JScriptCC
+    // Hook script engine ParseScriptText for JScriptCC and SWC processing
     if (SUCCEEDED(hr) && ppv && *ppv)
         MaybeHookScriptParseText(rclsid, static_cast<IUnknown*>(*ppv));
     return hr;
@@ -1381,13 +1394,196 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 // =====================================================================
 // Section 7g: Script Engine ParseScriptText Hook
 //
-// Hooks IActiveScriptParse::ParseScriptText on JScript engines.
-// Script code is preprocessed through JScriptCC's Conditional Compilation
-// engine (@cc_on / @if / @set / @end) before execution. If preprocessing
-// succeeds, the expanded code is passed to the original engine; otherwise
-// the original code is executed unmodified. All errors are reported via
-// DbgTrace (OutputDebugStringW).
+// Hooks IActiveScriptParse::ParseScriptText on both JScript engines. Script
+// code is converted to UTF-8 once, expanded through JScriptCC, then complete
+// classic scripts are transpiled to ES5 through swc-es5-c-api. The final code
+// is converted back to UTF-16 for JScript. Expression-mode calls bypass SWC
+// because its ABI accepts scripts, not expressions. Each stage falls back to
+// the latest valid code, and errors are reported through DbgTrace.
 // =====================================================================
+
+static bool WideToUtf8(const wchar_t* input, std::string& output)
+{
+    output.clear();
+    if (!input)
+        return false;
+
+    // ParseScriptText supplies a NUL-terminated LPCOLESTR. Passing -1 avoids
+    // a separate wcslen scan; the returned size includes the terminator.
+    int outputLength = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, input, -1,
+        nullptr, 0, nullptr, nullptr);
+    if (outputLength <= 0)
+        return false;
+
+    output.resize(static_cast<size_t>(outputLength));
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, input, -1,
+            output.data(), outputLength, nullptr, nullptr) != outputLength) {
+        output.clear();
+        return false;
+    }
+
+    output.pop_back();
+    return true;
+}
+
+static bool Utf8ToWide(const uint8_t* input, size_t inputLength,
+                       std::wstring& output)
+{
+    output.clear();
+    if (inputLength == 0)
+        return true;
+    if (!input ||
+        inputLength > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+
+    int byteLength = static_cast<int>(inputLength);
+    const char* bytes = reinterpret_cast<const char*>(input);
+    int outputLength = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, bytes, byteLength, nullptr, 0);
+    if (outputLength <= 0)
+        return false;
+
+    output.resize(static_cast<size_t>(outputLength));
+    return MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, bytes, byteLength,
+        output.data(), outputLength) == outputLength;
+}
+
+static bool Utf8ToWide(const std::string& input, std::wstring& output)
+{
+    return Utf8ToWide(
+        reinterpret_cast<const uint8_t*>(input.data()), input.size(), output);
+}
+
+static void TraceSwcFailure(swc_es5_status_t status,
+                            const swc_es5_result_t* result)
+{
+    std::wstring diagnostic;
+    if (result && Utf8ToWide(
+            swc_es5_result_error(result),
+            swc_es5_result_error_length(result), diagnostic) &&
+        !diagnostic.empty()) {
+        DbgTrace(L"[FlashIE] SWC ES5 error (status=%u): %s\n",
+                 static_cast<unsigned int>(status), diagnostic.c_str());
+        return;
+    }
+
+    DbgTrace(L"[FlashIE] SWC ES5 failed with status=%u\n",
+             static_cast<unsigned int>(status));
+}
+
+static bool TranspileScriptToEs5(const std::string& input,
+                                 std::string& output)
+{
+    try {
+        swc_es5_compiler_t* rawCompiler = nullptr;
+        swc_es5_status_t status = swc_es5_compiler_create(&rawCompiler);
+        if (status != SWC_ES5_STATUS_OK || !rawCompiler) {
+            TraceSwcFailure(status, nullptr);
+            return false;
+        }
+
+        using CompilerPtr = std::unique_ptr<
+            swc_es5_compiler_t, decltype(&swc_es5_compiler_destroy)>;
+        CompilerPtr compiler(rawCompiler, &swc_es5_compiler_destroy);
+
+        swc_es5_result_t* rawResult = nullptr;
+        const uint8_t* bytes = input.empty()
+            ? nullptr
+            : reinterpret_cast<const uint8_t*>(input.data());
+        status = swc_es5_transform(
+            compiler.get(), bytes, input.size(), &rawResult);
+
+        using ResultPtr = std::unique_ptr<
+            swc_es5_result_t, decltype(&swc_es5_result_destroy)>;
+        ResultPtr result(rawResult, &swc_es5_result_destroy);
+        if (status != SWC_ES5_STATUS_OK || !result) {
+            TraceSwcFailure(status, result.get());
+            return false;
+        }
+
+        const uint8_t* code = swc_es5_result_code(result.get());
+        size_t codeLength = swc_es5_result_code_length(result.get());
+        if (!code && codeLength != 0) {
+            DbgTrace(L"[FlashIE] SWC ES5 returned an invalid code buffer\n");
+            return false;
+        }
+
+        if (codeLength == 0) {
+            output.clear();
+        } else {
+            output.assign(reinterpret_cast<const char*>(code), codeLength);
+        }
+        return true;
+    }
+    catch (const std::exception& ex) {
+        DbgTrace(L"[FlashIE] SWC ES5 C++ failure: %hs\n", ex.what());
+        return false;
+    }
+    catch (...) {
+        DbgTrace(L"[FlashIE] SWC ES5 C++ failure\n");
+        return false;
+    }
+}
+
+static bool ProcessScriptForJScript(LPCOLESTR input, DWORD flags,
+                                    std::wstring& output, bool& usedSwc)
+{
+    usedSwc = false;
+    try {
+        std::string utf8Source;
+        if (!WideToUtf8(input, utf8Source)) {
+            DbgTrace(L"[FlashIE] Script input is not valid UTF-16\n");
+            return false;
+        }
+
+        std::string processed;
+        jscriptcc::CCErrorList errors;
+        jscriptcc::CCPreprocessor preprocessor;
+
+        const auto architecture = sizeof(void*) == 8
+            ? jscriptcc::TargetArchitecture::Win64
+            : jscriptcc::TargetArchitecture::Win32;
+
+        bool ok = preprocessor.process(
+            utf8Source.data(), utf8Source.size(), processed,
+            jscriptcc::CCEnvironment(architecture), &errors);
+
+        for (const auto& err : errors) {
+            DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
+                     err.line, err.column, err.message.c_str());
+        }
+        if (!ok) {
+            DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
+            return false;
+        }
+
+        if (!processed.empty() && !(flags & SCRIPTTEXT_ISEXPRESSION)) {
+            std::string transpiled;
+            if (TranspileScriptToEs5(processed, transpiled)) {
+                processed.swap(transpiled);
+                usedSwc = true;
+            }
+        }
+
+        if (!Utf8ToWide(processed, output)) {
+            DbgTrace(L"[FlashIE] Processed script is not valid UTF-8\n");
+            return false;
+        }
+        return true;
+    }
+    catch (const std::exception& ex) {
+        DbgTrace(L"[FlashIE] Script processing C++ failure: %hs\n", ex.what());
+        return false;
+    }
+    catch (...) {
+        DbgTrace(L"[FlashIE] Script processing C++ failure\n");
+        return false;
+    }
+}
 
 static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
     void* pThis, LPCOLESTR pstrCode, LPCOLESTR pstrItemName,
@@ -1408,59 +1604,21 @@ static HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
     if (!original)
         return E_UNEXPECTED;
 
-    if (pstrCode) {
-        // Convert UTF-16 source to UTF-8 for JScriptCC
-        int codeLen = static_cast<int>(wcslen(pstrCode));
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, nullptr, 0, nullptr, nullptr);
-        if (utf8Len > 0) {
-            std::string utf8Source(utf8Len, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, pstrCode, codeLen, &utf8Source[0], utf8Len, nullptr, nullptr);
-
-            // Run JScriptCC conditional compilation preprocessor
-            std::string preprocessed;
-            jscriptcc::CCErrorList errors;
-            jscriptcc::CCPreprocessor preprocessor;
-
-            const auto architecture = sizeof(void*) == 8
-                ? jscriptcc::TargetArchitecture::Win64
-                : jscriptcc::TargetArchitecture::Win32;
-
-            bool ok = preprocessor.process(
-                utf8Source, preprocessed, jscriptcc::CCEnvironment(architecture), &errors);
-
-            // Report any preprocessing errors
-            for (const auto& err : errors) {
-                DbgTrace(L"[FlashIE] JScriptCC error: line %d col %d: %hs\n",
-                         err.line, err.column, err.message.c_str());
-            }
-
-            if (ok && !preprocessed.empty()) {
-                // Convert preprocessed UTF-8 back to UTF-16
-                int wideLen = MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), nullptr, 0);
-                if (wideLen > 0) {
-                    std::wstring preprocessedWide(wideLen, L'\0');
-                    MultiByteToWideChar(CP_UTF8, 0, preprocessed.c_str(), static_cast<int>(preprocessed.size()), &preprocessedWide[0], wideLen);
-
-                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) begin ===\n");
-                    if (pstrItemName && pstrItemName[0])
-                        DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
-                    DbgTrace(L"[FlashIE]   code: %s\n", preprocessedWide.c_str());
-                    DbgTrace(L"[FlashIE] === ParseScriptText (preprocessed) end ===\n");
-
-                    return original(pThis, preprocessedWide.c_str(), pstrItemName,
-                        punkContext, pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
-                        dwFlags, pvarResult, pexcepinfo);
-                }
-            }
-
-            // Preprocessing failed or produced empty output — fall through to original code
-            if (!ok) {
-                DbgTrace(L"[FlashIE] JScriptCC preprocessing failed, using original code\n");
-            }
-        }
+    std::wstring processedCode;
+    bool usedSwc = false;
+    LPCOLESTR code = pstrCode;
+    if (pstrCode &&
+        ProcessScriptForJScript(pstrCode, dwFlags, processedCode, usedSwc)) {
+        code = processedCode.c_str();
+        DbgTrace(L"[FlashIE] === ParseScriptText (%s) begin ===\n",
+                 usedSwc ? L"SWC ES5" : L"JScriptCC");
+        if (pstrItemName && pstrItemName[0])
+            DbgTrace(L"[FlashIE]   item: %s\n", pstrItemName);
+        DbgTrace(L"[FlashIE]   code: %s\n", code);
+        DbgTrace(L"[FlashIE] === ParseScriptText end ===\n");
     }
 
-    return original(pThis, pstrCode, pstrItemName, punkContext,
+    return original(pThis, code, pstrItemName, punkContext,
         pstrDelimiter, dwSourceContextCookie, ulStartingLineNumber,
         dwFlags, pvarResult, pexcepinfo);
 }
@@ -1517,11 +1675,16 @@ static void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 7h: SharedObject First-Save Compatibility
+// Section 7h: Flash Browser Host Identity
 //
-// The bundled ActiveX player treats a missing old .sol as a failed replace
-// operation. For that one narrowly scoped case, report the deletion as
-// successful so Flash can continue its own .sxx -> .sol commit.
+// Flash ActiveX checks the current process executable name before enabling
+// its browser navigation path. The same unmodified SWF fails under
+// FlashIE.exe but navigates normally when the host is named iexplore.exe;
+// in the failing case, navigateToURL returns before calling IBindHost or
+// URLMon. Report the IE host basename only for calls originating in the
+// local Flash.ocx and only when it queries the current process
+// (hModule == nullptr). Explicit module queries and all non-Flash callers
+// continue to see the real executable path.
 // =====================================================================
 
 static bool IsFlashCaller(void* returnAddress)
@@ -1533,6 +1696,64 @@ static bool IsFlashCaller(void* returnAddress)
     return VirtualQuery(returnAddress, &mbi, sizeof(mbi)) == sizeof(mbi) &&
            mbi.AllocationBase == g_hOcxModule;
 }
+
+static DWORD WINAPI Hooked_GetModuleFileNameW(
+    HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
+{
+    // Flash enables its browser navigation path only for recognized hosts.
+    bool spoofHost = hModule == nullptr && IsFlashCaller(_ReturnAddress());
+    DWORD length = s_origGetModuleFileNameW(hModule, lpFilename, nSize);
+    DWORD originalError = GetLastError();
+    if (!spoofHost || !lpFilename || length == 0 || length >= nSize)
+        return length;
+
+    LPWSTR fileName = PathFindFileNameW(lpFilename);
+    static const wchar_t IE_HOST_NAME[] = L"iexplore.exe";
+    size_t prefixLength = static_cast<size_t>(fileName - lpFilename);
+    size_t hostLength = _countof(IE_HOST_NAME) - 1;
+    size_t resultLength = prefixLength + hostLength;
+    if (resultLength >= nSize) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nSize;
+    }
+
+    memcpy(fileName, IE_HOST_NAME, sizeof(IE_HOST_NAME));
+    SetLastError(originalError);
+    return static_cast<DWORD>(resultLength);
+}
+
+static DWORD WINAPI Hooked_GetModuleFileNameA(
+    HMODULE hModule, LPSTR lpFilename, DWORD nSize)
+{
+    // Keep the real directory so any path-based lookups remain process-local.
+    bool spoofHost = hModule == nullptr && IsFlashCaller(_ReturnAddress());
+    DWORD length = s_origGetModuleFileNameA(hModule, lpFilename, nSize);
+    DWORD originalError = GetLastError();
+    if (!spoofHost || !lpFilename || length == 0 || length >= nSize)
+        return length;
+
+    LPSTR fileName = PathFindFileNameA(lpFilename);
+    static const char IE_HOST_NAME[] = "iexplore.exe";
+    size_t prefixLength = static_cast<size_t>(fileName - lpFilename);
+    size_t hostLength = sizeof(IE_HOST_NAME) - 1;
+    size_t resultLength = prefixLength + hostLength;
+    if (resultLength >= nSize) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nSize;
+    }
+
+    memcpy(fileName, IE_HOST_NAME, sizeof(IE_HOST_NAME));
+    SetLastError(originalError);
+    return static_cast<DWORD>(resultLength);
+}
+
+// =====================================================================
+// Section 7i: SharedObject First-Save Compatibility
+//
+// The bundled ActiveX player treats a missing old .sol as a failed replace
+// operation. For that one narrowly scoped case, report the deletion as
+// successful so Flash can continue its own .sxx -> .sol commit.
+// =====================================================================
 
 static bool HasSolExtension(LPCWSTR path)
 {
@@ -1692,6 +1913,10 @@ bool FlashLoader::InstallHooks()
         ResolveTarget(hKernel32, "DeleteFileA", hKernelBase));
     s_origDeleteFileW = reinterpret_cast<FN_DeleteFileW>(
         ResolveTarget(hKernel32, "DeleteFileW", hKernelBase));
+    s_origGetModuleFileNameA = reinterpret_cast<FN_GetModuleFileNameA>(
+        ResolveTarget(hKernelBase, "GetModuleFileNameA", hKernel32));
+    s_origGetModuleFileNameW = reinterpret_cast<FN_GetModuleFileNameW>(
+        ResolveTarget(hKernelBase, "GetModuleFileNameW", hKernel32));
     s_origCoGetClassObject = reinterpret_cast<FN_CoGetClassObject>(
         ResolveTarget(hCombase, "CoGetClassObject", hOle32));
     s_origCoCreateInstance = reinterpret_cast<FN_CoCreateInstance>(
@@ -1705,6 +1930,7 @@ bool FlashLoader::InstallHooks()
 
     if (!s_origRegOpenKeyExW || !s_origRegQueryValueExW || !s_origRegCloseKey ||
         !s_origDeleteFileA || !s_origDeleteFileW ||
+        !s_origGetModuleFileNameA || !s_origGetModuleFileNameW ||
         !s_origCoGetClassObject || !s_origCoCreateInstance || !s_origCLSIDFromProgID ||
         !s_origCoGetClassObjectFromURL || !s_origLoadRegTypeLib) {
         ResetApiHookPointers();
@@ -1739,6 +1965,8 @@ bool FlashLoader::InstallHooks()
     ATTACH(s_origRegCloseKey,               Hooked_RegCloseKey);
     ATTACH(s_origDeleteFileA,               Hooked_DeleteFileA);
     ATTACH(s_origDeleteFileW,               Hooked_DeleteFileW);
+    ATTACH(s_origGetModuleFileNameA,        Hooked_GetModuleFileNameA);
+    ATTACH(s_origGetModuleFileNameW,        Hooked_GetModuleFileNameW);
     ATTACH(s_origCoGetClassObject,          Hooked_CoGetClassObject);
     ATTACH(s_origCoCreateInstance,          Hooked_CoCreateInstance);
     ATTACH(s_origCLSIDFromProgID,           Hooked_CLSIDFromProgID);
@@ -1810,6 +2038,8 @@ void FlashLoader::Deactivate()
         DETACH(s_origRegCloseKey,                Hooked_RegCloseKey);
         DETACH(s_origDeleteFileA,                Hooked_DeleteFileA);
         DETACH(s_origDeleteFileW,                Hooked_DeleteFileW);
+        DETACH(s_origGetModuleFileNameA,         Hooked_GetModuleFileNameA);
+        DETACH(s_origGetModuleFileNameW,         Hooked_GetModuleFileNameW);
         DETACH(s_origCoGetClassObject,           Hooked_CoGetClassObject);
         DETACH(s_origCoCreateInstance,           Hooked_CoCreateInstance);
         DETACH(s_origCLSIDFromProgID,            Hooked_CLSIDFromProgID);

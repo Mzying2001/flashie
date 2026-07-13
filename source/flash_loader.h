@@ -15,7 +15,7 @@ public:
     bool Activate();
 
     // Phase 2: Atomically install inline hooks (detours) on COM,
-    // registry, file, WLDP, and TypeLib APIs. Force-loads
+    // registry, file, Flash host identity, WLDP, and TypeLib APIs. Force-loads
     // mshtml.dll/urlmon.dll/ieframe.dll and resolves every required
     // target before patching. Returns false without leaving a partial
     // hook set if resolution or the Detours transaction fails. Call

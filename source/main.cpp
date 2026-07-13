@@ -69,8 +69,8 @@ static void OnLoadingStateChange(bool isLoading, void*)
     if (g_hwndRefresh == nullptr || g_hwndStop == nullptr)
         return;
     if (isLoading) {
-        ShowWindow(g_hwndRefresh, SW_HIDE);
         ShowWindow(g_hwndStop, SW_SHOW);
+        ShowWindow(g_hwndRefresh, SW_HIDE);
     } else {
         ShowWindow(g_hwndRefresh, SW_SHOW);
         ShowWindow(g_hwndStop, SW_HIDE);
@@ -243,7 +243,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     UpdateWindow(g_hwndMain);
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         // Address bar keyboard shortcuts
         if (msg.hwnd == g_hwndAddress && msg.message == WM_KEYDOWN) {
             if (msg.wParam == VK_RETURN) {

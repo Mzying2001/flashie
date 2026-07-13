@@ -7,6 +7,8 @@
 #include <exdispid.h>
 #include <mshtmhst.h>
 #include <docobj.h>
+#include <servprov.h>
+#include <urlmon.h>
 
 class COleSite;
 class BrowserHost;
@@ -89,7 +91,9 @@ private:
 // ---------------------------------------------------------------
 class COleSite : public IDocHostUIHandler,
                  public IOleCommandTarget,
-                 public IDispatch
+                 public IDispatch,
+                 public IServiceProvider,
+                 public IInternetSecurityManager
 {
     friend class COleClientSite;
     friend class COleInPlaceSite;
@@ -126,6 +130,22 @@ public:
     // IOleCommandTarget
     STDMETHODIMP QueryStatus(const GUID*, ULONG, OLECMD[], OLECMDTEXT*) override;
     STDMETHODIMP Exec(const GUID*, DWORD, DWORD, VARIANT*, VARIANT*) override;
+
+    // IServiceProvider
+    STDMETHODIMP QueryService(REFGUID guidService, REFIID riid,
+                              void** ppv) override;
+
+    // IInternetSecurityManager
+    STDMETHODIMP SetSecuritySite(IInternetSecurityMgrSite*) override;
+    STDMETHODIMP GetSecuritySite(IInternetSecurityMgrSite**) override;
+    STDMETHODIMP MapUrlToZone(LPCWSTR, DWORD*, DWORD) override;
+    STDMETHODIMP GetSecurityId(LPCWSTR, BYTE*, DWORD*, DWORD_PTR) override;
+    STDMETHODIMP ProcessUrlAction(LPCWSTR, DWORD, BYTE*, DWORD,
+                                  BYTE*, DWORD, DWORD, DWORD) override;
+    STDMETHODIMP QueryCustomPolicy(LPCWSTR, REFGUID, BYTE**, DWORD*,
+                                   BYTE*, DWORD, DWORD) override;
+    STDMETHODIMP SetZoneMapping(DWORD, LPCWSTR, DWORD) override;
+    STDMETHODIMP GetZoneMappings(DWORD, IEnumString**, DWORD) override;
 
     // IDispatch (DWebBrowserEvents2 sink)
     STDMETHODIMP GetTypeInfoCount(UINT*) override;
@@ -195,6 +215,7 @@ private:
     IOleInPlaceActiveObject* m_pIPActiveObj = nullptr;
     HWND                     m_hwndBrowser = nullptr;
     DWORD                    m_dwEventCookie = 0;
+    bool                     m_swfMimeFilterInitialized = false;
 
     NavigateCompleteCallback m_navCallback = nullptr;
     void*                    m_navCtx = nullptr;

@@ -73,4 +73,10 @@ Testing/
 .vscode/
 
 # Code review documents
-code-review/
+/code-review/
+
+# Local investigation notes
+/local-notes/
+
+# Published artifacts
+/publish/
