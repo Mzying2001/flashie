@@ -33,6 +33,59 @@ add_subdirectory(JScriptCC)
 set_target_properties(jscriptcc PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 target_compile_options(jscriptcc PRIVATE /utf-8)
 
+# Build the Rust SWC wrapper for the current MSVC architecture and expose its
+# C ABI as a normal CMake static-library target.
+set(SWC_ES5_SOURCE_DIR "${CMAKE_SOURCE_DIR}/swc-es5-c-api")
+if(NOT EXISTS "${SWC_ES5_SOURCE_DIR}/Cargo.toml")
+    message(FATAL_ERROR
+        "swc-es5-c-api is not initialized. Run: git submodule update --init --recursive")
+endif()
+
+find_program(CARGO_EXECUTABLE NAMES cargo REQUIRED)
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(SWC_ES5_RUST_TARGET "x86_64-win7-windows-msvc")
+else()
+    set(SWC_ES5_RUST_TARGET "i686-win7-windows-msvc")
+endif()
+
+set(SWC_ES5_TARGET_DIR
+    "${SWC_ES5_SOURCE_DIR}/target/${SWC_ES5_RUST_TARGET}")
+set(SWC_ES5_DEBUG_LIBRARY
+    "${SWC_ES5_TARGET_DIR}/debug/swc_es5_c_api.lib")
+set(SWC_ES5_RELEASE_LIBRARY
+    "${SWC_ES5_TARGET_DIR}/release/swc_es5_c_api.lib")
+
+add_custom_target(swc_es5_build
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "RUSTFLAGS=-C target-feature=+crt-static"
+        "${CARGO_EXECUTABLE}" build --locked --lib
+        --target "${SWC_ES5_RUST_TARGET}"
+        -Z "build-std=std,panic_unwind"
+        $<$<NOT:$<CONFIG:Debug>>:--release>
+    WORKING_DIRECTORY "${SWC_ES5_SOURCE_DIR}"
+    COMMENT "Building swc-es5-c-api (${SWC_ES5_RUST_TARGET})"
+    VERBATIM
+    COMMAND_EXPAND_LISTS
+)
+
+add_library(swc_es5 STATIC IMPORTED GLOBAL)
+set_target_properties(swc_es5 PROPERTIES
+    IMPORTED_LOCATION "${SWC_ES5_RELEASE_LIBRARY}"
+    IMPORTED_LOCATION_DEBUG "${SWC_ES5_DEBUG_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${SWC_ES5_SOURCE_DIR}/include"
+)
+
+# Keep this list synchronized with swc-es5-c-api's native-static-libs report.
+target_link_libraries(swc_es5 INTERFACE
+    kernel32
+    legacy_stdio_definitions
+    advapi32
+    ntdll
+    userenv
+    ws2_32
+    dbghelp
+)
 # Microsoft Detours — function hooking library (no CMake support, build manually)
 add_library(detours STATIC
     Detours/src/detours.cpp
@@ -75,10 +128,13 @@ target_compile_definitions(flashie PRIVATE
 
 target_link_options(flashie PRIVATE
     "/SUBSYSTEM:WINDOWS,${FLASHIE_SUBSYSTEM_VERSION}"
+    # rustc's crt-static target emits /DEFAULTLIB:libcmt in Debug as well.
+    "$<$<CONFIG:Debug>:/NODEFAULTLIB:libcmt>"
 )
 
 target_link_libraries(flashie PRIVATE
     jscriptcc
+    swc_es5
     detours
     ole32
     oleaut32
@@ -88,6 +144,8 @@ target_link_libraries(flashie PRIVATE
     comctl32
     urlmon
 )
+
+add_dependencies(flashie swc_es5_build)
 
 # Copy the Flash.ocx matching the target Windows version and architecture.
 # Output filename is always Flash.ocx.
