@@ -9,8 +9,7 @@ A standalone Windows application that runs Adobe Flash content without requiring
 - **No Installation Required** — Bundles Flash.ocx locally; no `regsvr32`, no system-wide Flash installation needed
 - **Zero Registry Pollution** — All API hooks are process-scoped and removed on shutdown; no registry or system-wide COM registration changes are made
 - **Auto-Activation** — Automatically activates Flash content without user clicks, including Flash embedded in iframes
-- **Direct SWF Navigation** — Opens top-level HTTP(S) `.swf` URLs in the browser instead of downloading them, while preserving the original URL, history entry, redirects, and origin
-- **Local SWF Files** — Opens existing `.swf` files from DOS paths, UNC paths, or `file:///` URLs, including paths containing spaces or Unicode characters
+- **Direct SWF Navigation** — Opens top-level HTTP(S) `.swf` URLs and local `.swf` files from DOS, UNC, or `file:///` paths directly in the browser
 
 ## How It Works
 
