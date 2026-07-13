@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(flashie LANGUAGES CXX)
+project(flashie VERSION 1.0.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -103,6 +103,12 @@ target_include_directories(detours PUBLIC Detours/src)
 target_compile_options(detours PRIVATE /W0)
 set_target_properties(detours PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 
+configure_file(
+    source/version.rc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+    @ONLY
+)
+
 add_executable(flashie WIN32
     source/main.cpp
     source/browser.cpp
@@ -110,6 +116,7 @@ add_executable(flashie WIN32
     source/flash.cpp
     source/flash_loader.cpp
     source/app.manifest
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
 )
 
 set_target_properties(flashie PROPERTIES OUTPUT_NAME "FlashIE")
