@@ -7,8 +7,10 @@
 ## 特性
 
 - **无需安装** — 本地附带 Flash.ocx，无需 `regsvr32`，无需系统级 Flash 安装
-- **零注册表污染** — 所有 API 钩子仅作用于当前进程，程序退出时自动移除；不写入注册表、不留下任何痕迹
+- **零注册表污染** — 所有 API 钩子仅作用于当前进程，程序退出时自动移除；不修改注册表，也不进行系统级 COM 注册
 - **自动激活** — 自动激活 Flash 内容，无需用户点击，包括 iframe 中嵌入的 Flash
+- **直接导航到 SWF** — 在浏览器中直接打开顶层 HTTP(S) `.swf` URL，而不是下载文件，并保留原始 URL、历史记录项、重定向关系和文档源（origin）
+- **本地 SWF 文件** — 打开通过 DOS 路径、UNC 路径或 `file:///` URL 指定的现有 `.swf` 文件，支持包含空格或 Unicode 字符的路径
 
 ## 工作原理
 
@@ -16,10 +18,11 @@ FlashIE 使用内联函数钩子（Detour）在进程级别拦截 Windows API �
 
 1. **COM 钩子** — 拦截 `CoGetClassObject`、`CoCreateInstance` 等函数，将 Flash CLSID 请求重定向到本地附带的 Flash.ocx
 2. **注册表钩子** — 在内存中伪造 Flash 注册表项（CLSID、InprocServer32、TypeLib、ProgID、MIME 类型）——**不会向实际注册表写入任何内容**
-3. **安全钩子** — 通过 `WldpIsClassInApprovedList` 和 `CoInternetIsFeatureEnabled` 批准 Flash，绕过 Windows 10+ 的限制
+3. **安全钩子** — 通过 `WldpIsClassInApprovedList` 和 `WldpQueryDynamicCodeTrust`，仅批准 Flash CLSID 和程序附带的 Flash.ocx 映像
 4. **激活钩子** — 钩子 `IOleObject::SetClientSite` 和 `IQuickActivate::QuickActivate` 虚表，通过合并定时器强制 Flash 就地激活
+5. **直接 SWF URLMon 处理** — 使用临时的进程内 URLMon 处理器，将顶层 HTTP(S) 和本地 SWF 导航显示为全窗口 Flash 内容，同时保持原始导航 URL 不变
 
-所有钩子在进程初始化后安装，在程序退出时干净移除。**不会对注册表产生任何持久性更改。**
+API 钩子在进程初始化后安装，并在程序退出时移除。临时 URLMon 处理器会在一次导航被接管或放弃后立即移除，程序退出时还会执行最终清理。**不会对注册表产生任何持久性更改。**
 
 ## 构建
 
@@ -62,7 +65,12 @@ cmake --build build-win7-x64 --config Release
 
 ```powershell
 FlashIE.exe "https://example.com/flash.html"
+FlashIE.exe "https://example.com/movie.swf"
+FlashIE.exe "C:\Games\Flash\movie.swf"
+FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 ```
+
+直接本地导航支持以绝对 DOS 路径、UNC 路径或 `file:///` URL 指定的现有 `.swf` 文件。对于直接 HTTP(S) SWF 导航，初始请求的 URL 路径必须以 `.swf` 结尾，并且服务器最终响应的 MIME 类型必须为 `application/x-shockwave-flash`；支持 HTTP 重定向，而以其他下载 MIME 类型返回的响应仍采用 IE 原生下载行为。直接转换仅应用于顶层导航，不会覆盖网页对其嵌入 Flash 对象的配置。
 
 ## 项目结构
 
@@ -70,6 +78,7 @@ FlashIE.exe "https://example.com/flash.html"
 flashie/
 ├── source/
 │   ├── flash_loader.h/cpp    # API 钩子引擎（COM、注册表、安全、TypeLib 钩子）
+│   ├── swf_mime_filter.h/cpp # 直接处理 HTTP(S) 和本地 SWF 的 URLMon 逻辑
 │   ├── browser.h/cpp         # IE WebBrowser 控件的 OLE 容器
 │   ├── flash.h/cpp           # MIDL 生成的 Flash COM 接口定义
 │   ├── main.cpp              # Win32 窗口、工具栏和初始化
