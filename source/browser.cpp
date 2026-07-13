@@ -1,4 +1,38 @@
 #include "browser.h"
+#include "swf_mime_filter.h"
+
+static bool IsTopLevelBrowserEvent(
+    IDispatch* eventDispatch, IWebBrowser2* browser)
+{
+    IUnknown* eventIdentity = nullptr;
+    IUnknown* browserIdentity = nullptr;
+    if (eventDispatch)
+        eventDispatch->QueryInterface(
+            IID_IUnknown, reinterpret_cast<void**>(&eventIdentity));
+    if (browser)
+        browser->QueryInterface(
+            IID_IUnknown, reinterpret_cast<void**>(&browserIdentity));
+
+    bool isTopLevel = eventIdentity && eventIdentity == browserIdentity;
+    if (eventIdentity) eventIdentity->Release();
+    if (browserIdentity) browserIdentity->Release();
+    return isTopLevel;
+}
+
+static const wchar_t* GetVariantString(VARIANT* value)
+{
+    if (!value)
+        return nullptr;
+    if (value->vt == (VT_VARIANT | VT_BYREF))
+        value = value->pvarVal;
+    if (!value)
+        return nullptr;
+    if (value->vt == VT_BSTR)
+        return value->bstrVal;
+    if (value->vt == (VT_BSTR | VT_BYREF) && value->pbstrVal)
+        return *value->pbstrVal;
+    return nullptr;
+}
 
 // ===============================================================
 // COleClientSite
@@ -223,21 +257,34 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         }
         return S_OK;
 
+    case DISPID_BEFORENAVIGATE2: {
+        // Params (reverse): URL=[5], pDisp=[6]. Arm the process-local MIME
+        // filter for a top-level SWF but let the original navigation proceed.
+        if (pDispParams->cArgs >= 7 && m_pBrowserHost) {
+            IDispatch* eventDispatch = pDispParams->rgvarg[6].pdispVal;
+            if (IsTopLevelBrowserEvent(
+                    eventDispatch, m_pBrowserHost->m_pWebBrowser)) {
+                const wchar_t* url = GetVariantString(
+                    &pDispParams->rgvarg[5]);
+                if (SwfMimeFilter::IsHttpSwfUrl(url))
+                    SwfMimeFilter::Arm(url);
+                else
+                    SwfMimeFilter::Cancel();
+            }
+        }
+        return S_OK;
+    }
+
     case DISPID_NAVIGATECOMPLETE2: {
         // rgvarg[1] = pDisp (IDispatch of the frame), rgvarg[0] = URL
         if (pDispParams->cArgs >= 2 && m_pBrowserHost) {
             // Only process top-level frame navigations
             IDispatch* pEventDisp = pDispParams->rgvarg[1].pdispVal;
-            IUnknown* pEventUnk = nullptr;
-            IUnknown* pBrowserUnk = nullptr;
-            bool isTopLevel = false;
-            if (pEventDisp)
-                pEventDisp->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&pEventUnk));
-            if (m_pBrowserHost->m_pWebBrowser)
-                m_pBrowserHost->m_pWebBrowser->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&pBrowserUnk));
-            isTopLevel = (pEventUnk && pEventUnk == pBrowserUnk);
-            if (pEventUnk) pEventUnk->Release();
-            if (pBrowserUnk) pBrowserUnk->Release();
+            bool isTopLevel = IsTopLevelBrowserEvent(
+                pEventDisp, m_pBrowserHost->m_pWebBrowser);
+
+            if (isTopLevel && SwfMimeFilter::IsArmed())
+                SwfMimeFilter::Cancel();
 
             if (isTopLevel && m_pBrowserHost->m_navCallback) {
                 VARIANT* pURL = &pDispParams->rgvarg[0];
@@ -249,6 +296,26 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         }
         return S_OK;
     }
+
+    case DISPID_NAVIGATEERROR: {
+        // Params (reverse): Cancel=[0], StatusCode=[1], Frame=[2],
+        // URL=[3], pDisp=[4]. A failed top-level navigation must not leave
+        // the one-shot MIME filter armed for an unrelated future request.
+        if (pDispParams->cArgs >= 5 && m_pBrowserHost &&
+            IsTopLevelBrowserEvent(
+                pDispParams->rgvarg[4].pdispVal,
+                m_pBrowserHost->m_pWebBrowser)) {
+            SwfMimeFilter::Cancel();
+        }
+        return S_OK;
+    }
+
+    case DISPID_FILEDOWNLOAD:
+        // If URLMon elected to download, it did not consume our MIME filter.
+        // Keep the native dialog as a fallback, but clear the pending filter.
+        if (SwfMimeFilter::IsArmed())
+            SwfMimeFilter::Cancel();
+        return S_OK;
 
     case DISPID_TITLECHANGE: {
         if (pDispParams->cArgs >= 1 && m_pBrowserHost && m_pBrowserHost->m_titleCallback) {
@@ -324,6 +391,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
 
 bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 {
+    m_swfMimeFilterInitialized = SwfMimeFilter::Initialize();
+
     m_pSite = new COleSite();
     m_pSite->m_hWnd = hwndParent;
     m_pSite->m_rcPos = rc;
@@ -382,6 +451,8 @@ void BrowserHost::Navigate(const wchar_t* url)
 {
     if (!m_pWebBrowser) return;
 
+    SwfMimeFilter::Cancel();
+
     VARIANT vURL;
     VariantInit(&vURL);
     vURL.vt = VT_BSTR;
@@ -392,10 +463,39 @@ void BrowserHost::Navigate(const wchar_t* url)
     VariantClear(&vURL);
 }
 
-void BrowserHost::GoBack()    { if (m_pWebBrowser) m_pWebBrowser->GoBack(); }
-void BrowserHost::GoForward() { if (m_pWebBrowser) m_pWebBrowser->GoForward(); }
-void BrowserHost::Refresh()   { if (m_pWebBrowser) m_pWebBrowser->Refresh(); }
-void BrowserHost::Stop()      { if (m_pWebBrowser) m_pWebBrowser->Stop(); }
+void BrowserHost::GoBack()
+{
+    SwfMimeFilter::Cancel();
+    if (m_pWebBrowser) m_pWebBrowser->GoBack();
+}
+
+void BrowserHost::GoForward()
+{
+    SwfMimeFilter::Cancel();
+    if (m_pWebBrowser) m_pWebBrowser->GoForward();
+}
+
+void BrowserHost::Refresh()
+{
+    if (!m_pWebBrowser)
+        return;
+
+    BSTR location = nullptr;
+    if (SUCCEEDED(m_pWebBrowser->get_LocationURL(&location)) && location &&
+        SwfMimeFilter::IsHttpSwfUrl(location)) {
+        SwfMimeFilter::Arm(location);
+    } else {
+        SwfMimeFilter::Cancel();
+    }
+    SysFreeString(location);
+    m_pWebBrowser->Refresh();
+}
+
+void BrowserHost::Stop()
+{
+    SwfMimeFilter::Cancel();
+    if (m_pWebBrowser) m_pWebBrowser->Stop();
+}
 
 void BrowserHost::Resize(const RECT& rc)
 {
@@ -452,6 +552,7 @@ void BrowserHost::DisconnectEvents()
 
 void BrowserHost::Destroy()
 {
+    SwfMimeFilter::Cancel();
     m_hwndBrowser = nullptr;
     DisconnectEvents();
 
@@ -480,5 +581,10 @@ void BrowserHost::Destroy()
         m_pSite->m_pBrowserHost = nullptr;
         m_pSite->Release();
         m_pSite = nullptr;
+    }
+
+    if (m_swfMimeFilterInitialized) {
+        SwfMimeFilter::Shutdown();
+        m_swfMimeFilterInitialized = false;
     }
 }

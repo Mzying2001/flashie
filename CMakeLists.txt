@@ -53,6 +53,7 @@ set_target_properties(detours PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNT
 add_executable(flashie WIN32
     source/main.cpp
     source/browser.cpp
+    source/swf_mime_filter.cpp
     source/flash.cpp
     source/flash_loader.cpp
     source/app.manifest
