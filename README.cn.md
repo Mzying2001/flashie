@@ -80,27 +80,6 @@ FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 
 直接本地导航支持以绝对 DOS 路径、UNC 路径或 `file:///` URL 指定的现有 `.swf` 文件。对于直接 HTTP(S) SWF 导航，初始请求的 URL 路径必须以 `.swf` 结尾，并且服务器最终响应的 MIME 类型必须为 `application/x-shockwave-flash`；支持 HTTP 重定向，而以其他下载 MIME 类型返回的响应仍采用 IE 原生下载行为。直接转换仅应用于顶层导航，不会覆盖网页对其嵌入 Flash 对象的配置。
 
-## 项目结构
-
-```
-flashie/
-├── source/
-│   ├── flash_loader.h/cpp    # API 钩子引擎（COM、注册表、安全、TypeLib 钩子）
-│   ├── swf_mime_filter.h/cpp # 直接处理 HTTP(S) 和本地 SWF 的 URLMon 逻辑
-│   ├── browser.h/cpp         # IE WebBrowser 控件的 OLE 容器
-│   ├── flash.h/cpp           # MIDL 生成的 Flash COM 接口定义
-│   ├── main.cpp              # Win32 窗口、工具栏和初始化
-│   ├── debug.h               # 调试输出宏
-│   └── app.manifest          # 免注册 COM 清单
-├── assets/
-│   ├── Flash32.ocx           # 32 位 Flash Player ActiveX 控件
-│   ├── Flash64.ocx           # 64 位 Flash Player ActiveX 控件
-│   ├── Flash32_Win7.ocx      # 兼容 Windows 7 及更早系统的 32 位控件
-│   ├── Flash64_Win7.ocx      # 兼容 Windows 7 及更早系统的 64 位控件
-├── CMakeLists.txt            # 构建配置
-└── AGENTS.md                 # 架构文档
-```
-
 ## 许可证
 
 MIT License

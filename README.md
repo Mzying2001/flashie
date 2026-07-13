@@ -80,27 +80,6 @@ FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 
 Direct local navigation accepts existing `.swf` files specified as absolute DOS paths, UNC paths, or `file:///` URLs. For direct HTTP(S) SWF navigation, the initially requested URL path must end in `.swf` and the server's final response must return `application/x-shockwave-flash`; HTTP redirects remain supported, while responses advertised as unrelated download MIME types retain IE's native download behavior. Direct conversion applies only to the top-level navigation and does not override how web pages configure their embedded Flash objects.
 
-## Project Structure
-
-```
-flashie/
-├── source/
-│   ├── flash_loader.h/cpp    # API hooking engine (COM, registry, security, TypeLib hooks)
-│   ├── swf_mime_filter.h/cpp # Direct HTTP(S) and local SWF URLMon handling
-│   ├── browser.h/cpp         # OLE container for IE WebBrowser control
-│   ├── flash.h/cpp           # MIDL-generated Flash COM interface definitions
-│   ├── main.cpp              # Win32 window, toolbar, and initialization
-│   ├── debug.h               # Debug output macro
-│   └── app.manifest          # Registration-free COM manifest
-├── assets/
-│   ├── Flash32.ocx           # 32-bit Flash Player ActiveX control
-│   ├── Flash64.ocx           # 64-bit Flash Player ActiveX control
-│   ├── Flash32_Win7.ocx      # 32-bit Windows 7-and-earlier control
-│   ├── Flash64_Win7.ocx      # 64-bit Windows 7-and-earlier control
-├── CMakeLists.txt            # Build configuration
-└── AGENTS.md                 # Architecture documentation
-```
-
 ## License
 
 MIT License
