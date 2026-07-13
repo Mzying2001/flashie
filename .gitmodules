@@ -1,6 +1,9 @@
-[submodule "JScriptCC"]
-	path = JScriptCC
-	url = https://github.com/Mzying2001/JScriptCC.git
 [submodule "Detours"]
 	path = Detours
 	url = https://github.com/microsoft/Detours.git
+[submodule "JScriptCC"]
+	path = JScriptCC
+	url = https://github.com/Mzying2001/JScriptCC.git
+[submodule "swc-es5-c-api"]
+	path = swc-es5-c-api
+	url = https://github.com/Mzying2001/swc-es5-c-api.git
