@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <!-- The 16 px silhouette is retained as the visual anchor. -->
+  <g transform="scale(2)">
+    <path fill="#9A4E09" d="M5 1h5v1H5zM3 2h2v1H3zM10 2h2v1h-2zM2 3h2v1H2zM12 3h2v1h-2zM1 4h2v2H1zM14 4h1v2h-1zM0 6h2v3H0zM15 6h1v3h-1z"/>
+    <path fill="#F6A81A" d="M6 1h3v1H6zM4 2h1v1H4zM11 2h1v1h-1zM2 3h1v1H2zM13 3h1v1h-1zM1 4h1v2H1zM14 5h1v1h-1zM0 7h1v2H0zM15 6h1v2h-1z"/>
+  </g>
+
+  <!-- One-pixel orbit highlights become available at 32 px. -->
+  <path fill="#FFD45A" d="M12 2h6v1h-6zM8 4h2v1H8zM4 6h2v1H4zM2 8h1v4H2zM0 14h1v4H0zM30 12h1v4h-1zM28 10h1v2h-1zM26 6h1v2h-1z"/>
+  <path fill="#693505" d="M10 3h10v1H10zM6 5h4v1H6zM20 5h4v1h-4zM2 11h4v1H2zM28 11h2v1h-2zM0 17h4v1H0zM30 16h2v2h-2z"/>
+
+  <!-- Lowercase e: a dark pixel outline, blue body, and cyan face. -->
+  <g transform="scale(2)">
+    <path fill="#064E86" d="M6 3h5v1H6zM4 4h9v1H4zM3 5h11v1H3zM2 6h4v1H2zM10 6h4v1h-4zM2 7h11v1H2zM1 8h13v1H1zM2 9h12v1H2zM2 10h4v1H2zM3 11h4v1H3zM11 11h3v1h-3zM4 12h9v1H4zM6 13h5v1H6z"/>
+    <path fill="#168FD0" d="M6 4h5v1H6zM5 5h7v1H5zM4 6h2v1H4zM10 6h2v1h-2zM4 7h7v1H4zM3 8h9v1H3zM4 9h8v1H4zM4 10h2v1H4zM5 11h2v1H5zM11 11h1v1h-1zM6 12h5v1H6z"/>
+    <path fill="#5BC8F2" d="M6 4h3v1H6zM5 5h2v1H5zM4 6h1v1H4zM4 7h4v1H4zM3 8h5v1H3zM4 9h2v1H4zM4 10h1v1H4zM5 11h1v1H5z"/>
+  </g>
+
+  <!-- Finer stair-steps and a restrained bevel keep the larger icon crisp. -->
+  <path fill="#043A67" d="M11 7h1v1h-1zM22 7h1v1h-1zM7 9h1v1H7zM26 9h1v1h-1zM5 11h1v1H5zM28 11h1v1h-1zM3 13h1v1H3zM28 13h1v1h-1zM1 17h1v1H1zM28 19h1v1h-1zM5 23h1v1H5zM28 23h1v1h-1zM7 25h1v1H7zM26 25h1v1h-1zM11 27h1v1h-1zM22 27h1v1h-1z"/>
+  <path fill="#0B72B2" d="M18 9h4v1h-4zM14 11h10v1H14zM10 13h2v1h-2zM22 13h2v1h-2zM16 15h6v1h-6zM16 17h8v1h-8zM12 19h12v1H12zM10 21h2v1h-2zM12 23h2v1h-2zM22 23h2v1h-2zM18 25h4v1h-4z"/>
+  <path fill="#A8E8FA" d="M12 8h5v1h-5zM10 10h3v1h-3zM8 12h1v2H8zM8 14h7v1H8zM6 16h9v1H6zM8 18h3v1H8zM8 20h1v1H8zM10 22h1v1h-1z"/>
+  <path fill="#D8F7FF" d="M12 8h2v1h-2zM8 14h2v1H8zM6 16h2v1H6z"/>
+
+  <!-- Smooth the right end of the middle stroke at this larger size. -->
+  <path fill="#064E86" d="M26 14h1v2h-1z"/>
+  <path fill="#043A67" d="M27 14h1v2h-1z"/>
+
+  <!-- Foreground orbit passes below the bowl rather than hiding the e. -->
+  <g transform="scale(2)">
+    <path fill="#9A4E09" d="M14 9h2v1h-2zM14 10h2v1h-2zM13 11h3v1h-3zM12 12h3v1h-3zM10 13h4v1h-4zM4 14h8v1H4zM2 13h4v1H2zM0 12h3v1H0z"/>
+    <path fill="#F6A81A" d="M14 9h1v1h-1zM14 10h1v1h-1zM13 11h2v1h-2zM12 12h2v1h-2zM10 13h3v1h-3zM5 14h5v1H5zM2 13h3v1H2zM1 12h1v1H1z"/>
+  </g>
+  <path fill="#FFD45A" d="M28 18h2v1h-2zM28 20h2v1h-2zM26 22h4v1h-4zM24 24h4v1h-4zM20 26h6v1h-6zM10 28h10v1H10zM4 26h6v1H4zM2 24h2v1H2z"/>
+  <path fill="#693505" d="M30 19h2v1h-2zM30 21h2v1h-2zM28 23h4v1h-4zM26 25h4v1h-4zM20 27h8v1h-8zM8 29h16v1H8zM4 27h8v1H4zM0 25h6v1H0z"/>
+</svg>

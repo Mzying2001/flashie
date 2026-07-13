@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" shape-rendering="crispEdges">
+  <!-- Preserve the approved 32 px silhouette and palette at double scale. -->
+  <g transform="scale(2)">
+    <g transform="scale(2)">
+      <path fill="#9A4E09" d="M5 1h5v1H5zM3 2h2v1H3zM10 2h2v1h-2zM2 3h2v1H2zM12 3h2v1h-2zM1 4h2v2H1zM14 4h1v2h-1zM0 6h2v3H0zM15 6h1v3h-1z"/>
+      <path fill="#F6A81A" d="M6 1h3v1H6zM4 2h1v1H4zM11 2h1v1h-1zM2 3h1v1H2zM13 3h1v1h-1zM1 4h1v2H1zM14 5h1v1h-1zM0 7h1v2H0zM15 6h1v2h-1z"/>
+    </g>
+    <path fill="#FFD45A" d="M12 2h6v1h-6zM8 4h2v1H8zM4 6h2v1H4zM2 8h1v4H2zM0 14h1v4H0zM30 12h1v4h-1zM28 10h1v2h-1zM26 6h1v2h-1z"/>
+    <path fill="#693505" d="M10 3h10v1H10zM6 5h4v1H6zM20 5h4v1h-4zM2 11h4v1H2zM28 11h2v1h-2zM0 17h4v1H0zM30 16h2v2h-2z"/>
+  </g>
+
+  <!-- Extra orbit tones use the native 64 px grid. -->
+  <path fill="#FFF0A3" d="M26 4h8v1h-8zM18 8h2v1h-2zM10 12h2v1h-2zM4 16h1v7H4zM0 29h1v6H0zM60 25h1v6h-1zM56 21h1v3h-1zM52 13h1v3h-1z"/>
+  <path fill="#D8790B" d="M36 4h4v1h-4zM20 7h20v1H20zM12 11h8v1h-8zM40 11h8v1h-8zM4 22h8v2H4zM56 22h4v2h-4zM0 34h8v2H0zM60 32h4v4h-4z"/>
+  <path fill="#402002" d="M20 6h20v1H20zM12 10h8v1h-8zM40 10h8v1h-8zM4 23h8v1H4zM56 23h4v1h-4zM0 35h8v1H0zM60 34h4v2h-4z"/>
+
+  <!-- Lowercase e, inherited from the 32 px artwork. -->
+  <g transform="scale(2)">
+    <g transform="scale(2)">
+      <path fill="#064E86" d="M6 3h5v1H6zM4 4h9v1H4zM3 5h11v1H3zM2 6h4v1H2zM10 6h4v1h-4zM2 7h11v1H2zM1 8h13v1H1zM2 9h12v1H2zM2 10h4v1H2zM3 11h4v1H3zM11 11h3v1h-3zM4 12h9v1H4zM6 13h5v1H6z"/>
+      <path fill="#168FD0" d="M6 4h5v1H6zM5 5h7v1H5zM4 6h2v1H4zM10 6h2v1h-2zM4 7h7v1H4zM3 8h9v1H3zM4 9h8v1H4zM4 10h2v1H4zM5 11h2v1H5zM11 11h1v1h-1zM6 12h5v1H6z"/>
+      <path fill="#5BC8F2" d="M6 4h3v1H6zM5 5h2v1H5zM4 6h1v1H4zM4 7h4v1H4zM3 8h5v1H3zM4 9h2v1H4zM4 10h1v1H4zM5 11h1v1H5z"/>
+    </g>
+    <path fill="#043A67" d="M11 7h1v1h-1zM22 7h1v1h-1zM7 9h1v1H7zM26 9h1v1h-1zM5 11h1v1H5zM28 11h1v1h-1zM3 13h1v1H3zM28 13h1v1h-1zM1 17h1v1H1zM28 19h1v1h-1zM5 23h1v1H5zM28 23h1v1h-1zM7 25h1v1H7zM26 25h1v1h-1zM11 27h1v1h-1zM22 27h1v1h-1z"/>
+    <path fill="#0B72B2" d="M18 9h4v1h-4zM14 11h10v1H14zM10 13h2v1h-2zM22 13h2v1h-2zM16 15h6v1h-6zM16 17h8v1h-8zM12 19h12v1H12zM10 21h2v1h-2zM12 23h2v1h-2zM22 23h2v1h-2zM18 25h4v1h-4z"/>
+    <path fill="#A8E8FA" d="M12 8h5v1h-5zM10 10h3v1h-3zM8 12h1v2H8zM8 14h7v1H8zM6 16h9v1H6zM8 18h3v1H8zM8 20h1v1H8zM10 22h1v1h-1z"/>
+    <path fill="#D8F7FF" d="M12 8h2v1h-2zM8 14h2v1H8zM6 16h2v1H6z"/>
+  </g>
+
+  <!-- Native 64 px contour steps and surface transitions. -->
+  <path fill="#021E38" d="M21 15h1v1h-1zM46 15h1v1h-1zM13 19h1v1h-1zM54 19h1v1h-1zM9 23h1v1H9zM58 23h1v1h-1zM5 27h1v1H5zM58 27h1v1h-1zM1 35h1v1H1zM58 39h1v1h-1zM9 47h1v1H9zM58 47h1v1h-1zM13 51h1v1h-1zM54 51h1v1h-1zM21 55h1v1h-1zM46 55h1v1h-1z"/>
+  <path fill="#07588F" d="M36 19h8v1h-8zM28 23h20v1H28zM20 27h4v1h-4zM44 27h4v1h-4zM32 31h12v1H32zM32 35h16v1H32zM24 39h24v1H24zM20 43h4v1h-4zM24 47h4v1h-4zM44 47h4v1h-4zM36 51h8v1h-8z"/>
+  <path fill="#35B4E8" d="M34 18h2v1h-2zM26 22h2v1h-2zM18 26h2v1h-2zM30 30h2v1h-2zM30 34h2v1h-2zM22 38h2v1h-2zM18 42h2v1h-2zM22 46h2v1h-2zM34 50h2v1h-2z"/>
+  <path fill="#F0FCFF" d="M24 16h5v1h-5zM20 20h4v1h-4zM16 24h1v4h-1zM16 28h10v1H16zM12 32h12v1H12zM16 36h5v1h-5zM16 40h1v2h-1zM20 44h2v1h-2z"/>
+  <path fill="#FFFFFF" d="M24 16h2v1h-2zM16 28h3v1h-3zM12 32h3v1h-3z"/>
+
+  <!-- The middle stroke gets a native 64 px staircase instead of a scaled notch. -->
+  <path fill="#064E86" d="M52 28h5v2h-5zM52 30h4v1h-4zM52 31h3v1h-3z"/>
+  <path fill="#043A67" d="M57 28h1v2h-1zM56 30h1v1h-1zM55 31h1v1h-1z"/>
+
+  <!-- Foreground orbit remains below the lower bowl. -->
+  <g transform="scale(2)">
+    <g transform="scale(2)">
+      <path fill="#9A4E09" d="M14 9h2v1h-2zM14 10h2v1h-2zM13 11h3v1h-3zM12 12h3v1h-3zM10 13h4v1h-4zM4 14h8v1H4zM2 13h4v1H2zM0 12h3v1H0z"/>
+      <path fill="#F6A81A" d="M14 9h1v1h-1zM14 10h1v1h-1zM13 11h2v1h-2zM12 12h2v1h-2zM10 13h3v1h-3zM5 14h5v1H5zM2 13h3v1H2zM1 12h1v1H1z"/>
+    </g>
+    <path fill="#FFD45A" d="M28 18h2v1h-2zM28 20h2v1h-2zM26 22h4v1h-4zM24 24h4v1h-4zM20 26h6v1h-6zM10 28h10v1H10zM4 26h6v1H4zM2 24h2v1H2z"/>
+    <path fill="#693505" d="M30 19h2v1h-2zM30 21h2v1h-2zM28 23h4v1h-4zM26 25h4v1h-4zM20 27h8v1h-8zM8 29h16v1H8zM4 27h8v1H4zM0 25h6v1H0z"/>
+  </g>
+  <path fill="#FFF0A3" d="M57 36h3v1h-3zM57 40h3v1h-3zM53 44h7v1h-7zM49 48h7v1h-7zM41 52h11v1H41zM21 56h18v1H21zM9 52h11v1H9zM4 48h3v1H4z"/>
+  <path fill="#D8790B" d="M60 38h4v2h-4zM60 42h4v2h-4zM56 46h8v2h-8zM52 50h8v2h-8zM40 54h16v2H40zM16 58h32v2H16zM8 54h16v2H8zM0 50h12v2H0z"/>
+  <path fill="#402002" d="M62 39h2v1h-2zM62 43h2v1h-2zM60 47h4v1h-4zM56 51h4v1h-4zM48 55h8v1h-8zM16 59h32v1H16zM8 55h16v1H8zM0 51h12v1H0z"/>
+</svg>
