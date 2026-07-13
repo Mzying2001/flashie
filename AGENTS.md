@@ -85,7 +85,8 @@ Five source files, five headers, plus three submodule dependencies:
 
 - **`assets/flash/Flash32.ocx`** / **`assets/flash/Flash64.ocx`** — Pre-patched Flash Player ActiveX (32-bit / 64-bit).
 - **`assets/flash/Flash32_Win7.ocx`** / **`assets/flash/Flash64_Win7.ocx`** — Flash Player ActiveX for Windows 7 and earlier (32-bit / 64-bit), selected with `-DFLASHIE_WINDOWS_TARGET=WIN7`. These controls have rendering problems on newer Windows versions.
-- **`assets/icons/`** — Pixel-art application icon sources in 16×16, 32×32, and 64×64 SVG variants.
+- **`assets/icons/flashie.ico`** — Pixel-art application icon containing 16×16, 32×32, and 64×64 images.
+- **`assets/icons/flashie-icon-16.svg`**, **`flashie-icon-32.svg`**, and **`flashie-icon-64.svg`** — Editable pixel-art source images for the corresponding icon sizes.
 
 ## Core Requirement: Zero Registry Pollution
 
