@@ -67,6 +67,7 @@ Five source files, five headers, plus three submodule dependencies:
 - **`source/browser.h/.cpp`** — `BrowserHost` and OLE site classes (`COleSite`, `COleClientSite`, `COleInPlaceSite`, `COleInPlaceFrame`). Implements the standard OLE container interfaces needed to host an `IWebBrowser2` (IE) control in-process. `COleSite` implements:
   - `IDocHostUIHandler` — disables 3D border (`DOCHOSTUIFLAG_NO3DBORDER`).
   - `IOleCommandTarget` — suppresses script error dialogs (`OLECMDID_SHOWSCRIPTERROR`).
+  - `IServiceProvider` / `IInternetSecurityManager` — returns `URLPOLICY_ALLOW` only for `URLACTION_HTML_MIXED_CONTENT`, so legacy HTTP subresources on HTTPS pages load without the IE mixed-content dialog. Every other URL security action uses IE's default policy, and no Internet Options registry setting is changed.
   - `IDispatch` — `DWebBrowserEvents2` event sink. `BeforeNavigate2` arms direct SWF handling only for the top-level browser identity. `NavigateComplete2`, `NavigateError`, and `FileDownload` clear unconsumed one-shot handlers. It also handles loading state, title/status changes, and NewWindow2/NewWindow3 (redirects new windows to the same browser).
   - `DISPID_AMBIENT_DLCONTROL` ambient property — allows content downloads but blocks ActiveX CAB downloads via `DLCTL_NO_DLACTIVEXCTLS`.
   - Back, Forward, Stop, and ordinary Navigate calls cancel pending SWF handling before starting another operation. Refresh re-arms a supported direct SWF URL before calling `IWebBrowser2::Refresh()`.

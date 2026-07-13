@@ -169,6 +169,10 @@ STDMETHODIMP COleSite::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IOleCommandTarget*>(this);
     } else if (riid == IID_IDispatch || riid == DIID_DWebBrowserEvents2) {
         *ppv = static_cast<IDispatch*>(this);
+    } else if (riid == IID_IServiceProvider) {
+        *ppv = static_cast<IServiceProvider*>(this);
+    } else if (riid == IID_IInternetSecurityManager) {
+        *ppv = static_cast<IInternetSecurityManager*>(this);
     } else {
         *ppv = nullptr;
         return E_NOINTERFACE;
@@ -223,6 +227,74 @@ STDMETHODIMP COleSite::Exec(const GUID* pguidCmdGroup, DWORD nCmdID, DWORD,
         return S_OK;
     }
     return OLECMDERR_E_NOTSUPPORTED;
+}
+
+// IServiceProvider / IInternetSecurityManager
+STDMETHODIMP COleSite::QueryService(
+    REFGUID guidService, REFIID riid, void** ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+    *ppv = nullptr;
+
+    if (guidService == SID_SInternetSecurityManager &&
+        riid == IID_IInternetSecurityManager) {
+        return QueryInterface(riid, ppv);
+    }
+    return E_NOINTERFACE;
+}
+
+STDMETHODIMP COleSite::SetSecuritySite(IInternetSecurityMgrSite*)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::GetSecuritySite(IInternetSecurityMgrSite**)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::MapUrlToZone(LPCWSTR, DWORD*, DWORD)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::GetSecurityId(LPCWSTR, BYTE*, DWORD*, DWORD_PTR)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::ProcessUrlAction(
+    LPCWSTR, DWORD action, BYTE* policy, DWORD policySize,
+    BYTE*, DWORD, DWORD, DWORD)
+{
+    if (action != URLACTION_HTML_MIXED_CONTENT)
+        return INET_E_DEFAULT_ACTION;
+    if (!policy)
+        return E_POINTER;
+    if (policySize < sizeof(DWORD))
+        return E_INVALIDARG;
+
+    // Display insecure subresources without IE's mixed-content prompt.
+    const DWORD allow = URLPOLICY_ALLOW;
+    CopyMemory(policy, &allow, sizeof(allow));
+    return S_OK;
+}
+
+STDMETHODIMP COleSite::QueryCustomPolicy(
+    LPCWSTR, REFGUID, BYTE**, DWORD*, BYTE*, DWORD, DWORD)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::SetZoneMapping(DWORD, LPCWSTR, DWORD)
+{
+    return INET_E_DEFAULT_ACTION;
+}
+
+STDMETHODIMP COleSite::GetZoneMappings(DWORD, IEnumString**, DWORD)
+{
+    return INET_E_DEFAULT_ACTION;
 }
 
 // IDispatch (DWebBrowserEvents2)
