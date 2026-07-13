@@ -77,3 +77,6 @@ Testing/
 
 # Local investigation notes
 /local-notes/
+
+# Published artifacts
+/publish/
