@@ -103,6 +103,11 @@ target_include_directories(detours PUBLIC Detours/src)
 target_compile_options(detours PRIVATE /W0)
 set_target_properties(detours PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 
+set(FLASHIE_ICON_SOURCE "${CMAKE_SOURCE_DIR}/assets/icons/flashie.ico")
+if(NOT EXISTS "${FLASHIE_ICON_SOURCE}")
+    message(FATAL_ERROR "FlashIE icon not found: ${FLASHIE_ICON_SOURCE}")
+endif()
+
 configure_file(
     source/version.rc.in
     "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
@@ -115,6 +120,7 @@ add_executable(flashie WIN32
     source/swf_mime_filter.cpp
     source/flash.cpp
     source/flash_loader.cpp
+    source/resource.h
     source/app.manifest
     "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
 )

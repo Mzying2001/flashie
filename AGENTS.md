@@ -32,7 +32,7 @@ Output binary: `<build-directory>/<Config>/FlashIE.exe`. Post-build steps automa
 
 ### Source Files
 
-Five source files, five headers, plus three submodule dependencies:
+Five source files, six headers, plus three submodule dependencies:
 
 - **`Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, file, host identity, WLDP, TypeLib).
 - **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
@@ -76,6 +76,8 @@ Five source files, five headers, plus three submodule dependencies:
 - **`source/flash.h/.cpp`** — MIDL-generated Flash COM interface definitions (`IShockwaveFlash`, `CLSID_ShockwaveFlash`, `LIBID_ShockwaveFlashObjects`, etc.).
 
 - **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
+
+- **`source/resource.h`** / **`source/version.rc.in`** — Shared Win32 resource identifiers and the generated executable resources. The resource script embeds version metadata and the multi-size application icon.
 
 - **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. The first command-line argument is used as the initial address; without one, the browser opens `https://www.bing.com/`. Initialization order: parse command line → `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/file/host-identity/WLDP/TypeLib hooks) → `BrowserHost::Initialize()` (initializes the URLMon SWF manager and creates the browser) → navigate. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown destroys `BrowserHost` and its temporary URLMon registrations before `FlashLoader::Deactivate()` and `OleUninitialize()`.
 

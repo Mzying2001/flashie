@@ -7,6 +7,7 @@
 #include <string>
 #include "flash_loader.h"
 #include "browser.h"
+#include "resource.h"
 
 static constexpr int TOOLBAR_HEIGHT = 32;
 static constexpr int BUTTON_WIDTH   = 60;
@@ -37,6 +38,17 @@ static HWND         g_hwndGo          = nullptr;
 static HWND         g_hwndStatus      = nullptr;
 static bool         g_isClosing       = false;
 static std::wstring g_initialAddress  = L"https://www.bing.com/";
+
+static HICON LoadApplicationIcon(HINSTANCE hInstance, int width, int height)
+{
+    return static_cast<HICON>(LoadImageW(
+        hInstance,
+        MAKEINTRESOURCEW(IDI_FLASHIE_ICON),
+        IMAGE_ICON,
+        width,
+        height,
+        LR_DEFAULTCOLOR | LR_SHARED));
+}
 
 static void DoNavigate()
 {
@@ -231,7 +243,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"FlashIEWindow";
-    wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon         = LoadApplicationIcon(hInstance, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm       = LoadApplicationIcon(hInstance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    if (!wc.hIcon)
+        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    if (!wc.hIconSm)
+        wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
 
     g_hwndMain = CreateWindowExW(0, L"FlashIEWindow", L"FlashIE",

@@ -1,0 +1,6 @@
+#ifndef FLASHIE_RESOURCE_H
+#define FLASHIE_RESOURCE_H
+
+#define IDI_FLASHIE_ICON 101
+
+#endif
