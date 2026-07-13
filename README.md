@@ -7,8 +7,10 @@ A standalone Windows application that runs Adobe Flash content without requiring
 ## Features
 
 - **No Installation Required** — Bundles Flash.ocx locally; no `regsvr32`, no system-wide Flash installation needed
-- **Zero Registry Pollution** — All API hooks are process-scoped and removed on shutdown; no registry writes, no traces left behind
+- **Zero Registry Pollution** — All API hooks are process-scoped and removed on shutdown; no registry or system-wide COM registration changes are made
 - **Auto-Activation** — Automatically activates Flash content without user clicks, including Flash embedded in iframes
+- **Direct SWF Navigation** — Opens top-level HTTP(S) `.swf` URLs in the browser instead of downloading them, while preserving the original URL, history entry, redirects, and origin
+- **Local SWF Files** — Opens existing `.swf` files from DOS paths, UNC paths, or `file:///` URLs, including paths containing spaces or Unicode characters
 
 ## How It Works
 
@@ -16,10 +18,11 @@ FlashIE uses inline function hooking (detours) to intercept Windows API calls at
 
 1. **COM Hooks** — Intercept `CoGetClassObject`, `CoCreateInstance`, etc. to redirect Flash CLSID requests to the bundled Flash.ocx
 2. **Registry Hooks** — Fake Flash registry entries (CLSID, InprocServer32, TypeLib, ProgID, MIME types) entirely in memory — nothing is written to the actual registry
-3. **Security Hooks** — Approve Flash through `WldpIsClassInApprovedList` and `CoInternetIsFeatureEnabled` to bypass Windows 10+ restrictions
+3. **Security Hooks** — Approve only the Flash CLSID and bundled Flash.ocx image through `WldpIsClassInApprovedList` and `WldpQueryDynamicCodeTrust`
 4. **Activation Hooks** — Hook `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables to force Flash in-place activation via a coalesced timer
+5. **Direct SWF URLMon Handling** — Uses temporary, process-local URLMon handlers to display top-level HTTP(S) and local SWF navigations as full-window Flash content without changing the original navigation URL
 
-All hooks are installed after process initialization and cleanly removed on shutdown. **No persistent changes are made to the registry.**
+API hooks are installed after process initialization and removed on shutdown. Temporary URLMon handlers are removed as soon as their one navigation is claimed or abandoned, with shutdown cleanup as a final safeguard. **No persistent changes are made to the registry.**
 
 ## Build
 
@@ -62,7 +65,12 @@ To load an address at startup, pass the URL or local file path as the first argu
 
 ```powershell
 FlashIE.exe "https://example.com/flash.html"
+FlashIE.exe "https://example.com/movie.swf"
+FlashIE.exe "C:\Games\Flash\movie.swf"
+FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 ```
+
+Direct local navigation accepts existing `.swf` files specified as absolute DOS paths, UNC paths, or `file:///` URLs. For direct HTTP(S) SWF navigation, the initially requested URL path must end in `.swf` and the server's final response must return `application/x-shockwave-flash`; HTTP redirects remain supported, while responses advertised as unrelated download MIME types retain IE's native download behavior. Direct conversion applies only to the top-level navigation and does not override how web pages configure their embedded Flash objects.
 
 ## Project Structure
 
@@ -70,6 +78,7 @@ FlashIE.exe "https://example.com/flash.html"
 flashie/
 ├── source/
 │   ├── flash_loader.h/cpp    # API hooking engine (COM, registry, security, TypeLib hooks)
+│   ├── swf_mime_filter.h/cpp # Direct HTTP(S) and local SWF URLMon handling
 │   ├── browser.h/cpp         # OLE container for IE WebBrowser control
 │   ├── flash.h/cpp           # MIDL-generated Flash COM interface definitions
 │   ├── main.cpp              # Win32 window, toolbar, and initialization

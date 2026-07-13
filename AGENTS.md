@@ -4,7 +4,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 ## Overview
 
-FlashIE is a standalone Windows application that hosts an embedded IE WebBrowser control with a locally-loaded Adobe Flash Player ActiveX control (Flash.ocx). It uses a pre-patched Flash.ocx (no time bomb or region restrictions) and applies process-local, Flash-scoped compatibility exceptions to run content without registering Flash system-wide. Flash activation is forced without user clicks, with bounded retries for hidden iframes.
+FlashIE is a standalone Windows application that hosts an embedded IE WebBrowser control with a locally-loaded Adobe Flash Player ActiveX control (Flash.ocx). It uses a pre-patched Flash.ocx (no time bomb or region restrictions) and applies process-local, Flash-scoped compatibility exceptions to run content without registering Flash system-wide. Flash activation is forced without user clicks, with bounded retries for hidden iframes. Top-level HTTP(S) and local `.swf` navigations are converted in-process into full-window Flash documents while preserving the original navigation URL.
 
 ## Build
 
@@ -32,7 +32,7 @@ Output binary: `<build-directory>/<Config>/FlashIE.exe`. Post-build steps automa
 
 ### Source Files
 
-Four source files, four headers, plus two submodule dependencies:
+Five source files, five headers, plus two submodule dependencies:
 
 - **`Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, file, host identity, WLDP, TypeLib).
 - **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
@@ -55,16 +55,27 @@ Four source files, four headers, plus two submodule dependencies:
   - **Section 7i**: SharedObject first-save compatibility — scoped `DeleteFileA/W` hooks treat `ERROR_FILE_NOT_FOUND` as success only when the local `Flash.ocx` deletes a `.sol`, allowing Flash to continue its own `.sxx` commit. All other file deletions pass through unchanged.
   - **Section 8**: Public API — `Activate()` loads the OCX, creates the wrapped factory, and registers it with COM; it returns `false` and releases acquired state when activation fails. `InstallHooks()` returns `bool`, resolves all required targets before patching, and installs the complete COM/registry/file/host-identity/WLDP/TypeLib API hook set atomically in one Detours transaction; failure aborts or rolls back installation. `Deactivate()` must run on the activation STA. It flushes pending activations, closes tracked keys, restores Flash vtables, detaches API and Flash QI hooks transactionally, restores script vtables, and revokes the in-process class registration. A Flash-vtable restoration or Detours detach failure is logged and returns without discarding the corresponding hook state.
 
+- **`source/swf_mime_filter.h/.cpp`** — Process-local URLMon handling for direct top-level SWF navigation:
+  - `Initialize()` obtains the process `IInternetSession` and creates an in-memory `IClassFactory`. The factory is passed directly to URLMon; its CLSID is not registered with COM, and no protocol/MIME mapping is written to the registry.
+  - `IsSupportedSwfUrl()` canonicalizes HTTP, HTTPS, `file:` URLs, DOS paths, and UNC paths with `IUri`. Every initially armed URL must have a `.swf` path suffix; a local target must also exist and must not be a directory.
+  - `Arm()` installs a one-shot MIME filter for `application/x-shockwave-flash`. HTTP(S) responses with another MIME type retain IE's native behavior. Local files additionally use a temporary `file` namespace handler because URLMon's built-in file protocol bypasses MIME filters and classifies SWF data as `application/octet-stream`.
+  - `ClaimPendingNavigation()` accepts an exact canonical URL match. HTTP(S) redirects may use the final URL only for a top-level binding with no root/document URL; local `file:` bindings never use this redirect fallback. The URLMon handlers are unregistered before the generated page's `<embed>` requests the actual SWF.
+  - `SwfMimeProtocol` returns an in-memory UTF-8 HTML document containing a full-window Flash `<embed>`. It reports `text/html` to URLMon, serves bytes through `Read`, and defers `ReportResult` to a 1ms timer on the owning message-loop thread so URLMon cannot synchronously destroy the protocol from inside `Read`.
+  - Pending handler registration, generation state, and the deferred completion object are protected by an SRW lock. `Cancel()` and `Shutdown()` unregister all temporary handlers; shutdown also cancels any pending completion timer.
+
 - **`source/browser.h/.cpp`** — `BrowserHost` and OLE site classes (`COleSite`, `COleClientSite`, `COleInPlaceSite`, `COleInPlaceFrame`). Implements the standard OLE container interfaces needed to host an `IWebBrowser2` (IE) control in-process. `COleSite` implements:
   - `IDocHostUIHandler` — disables 3D border (`DOCHOSTUIFLAG_NO3DBORDER`).
   - `IOleCommandTarget` — suppresses script error dialogs (`OLECMDID_SHOWSCRIPTERROR`).
-  - `IDispatch` — `DWebBrowserEvents2` event sink for NavigateComplete2, TitleChange, NewWindow2/NewWindow3 (redirects new windows to same browser), and `DISPID_AMBIENT_DLCONTROL` ambient property (allows content downloads but blocks ActiveX CAB downloads via `DLCTL_NO_DLACTIVEXCTLS`).
+  - `IDispatch` — `DWebBrowserEvents2` event sink. `BeforeNavigate2` arms direct SWF handling only for the top-level browser identity. `NavigateComplete2`, `NavigateError`, and `FileDownload` clear unconsumed one-shot handlers. It also handles loading state, title/status changes, and NewWindow2/NewWindow3 (redirects new windows to the same browser).
+  - `DISPID_AMBIENT_DLCONTROL` ambient property — allows content downloads but blocks ActiveX CAB downloads via `DLCTL_NO_DLACTIVEXCTLS`.
+  - Back, Forward, Stop, and ordinary Navigate calls cancel pending SWF handling before starting another operation. Refresh re-arms a supported direct SWF URL before calling `IWebBrowser2::Refresh()`.
+  - `Initialize()`/`Destroy()` own the lifetime of the process URLMon SWF manager in addition to the WebBrowser control and event connection.
 
 - **`source/flash.h/.cpp`** — MIDL-generated Flash COM interface definitions (`IShockwaveFlash`, `CLSID_ShockwaveFlash`, `LIBID_ShockwaveFlashObjects`, etc.).
 
 - **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
 
-- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. The first command-line argument is used as the initial address; without one, the browser opens `about:blank`. Initialization order: parse command line → `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/file/host-identity/WLDP/TypeLib hooks) → create browser. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown: `FlashLoader::Deactivate()` → `OleUninitialize`.
+- **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. The first command-line argument is used as the initial address; without one, the browser opens `https://www.bing.com/`. Initialization order: parse command line → `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/file/host-identity/WLDP/TypeLib hooks) → `BrowserHost::Initialize()` (initializes the URLMon SWF manager and creates the browser) → navigate. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown destroys `BrowserHost` and its temporary URLMon registrations before `FlashLoader::Deactivate()` and `OleUninitialize()`.
 
 - **`source/app.manifest`** — Registration-Free COM declarations for Flash.ocx (SxS activation context).
 
@@ -91,7 +102,8 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
 - **Flash host identity**: Flash's ActiveX navigation code recognizes `iexplore.exe` as a browser host before it uses the document's successful `IBindHost` service. `GetModuleFileNameA/W` are therefore overlaid only for calls originating in the locally loaded `Flash.ocx`, only for `hModule == nullptr`, and only by replacing the executable basename while preserving the real directory and Win32 buffer contract.
 - **`LoggingClassFactory`**: Wraps the real Flash class factory. On `CreateInstance`, installs three hooks on the new Flash object: (1) a Detours `QueryInterface` hook for `IObjectSafety` injection, (2) an `IOleObject::SetClientSite` vtable hook for forced activation, and (3) an `IQuickActivate::QuickActivate` vtable hook for iframe activation. Registered as the COM class object (not the raw factory) so the intercepted Flash creation paths use it. `allowScriptAccess` and other property-bag values remain controlled by the page.
 - **Scoped security exceptions**: Registry hooks recognize exact Flash CLSID paths, validated Flash ProgID paths, and the current executable's browser-emulation value. WLDP hooks recognize only the Flash CLSID or locally loaded `Flash.ocx` file/image. Requests for unrelated controls, code images, and registry policy values are delegated unchanged to Windows.
-- **Synchronization and shutdown**: Factory access, fake-key tracking, Flash hook installation/restoration, and the script-vtable table use SRW locks. Activation timers are bound to their owning STA, and `Deactivate()` requires that STA before flushing timers, restoring hooks, releasing factories, and revoking the in-process class registration.
+- **Direct SWF navigation**: Temporary process-local URLMon handlers transform only the armed top-level SWF navigation while preserving its URL, history, and origin. Pending handlers are removed when the navigation ends or is canceled.
+- **Synchronization and shutdown**: Shared hook and URLMon state use SRW locks. `BrowserHost::Destroy()` shuts down URLMon handling before `FlashLoader::Deactivate()` restores the remaining hooks and registrations.
 - **Forced activation**: Windows 10 defers Flash `DoVerb(INPLACEACTIVATE)` until user click. Two vtable hooks solve this:
   - `SetClientSite` hook — catches the normal MSHTML activation path.
   - `QuickActivate` hook — catches the alternative path used by cross-domain iframes.
@@ -99,4 +111,4 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
 
 ## Debugging
 
-All diagnostic output uses `OutputDebugStringW` with `[FlashIE]` prefix. View with Visual Studio debugger Output window or Sysinternals DebugView. Debug builds additionally probe Flash objects for key interfaces on each `CreateInstance` call.
+All diagnostic output uses `OutputDebugStringW` with `[FlashIE]` prefix. View with Visual Studio debugger Output window or Sysinternals DebugView.

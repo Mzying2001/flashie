@@ -195,6 +195,7 @@ private:
     IOleInPlaceActiveObject* m_pIPActiveObj = nullptr;
     HWND                     m_hwndBrowser = nullptr;
     DWORD                    m_dwEventCookie = 0;
+    bool                     m_swfMimeFilterInitialized = false;
 
     NavigateCompleteCallback m_navCallback = nullptr;
     void*                    m_navCtx = nullptr;
