@@ -1,6 +1,6 @@
-# FlashIE
+# ![icon](assets/icons/flashie-icon-32.svg) FlashIE
 
-[中文版](README.cn.md)
+**English** | [中文](README.cn.md)
 
 A standalone Windows application that runs Adobe Flash content without requiring Flash to be installed on the system. FlashIE embeds an Internet Explorer WebBrowser control and loads a bundled Flash.ocx through API hooking — no registry modifications, completely portable.
 

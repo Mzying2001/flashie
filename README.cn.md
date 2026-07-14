@@ -1,6 +1,6 @@
-# FlashIE
+# ![icon](assets/icons/flashie-icon-32.svg) FlashIE
 
-[English](README.md)
+[English](README.md) | **中文**
 
 一个独立运行的 Windows 应用程序，无需在系统中安装 Flash 即可运行 Adobe Flash 内容。FlashIE 内嵌 Internet Explorer WebBrowser 控件，通过 API 钩子加载本地附带的 Flash.ocx——不修改注册表，完全绿色便携。
 
