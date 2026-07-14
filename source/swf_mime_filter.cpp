@@ -150,7 +150,7 @@ std::string BuildWrapperHtml(const std::wstring& movieUrl)
     std::wstring html =
         L"<!doctype html><html><head><meta charset=\"utf-8\">"
         L"<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">"
-        L"<title>Flash</title><style>html,body,embed{display:block;width:100%;"
+        L"<title>SWF Player</title><style>html,body,embed{display:block;width:100%;"
         L"height:100%;margin:0;padding:0;overflow:hidden}</style></head><body>"
         L"<embed id=\"flash-content\" src=\"" + escaped + L"\" "
         L"type=\"application/x-shockwave-flash\" width=\"100%\" "
