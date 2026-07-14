@@ -1,11 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = $PSScriptRoot
-$publishDirectory = Join-Path $repoRoot 'publish'
+$publishRoot = Join-Path $repoRoot 'publish'
+
 $cmake = (Get-Command cmake -CommandType Application -ErrorAction Stop).Source
 
 $buildMatrix = @(
@@ -107,6 +108,7 @@ if ($versions.Count -ne 1 -or [string]::IsNullOrWhiteSpace($versions[0])) {
     throw "Build configurations produced inconsistent project versions: $($versions -join ', ')"
 }
 
+$publishDirectory = Join-Path $publishRoot $versions[0]
 New-Item -ItemType Directory -Path $publishDirectory -Force | Out-Null
 
 foreach ($output in $outputs) {
