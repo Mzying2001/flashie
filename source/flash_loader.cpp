@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 #include <string.h>
 #include <stdint.h>
 #include <intrin.h>
@@ -197,26 +198,28 @@ enum FakeKeyType {
 };
 
 struct FakeKeyEntry {
-    HKEY    hKey;
+    HKEY        hKey;
     FakeKeyType type;
 };
 
-static const int MAX_FAKE_KEYS = 64;
-static FakeKeyEntry s_fakeKeys[MAX_FAKE_KEYS] = {};
-static int s_fakeKeyCount = 0;
+static std::vector<FakeKeyEntry> s_fakeKeys;
 static SRWLOCK s_fakeKeyLock = SRWLOCK_INIT;
 
 static bool TrackKey(HKEY hKey, FakeKeyType type)
 {
     bool tracked = false;
     AcquireSRWLockExclusive(&s_fakeKeyLock);
-    if (s_fakeKeyCount < MAX_FAKE_KEYS) {
-        s_fakeKeys[s_fakeKeyCount].hKey = hKey;
-        s_fakeKeys[s_fakeKeyCount].type = type;
-        s_fakeKeyCount++;
+    try {
+        s_fakeKeys.push_back({ hKey, type });
         tracked = true;
     }
+    catch (...) {
+        // Do not let allocation failures escape a Win32 hook boundary.
+    }
     ReleaseSRWLockExclusive(&s_fakeKeyLock);
+
+    if (!tracked)
+        DbgTrace(L"[FlashIE] Failed to track registry key\n");
     return tracked;
 }
 
@@ -240,9 +243,9 @@ static FakeKeyType GetFakeKeyType(HKEY hKey)
 {
     FakeKeyType type = FK_NONE;
     AcquireSRWLockShared(&s_fakeKeyLock);
-    for (int i = 0; i < s_fakeKeyCount; i++) {
-        if (s_fakeKeys[i].hKey == hKey) {
-            type = s_fakeKeys[i].type;
+    for (const auto& entry : s_fakeKeys) {
+        if (entry.hKey == hKey) {
+            type = entry.type;
             break;
         }
     }
@@ -254,10 +257,9 @@ static bool CloseFakeKey(HKEY hKey)
 {
     bool found = false;
     AcquireSRWLockExclusive(&s_fakeKeyLock);
-    for (int i = 0; i < s_fakeKeyCount; i++) {
+    for (size_t i = 0; i < s_fakeKeys.size(); i++) {
         if (s_fakeKeys[i].hKey == hKey) {
-            s_fakeKeys[i] = s_fakeKeys[s_fakeKeyCount - 1];
-            s_fakeKeyCount--;
+            s_fakeKeys.erase(s_fakeKeys.begin() + i);
             found = true;
             break;
         }
@@ -271,20 +273,15 @@ static bool CloseFakeKey(HKEY hKey)
 
 static void CloseAllTrackedKeys()
 {
-    HKEY handles[MAX_FAKE_KEYS] = {};
-    int count = 0;
+    std::vector<FakeKeyEntry> keys;
 
     AcquireSRWLockExclusive(&s_fakeKeyLock);
-    count = s_fakeKeyCount;
-    for (int i = 0; i < count; i++)
-        handles[i] = s_fakeKeys[i].hKey;
-    memset(s_fakeKeys, 0, sizeof(s_fakeKeys));
-    s_fakeKeyCount = 0;
+    keys.swap(s_fakeKeys);
     ReleaseSRWLockExclusive(&s_fakeKeyLock);
 
     if (s_origRegCloseKey) {
-        for (int i = 0; i < count; i++)
-            s_origRegCloseKey(handles[i]);
+        for (const auto& entry : keys)
+            s_origRegCloseKey(entry.hKey);
     }
 }
 
