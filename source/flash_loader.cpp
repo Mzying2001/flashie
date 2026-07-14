@@ -117,6 +117,12 @@ typedef HRESULT (STDMETHODCALLTYPE *FN_ParseScriptText)(
 typedef HRESULT (STDMETHODCALLTYPE *FN_FlashQueryInterface)(
     void* pThis, REFIID riid, void** ppv);
 
+typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
+    IOleObject* pThis, IOleClientSite* pClientSite);
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
+    IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
+
 // =====================================================================
 // Section 3: Detours Hook Infrastructure
 // =====================================================================
@@ -1064,8 +1070,6 @@ static void MaybeHookFlashQI(IUnknown* pObj)
 // restored during deactivation.
 // =====================================================================
 
-typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
-    IOleObject* pThis, IOleClientSite* pClientSite);
 static FN_OleSetClientSite s_origSetClientSite = nullptr;
 static void** s_hookedOleVtable = nullptr;
 
@@ -1275,8 +1279,6 @@ static void MaybeHookFlashSetClientSite(IUnknown* pObj)
 // QuickActivate sets the client site internally, bypassing our
 // SetClientSite vtable hook.
 
-typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
-    IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
 static FN_QuickActivate s_origQuickActivate = nullptr;
 static void** s_hookedQuickVtable = nullptr;
 
