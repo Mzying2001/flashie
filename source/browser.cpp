@@ -2,6 +2,12 @@
 #include "swf_mime_filter.h"
 #include <mshtml.h>
 
+static constexpr DISPID DISPID_FLASHIE_POINTER_DOWN = 0x6001;
+static constexpr DISPID DISPID_FLASHIE_POINTER_UP = 0x6002;
+static constexpr DISPID DISPID_FLASHIE_SHOULD_ALLOW_DEACTIVATE = 0x6003;
+static constexpr int FOCUS_TARGET_BACKGROUND = 0;
+static constexpr int FOCUS_TARGET_INTERACTIVE = 2;
+
 static void InstallFlashFocusGuard(IDispatch* browserDispatch)
 {
     IWebBrowser2* frameBrowser = nullptr;
@@ -29,11 +35,39 @@ static void InstallFlashFocusGuard(IDispatch* browserDispatch)
         return;
 
     // Flash dispatches Stage deactivation before MSHTML reaches the OLE
-    // UIDeactivate callback, so preserve focus at the cancelable DOM boundary.
+    // UIDeactivate callback. Cancel ordinary background clicks at the DOM
+    // boundary, but let MSHTML handle targets that need native focus/selection.
     BSTR code = SysAllocString(
         L"(function(){"
         L"if(window.__flashieFocusGuard)return;"
         L"window.__flashieFocusGuard=true;"
+        L"function __flashieTargetKind(s,x,y){"
+        L"var r=s,n=s,q;"
+        L"for(;n&&n.tagName;n=n.parentNode){"
+        L"q=String(n.tagName).toUpperCase();"
+        L"if(q==='A'||q==='AREA'||q==='INPUT'||q==='TEXTAREA'||"
+        L"q==='SELECT'||q==='BUTTON'||q==='OPTION'||q==='LABEL'||"
+        L"q==='IFRAME'||q==='OBJECT'||q==='EMBED'||n.isContentEditable)"
+        L"return 2;"
+        L"var a=n.getAttributeNode&&n.getAttributeNode('tabIndex');"
+        L"if(a&&a.specified&&Number(a.value)>=0)return 2;"
+        L"}"
+        L"try{var d=r&&r.ownerDocument,b=d&&d.body;"
+        L"if(b&&b.createTextRange){var tr=b.createTextRange();"
+        L"tr.moveToElementText(r);var rs=tr.getClientRects();"
+        L"for(var i=0;i<rs.length;i++){var z=rs[i];"
+        L"if(x>=z.left&&x<=z.right&&y>=z.top&&y<=z.bottom)return 1;"
+        L"}}}catch(v){}"
+        L"return 0;"
+        L"}"
+        L"document.attachEvent('onmousedown',function(){"
+        L"var e=window.event;if(!e||e.button!==1)return;"
+        L"var k=__flashieTargetKind(e.srcElement,e.clientX,e.clientY);"
+        L"try{window.external.FlashIEPointerDown(k);}catch(x){}"
+        L"});"
+        L"document.attachEvent('onmouseup',function(){"
+        L"try{window.external.FlashIEPointerUp();}catch(x){}"
+        L"});"
         L"document.attachEvent('onbeforedeactivate',function(){"
         L"var e=window.event,s=e&&e.srcElement;"
         L"if(!s||!s.tagName)return;"
@@ -43,11 +77,11 @@ static void InstallFlashFocusGuard(IDispatch* browserDispatch)
         L"var m=String(s.type||s.getAttribute('type')||'').toLowerCase();"
         L"if(c.indexOf('D27CDB6E-AE6D-11CF-96B8-444553540000')<0&&"
         L"m!=='application/x-shockwave-flash')return;"
-        L"for(var n=e.toElement;n&&n.tagName;n=n.parentNode){"
-        L"var q=String(n.tagName).toUpperCase();"
-        L"if(q==='INPUT'||q==='TEXTAREA'||q==='SELECT'||q==='BUTTON'||"
-        L"n.isContentEditable)return;"
-        L"}"
+        L"var allow=false;"
+        L"try{allow=window.external.FlashIEShouldAllowDeactivate();"
+        L"}catch(x){allow=e.toElement&&"
+        L"__flashieTargetKind(e.toElement,e.clientX,e.clientY)>0;}"
+        L"if(allow)return;"
         L"e.returnValue=false;"
         L"});"
         L"})();");
@@ -271,6 +305,15 @@ STDMETHODIMP COleSite::GetHostInfo(DOCHOSTUIINFO* pInfo)
     return S_OK;
 }
 
+STDMETHODIMP COleSite::GetExternal(IDispatch** dispatch)
+{
+    if (!dispatch)
+        return E_POINTER;
+    *dispatch = static_cast<IDispatch*>(this);
+    AddRef();
+    return S_OK;
+}
+
 // IOleCommandTarget — suppress script error dialogs
 static const GUID CGID_DocHostCommandHandler =
     {0xf38bc242, 0xb950, 0x11d1, {0x89, 0x18, 0x00, 0xc0, 0x4f, 0xc2, 0xc8, 0x36}};
@@ -371,14 +414,63 @@ STDMETHODIMP COleSite::GetTypeInfoCount(UINT* pctinfo)
 }
 
 STDMETHODIMP COleSite::GetTypeInfo(UINT, LCID, ITypeInfo**) { return E_NOTIMPL; }
-STDMETHODIMP COleSite::GetIDsOfNames(REFIID, OLECHAR**, UINT, LCID, DISPID*)
+STDMETHODIMP COleSite::GetIDsOfNames(
+    REFIID, OLECHAR** names, UINT nameCount, LCID, DISPID* dispids)
 {
-    return DISP_E_UNKNOWNNAME;
+    if (!names || !dispids)
+        return E_POINTER;
+
+    for (UINT i = 0; i < nameCount; ++i) {
+        if (_wcsicmp(names[i], L"FlashIEPointerDown") == 0)
+            dispids[i] = DISPID_FLASHIE_POINTER_DOWN;
+        else if (_wcsicmp(names[i], L"FlashIEPointerUp") == 0)
+            dispids[i] = DISPID_FLASHIE_POINTER_UP;
+        else if (_wcsicmp(names[i], L"FlashIEShouldAllowDeactivate") == 0)
+            dispids[i] = DISPID_FLASHIE_SHOULD_ALLOW_DEACTIVATE;
+        else {
+            dispids[i] = DISPID_UNKNOWN;
+            return DISP_E_UNKNOWNNAME;
+        }
+    }
+    return S_OK;
 }
 
 STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARAMS* pDispParams,
                                VARIANT* pvarResult, EXCEPINFO*, UINT*)
 {
+    if (dispid == DISPID_FLASHIE_POINTER_DOWN) {
+        int kind = 0;
+        if (pDispParams && pDispParams->cArgs >= 1) {
+            const VARIANT& value = pDispParams->rgvarg[0];
+            if (value.vt == VT_I4)
+                kind = value.lVal;
+            else if (value.vt == VT_I2)
+                kind = value.iVal;
+            else if (value.vt == VT_R8)
+                kind = static_cast<int>(value.dblVal);
+        }
+        m_focusPointerKind =
+            kind >= FOCUS_TARGET_BACKGROUND && kind <= FOCUS_TARGET_INTERACTIVE
+                ? kind : FOCUS_TARGET_BACKGROUND;
+        return S_OK;
+    }
+
+    if (dispid == DISPID_FLASHIE_POINTER_UP) {
+        m_focusPointerKind = -1;
+        return S_OK;
+    }
+
+    if (dispid == DISPID_FLASHIE_SHOULD_ALLOW_DEACTIVATE) {
+        bool allow = m_focusPointerKind != FOCUS_TARGET_BACKGROUND;
+
+        if (pvarResult) {
+            VariantInit(pvarResult);
+            pvarResult->vt = VT_BOOL;
+            pvarResult->boolVal = allow ? VARIANT_TRUE : VARIANT_FALSE;
+        }
+        return S_OK;
+    }
+
     switch (dispid) {
 
     case DISPID_DOWNLOADBEGIN:

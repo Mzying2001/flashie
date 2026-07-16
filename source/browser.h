@@ -123,7 +123,7 @@ public:
     STDMETHODIMP TranslateAccelerator(LPMSG, const GUID*, DWORD) override { return S_FALSE; }
     STDMETHODIMP GetOptionKeyPath(BSTR*, DWORD) override { return E_NOTIMPL; }
     STDMETHODIMP GetDropTarget(IDropTarget*, IDropTarget**) override { return E_NOTIMPL; }
-    STDMETHODIMP GetExternal(IDispatch**) override { return E_NOTIMPL; }
+    STDMETHODIMP GetExternal(IDispatch**) override;
     STDMETHODIMP TranslateUrl(DWORD, OLECHAR*, OLECHAR**) override { return S_FALSE; }
     STDMETHODIMP FilterDataObject(IDataObject*, IDataObject**) override { return S_FALSE; }
 
@@ -166,6 +166,8 @@ private:
     COleInPlaceSite*   m_pInPlaceSite = nullptr;
     COleInPlaceFrame*  m_pInPlaceFrame = nullptr;
     BrowserHost*       m_pBrowserHost = nullptr;
+    // -1: no page pointer event; 0: background; 1: text; 2: interactive.
+    int                m_focusPointerKind = -1;
 };
 
 // ---------------------------------------------------------------
