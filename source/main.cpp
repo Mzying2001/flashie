@@ -26,7 +26,7 @@ enum ControlID {
     ID_STATUS,
 };
 
-static FlashLoader  g_flashLoader;
+static bool         g_flashActivated  = false;
 static BrowserHost* g_pBrowser        = nullptr;
 static HWND         g_hwndMain        = nullptr;
 static HWND         g_hwndBack        = nullptr;
@@ -139,11 +139,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
         // InstallHooks force-loads mshtml.dll/urlmon.dll/ieframe.dll.
-        if (!g_flashLoader.InstallHooks() && g_flashLoader.IsActive()) {
+        if (g_flashActivated && !FlashLoader::InstallHooks()) {
             MessageBoxW(hwnd, L"Failed to install the Flash compatibility hooks.\n"
                         L"Flash support has been disabled for this session.",
                         L"FlashIE", MB_ICONWARNING);
-            g_flashLoader.Deactivate();
+            FlashLoader::Deactivate();
+            g_flashActivated = false;
         }
 
         g_pBrowser = new BrowserHost();
@@ -229,7 +230,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     // Register Flash.ocx class factory into this process's COM table.
     // Must be after OleInitialize (COM needs to be initialized).
-    if (!g_flashLoader.Activate()) {
+    g_flashActivated = FlashLoader::Activate();
+    if (!g_flashActivated) {
         MessageBoxW(nullptr, L"Failed to load Flash.ocx.\n"
                     L"Ensure Flash.ocx is alongside the executable.",
                     L"FlashIE", MB_ICONWARNING);
@@ -287,7 +289,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     }
 
     // Deactivate Flash BEFORE OleUninitialize
-    g_flashLoader.Deactivate();
+    FlashLoader::Deactivate();
+    g_flashActivated = false;
     OleUninitialize();
 
     return static_cast<int>(msg.wParam);
