@@ -1,5 +1,71 @@
 #include "browser.h"
 #include "swf_mime_filter.h"
+#include <mshtml.h>
+
+static void InstallFlashFocusGuard(IDispatch* browserDispatch)
+{
+    IWebBrowser2* frameBrowser = nullptr;
+    if (!browserDispatch || FAILED(browserDispatch->QueryInterface(
+            IID_IWebBrowser2, reinterpret_cast<void**>(&frameBrowser))))
+        return;
+
+    IDispatch* documentDispatch = nullptr;
+    frameBrowser->get_Document(&documentDispatch);
+    frameBrowser->Release();
+    if (!documentDispatch)
+        return;
+
+    IHTMLDocument2* document = nullptr;
+    documentDispatch->QueryInterface(
+        IID_IHTMLDocument2, reinterpret_cast<void**>(&document));
+    documentDispatch->Release();
+    if (!document)
+        return;
+
+    IHTMLWindow2* window = nullptr;
+    document->get_parentWindow(&window);
+    document->Release();
+    if (!window)
+        return;
+
+    // Flash dispatches Stage deactivation before MSHTML reaches the OLE
+    // UIDeactivate callback, so preserve focus at the cancelable DOM boundary.
+    BSTR code = SysAllocString(
+        L"(function(){"
+        L"if(window.__flashieFocusGuard)return;"
+        L"window.__flashieFocusGuard=true;"
+        L"document.attachEvent('onbeforedeactivate',function(){"
+        L"var e=window.event,s=e&&e.srcElement;"
+        L"if(!s||!s.tagName)return;"
+        L"var t=String(s.tagName).toUpperCase();"
+        L"if(t!=='OBJECT'&&t!=='EMBED')return;"
+        L"var c=String(s.classid||s.getAttribute('classid')||'').toUpperCase();"
+        L"var m=String(s.type||s.getAttribute('type')||'').toLowerCase();"
+        L"if(c.indexOf('D27CDB6E-AE6D-11CF-96B8-444553540000')<0&&"
+        L"m!=='application/x-shockwave-flash')return;"
+        L"for(var n=e.toElement;n&&n.tagName;n=n.parentNode){"
+        L"var q=String(n.tagName).toUpperCase();"
+        L"if(q==='INPUT'||q==='TEXTAREA'||q==='SELECT'||q==='BUTTON'||"
+        L"n.isContentEditable)return;"
+        L"}"
+        L"e.returnValue=false;"
+        L"});"
+        L"})();");
+    BSTR language = SysAllocString(L"javascript");
+    if (!code || !language) {
+        SysFreeString(language);
+        SysFreeString(code);
+        window->Release();
+        return;
+    }
+    VARIANT result;
+    VariantInit(&result);
+    window->execScript(code, language, &result);
+    VariantClear(&result);
+    SysFreeString(language);
+    SysFreeString(code);
+    window->Release();
+}
 
 static bool IsTopLevelBrowserEvent(
     IDispatch* eventDispatch, IWebBrowser2* browser)
@@ -368,6 +434,11 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         }
         return S_OK;
     }
+
+    case DISPID_DOCUMENTCOMPLETE:
+        if (pDispParams->cArgs >= 2)
+            InstallFlashFocusGuard(pDispParams->rgvarg[1].pdispVal);
+        return S_OK;
 
     case DISPID_NAVIGATEERROR: {
         // Params (reverse): Cancel=[0], StatusCode=[1], Frame=[2],
