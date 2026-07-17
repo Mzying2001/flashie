@@ -36,9 +36,9 @@ constexpr wchar_t FLASH_CLSID_STR[] = L"{D27CDB6E-AE6D-11CF-96B8-444553540000}";
 
 // In-box JScript Active Scripting engines. VBScript implements the same parse
 // interface, so the class ID must be checked before installing JScriptCC.
-const CLSID CLSID_JScript_ =
+constexpr CLSID CLSID_JScript =
     {0xF414C260, 0x6AC0, 0x11CF, {0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58}};
-const CLSID CLSID_JScript9_ =
+constexpr CLSID CLSID_JScript9 =
     {0x16D51579, 0xA30B, 0x4C8B, {0xA2, 0x76, 0x0F, 0xF4, 0xDC, 0x41, 0xE7, 0x55}};
 
 // Bounded hook tables, activation queues, and deferred retry count.
@@ -1625,8 +1625,8 @@ HRESULT STDMETHODCALLTYPE Hooked_ParseScriptText(
 
 bool IsJScriptEngine(REFCLSID rclsid)
 {
-    return IsEqualCLSID(rclsid, CLSID_JScript_) ||
-           IsEqualCLSID(rclsid, CLSID_JScript9_);
+    return IsEqualCLSID(rclsid, CLSID_JScript) ||
+           IsEqualCLSID(rclsid, CLSID_JScript9);
 }
 
 void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj)
