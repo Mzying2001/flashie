@@ -58,7 +58,12 @@ set(SWC_ES5_RELEASE_LIBRARY
 
 add_custom_target(swc_es5_build
     COMMAND "${CMAKE_COMMAND}" -E env
-        "RUSTFLAGS=-C target-feature=+crt-static"
+        "RUSTFLAGS=-C target-feature=+crt-static$<$<NOT:$<CONFIG:Debug>>: -Z location-detail=none>"
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL=s"
+        "CARGO_PROFILE_RELEASE_LTO=fat"
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1"
+        "CARGO_PROFILE_RELEASE_DEBUG=0"
+        "CARGO_PROFILE_RELEASE_STRIP=symbols"
         "${CARGO_EXECUTABLE}" build --locked --lib
         --target "${SWC_ES5_RUST_TARGET}"
         -Z "build-std=std,panic_unwind"
