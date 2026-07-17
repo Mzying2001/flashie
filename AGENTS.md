@@ -32,7 +32,7 @@ Output binary: `<build-directory>/<Config>/FlashIE.exe`. Post-build steps automa
 
 ### Source Files
 
-Five source files, six headers, plus three submodule dependencies:
+Application sources and headers, plus three submodule dependencies:
 
 - **`Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, file, host identity, WLDP, TypeLib).
 - **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
@@ -75,7 +75,9 @@ Five source files, six headers, plus three submodule dependencies:
 
 - **`source/flash.h/.cpp`** — MIDL-generated Flash COM interface definitions (`IShockwaveFlash`, `CLSID_ShockwaveFlash`, `LIBID_ShockwaveFlashObjects`, etc.).
 
-- **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
+- **`source/debug.h/.cpp`** — `DbgTrace` macro for diagnostic output.
+
+- **`source/text_encoding.h/.cpp`** — Shared strict UTF-16/UTF-8 conversion used by script preprocessing, SWC diagnostics, and generated SWF wrapper documents.
 
 - **`source/resource.h`** / **`source/version.rc.in`** — Shared Win32 resource identifiers and the generated executable resources. The resource script embeds version metadata and the multi-size application icon.
 
@@ -118,3 +120,11 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
 ## Debugging
 
 All diagnostic output uses `OutputDebugStringW` with `[FlashIE]` prefix. View with Visual Studio debugger Output window or Sysinternals DebugView.
+
+## Git Commit Conventions
+
+- Use Conventional Commits: `<type>(<scope>): <summary>`
+- Example types: `feat`, `fix`, `refactor`, `build`, `docs`, `test`, `chore`
+- Use an optional scope for the affected project, area, class, or file
+- Write concise English summaries
+- For non-trivial changes, include a body explaining the reason and implementation/fix approach

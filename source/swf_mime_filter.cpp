@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "debug.h"
+#include "text_encoding.h"
 
 #include <windows.h>
 #include <shlwapi.h>
@@ -126,24 +127,6 @@ std::wstring EscapeHtmlAttribute(const std::wstring& value)
     return escaped;
 }
 
-std::string WideToUtf8(const std::wstring& value)
-{
-    if (value.empty())
-        return {};
-
-    int needed = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (needed <= 0)
-        return {};
-
-    std::string result(static_cast<size_t>(needed), '\0');
-    if (WideCharToMultiByte(CP_UTF8, 0, value.data(),
-            static_cast<int>(value.size()), result.data(), needed,
-            nullptr, nullptr) != needed)
-        return {};
-    return result;
-}
-
 std::string BuildWrapperHtml(const std::wstring& movieUrl)
 {
     std::wstring escaped = EscapeHtmlAttribute(movieUrl);
@@ -156,7 +139,10 @@ std::string BuildWrapperHtml(const std::wstring& movieUrl)
         L"type=\"application/x-shockwave-flash\" width=\"100%\" "
         L"height=\"100%\" allowFullScreen=\"true\"></embed>"
         L"</body></html>";
-    return WideToUtf8(html);
+    std::string utf8;
+    if (!TextEncoding::WideToUtf8(html.c_str(), utf8))
+        return {};
+    return utf8;
 }
 
 void UnregisterHandlers()

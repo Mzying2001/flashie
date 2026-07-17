@@ -17,13 +17,13 @@ static constexpr int WINDOW_MIN_CX  = 500;
 static constexpr int WINDOW_MIN_CY  = 350;
 
 enum ControlID {
-    ID_BACK = 1001,
-    ID_FORWARD,
-    ID_REFRESH,
-    ID_STOP,
-    ID_ADDRESS,
-    ID_GO,
-    ID_STATUS,
+    IDC_BACK = 1001,
+    IDC_FORWARD,
+    IDC_REFRESH,
+    IDC_STOP,
+    IDC_ADDRESS,
+    IDC_GO,
+    IDC_STATUS,
 };
 
 static bool         g_flashActivated  = false;
@@ -126,13 +126,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RECT rc;
         GetClientRect(hwnd, &rc);
 
-        g_hwndBack    = CreateWindowW(L"BUTTON", L"Back",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_BACK),    hInst, nullptr);
-        g_hwndForward = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_FORWARD), hInst, nullptr);
-        g_hwndRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_REFRESH), hInst, nullptr);
-        g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STOP),    hInst, nullptr);
-        g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_ADDRESS), hInst, nullptr);
-        g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_GO),      hInst, nullptr);
-        g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), hInst, nullptr);
+        g_hwndBack    = CreateWindowW(L"BUTTON", L"Back",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BACK),    hInst, nullptr);
+        g_hwndForward = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FORWARD), hInst, nullptr);
+        g_hwndRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH), hInst, nullptr);
+        g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STOP),    hInst, nullptr);
+        g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
+        g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GO),      hInst, nullptr);
+        g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), hInst, nullptr);
 
         OnLoadingStateChange(false, nullptr);
 
@@ -175,11 +175,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
-        case ID_BACK:    if (g_pBrowser) g_pBrowser->GoBack();    break;
-        case ID_FORWARD: if (g_pBrowser) g_pBrowser->GoForward(); break;
-        case ID_REFRESH: if (g_pBrowser) g_pBrowser->Refresh();   break;
-        case ID_STOP:    if (g_pBrowser) g_pBrowser->Stop();      break;
-        case ID_GO:      DoNavigate(); break;
+        case IDC_BACK:    if (g_pBrowser) g_pBrowser->GoBack();    break;
+        case IDC_FORWARD: if (g_pBrowser) g_pBrowser->GoForward(); break;
+        case IDC_REFRESH: if (g_pBrowser) g_pBrowser->Refresh();   break;
+        case IDC_STOP:    if (g_pBrowser) g_pBrowser->Stop();      break;
+        case IDC_GO:      DoNavigate(); break;
         }
         return 0;
     }
