@@ -687,7 +687,7 @@ constexpr ClsidSuffixEntry CLSID_SUFFIXES[] = {
 
 // Helper: allocate fake key, set output, log, and return ERROR_SUCCESS.
 LSTATUS ReturnFakeKey(FakeKeyType type, PHKEY phkResult,
-                             LPCWSTR lpSubKey, const wchar_t* desc)
+                      LPCWSTR lpSubKey, const wchar_t* desc)
 {
     HKEY h = AllocFakeKey(type);
     if (h && phkResult) {
@@ -1459,7 +1459,7 @@ HRESULT WINAPI Hooked_LoadRegTypeLib(
 // =====================================================================
 
 void TraceSwcFailure(swc_es5_status_t status,
-                            const swc_es5_result_t* result)
+                     const swc_es5_result_t* result)
 {
     std::wstring diagnostic;
     if (result && TextEncoding::Utf8ToWide(
@@ -1476,7 +1476,7 @@ void TraceSwcFailure(swc_es5_status_t status,
 }
 
 bool TranspileScriptToEs5(const std::string& input,
-                                 std::string& output)
+                          std::string& output)
 {
     try {
         swc_es5_compiler_t* rawCompiler = nullptr;
@@ -1530,7 +1530,7 @@ bool TranspileScriptToEs5(const std::string& input,
 }
 
 bool ProcessScriptForJScript(LPCOLESTR input, DWORD flags,
-                                    std::wstring& output, bool& usedSwc)
+                             std::wstring& output, bool& usedSwc)
 {
     usedSwc = false;
     try {
