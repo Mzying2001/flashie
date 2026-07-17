@@ -653,7 +653,7 @@ struct FakeSubKeyEntry {
     FakeKeyType parentOnly;
 };
 
-const FakeSubKeyEntry s_fakeSubKeys[] = {
+constexpr FakeSubKeyEntry FAKE_SUB_KEYS[] = {
     { L"CLSID",                    FK_PROGID_CLSID,   FK_PROGID_ROOT },
     { L"CurVer",                   FK_PROGID_CURVER,  FK_NONE },
     { L"InprocServer32",           FK_INPROC,         FK_NONE },
@@ -674,7 +674,7 @@ struct ClsidSuffixEntry {
     FakeKeyType type;
 };
 
-const ClsidSuffixEntry s_clsidSuffixes[] = {
+constexpr ClsidSuffixEntry CLSID_SUFFIXES[] = {
     { L"InprocServer32",           FK_INPROC },
     { L"MiscStatus\\1",            FK_MISCSTATUS1 },
     { L"MiscStatus",               FK_MISCSTATUS },
@@ -777,7 +777,7 @@ LSTATUS WINAPI Hooked_RegOpenKeyExW(
     if (parentType != FK_NONE && lpSubKey && phkResult) {
         FakeKeyType subType = FK_NONE;
 
-        for (const auto& e : s_fakeSubKeys) {
+        for (const auto& e : FAKE_SUB_KEYS) {
             if (e.parentOnly != FK_NONE && parentType != e.parentOnly)
                 continue;
             if (_wcsicmp(lpSubKey, e.name) == 0) {
@@ -824,7 +824,7 @@ LSTATUS WINAPI Hooked_RegOpenKeyExW(
             if (SubKeyEndsWith(lpSubKey, FLASH_CLSID_STR)) {
                 fkType = FK_CLSID_ROOT; fkName = L"CLSID root";
             } else {
-                for (const auto& e : s_clsidSuffixes) {
+                for (const auto& e : CLSID_SUFFIXES) {
                     if (SubKeyEndsWith(lpSubKey, e.suffix)) {
                         fkType = e.type; fkName = e.suffix;
                         break;
