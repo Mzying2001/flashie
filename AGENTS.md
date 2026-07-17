@@ -75,7 +75,7 @@ Five source files, six headers, plus three submodule dependencies:
 
 - **`source/flash.h/.cpp`** — MIDL-generated Flash COM interface definitions (`IShockwaveFlash`, `CLSID_ShockwaveFlash`, `LIBID_ShockwaveFlashObjects`, etc.).
 
-- **`source/debug.h`** — `DbgTrace` macro for diagnostic output.
+- **`source/debug.h/.cpp`** — `DbgTrace` macro for diagnostic output.
 
 - **`source/resource.h`** / **`source/version.rc.in`** — Shared Win32 resource identifiers and the generated executable resources. The resource script embeds version metadata and the multi-size application icon.
 
@@ -118,3 +118,11 @@ When adding new features or modifying hooks, ensure this invariant is preserved.
 ## Debugging
 
 All diagnostic output uses `OutputDebugStringW` with `[FlashIE]` prefix. View with Visual Studio debugger Output window or Sysinternals DebugView.
+
+## Git Commit Conventions
+
+- Use Conventional Commits: `<type>(<scope>): <summary>`
+- Example types: `feat`, `fix`, `refactor`, `build`, `docs`, `test`, `chore`
+- Use an optional scope for the affected project, area, class, or file
+- Write concise English summaries
+- For non-trivial changes, include a body explaining the reason and implementation/fix approach
