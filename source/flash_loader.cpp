@@ -4,6 +4,7 @@
 
 #include "flash_loader.h"
 #include "debug.h"
+#include "text_encoding.h"
 
 #include <windows.h>
 #include <objbase.h>
@@ -15,7 +16,6 @@
 #include <swc_es5.h>
 
 #include <exception>
-#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -1458,67 +1458,11 @@ static HRESULT WINAPI Hooked_LoadRegTypeLib(
 // the latest valid code, and errors are reported through DbgTrace.
 // =====================================================================
 
-static bool WideToUtf8(const wchar_t* input, std::string& output)
-{
-    output.clear();
-    if (!input)
-        return false;
-
-    // ParseScriptText supplies a NUL-terminated LPCOLESTR. Passing -1 avoids
-    // a separate wcslen scan; the returned size includes the terminator.
-    int outputLength = WideCharToMultiByte(
-        CP_UTF8, WC_ERR_INVALID_CHARS, input, -1,
-        nullptr, 0, nullptr, nullptr);
-    if (outputLength <= 0)
-        return false;
-
-    output.resize(static_cast<size_t>(outputLength));
-    if (WideCharToMultiByte(
-            CP_UTF8, WC_ERR_INVALID_CHARS, input, -1,
-            output.data(), outputLength, nullptr, nullptr) != outputLength) {
-        output.clear();
-        return false;
-    }
-
-    output.pop_back();
-    return true;
-}
-
-static bool Utf8ToWide(const uint8_t* input, size_t inputLength,
-                       std::wstring& output)
-{
-    output.clear();
-    if (inputLength == 0)
-        return true;
-    if (!input ||
-        inputLength > static_cast<size_t>((std::numeric_limits<int>::max)())) {
-        return false;
-    }
-
-    int byteLength = static_cast<int>(inputLength);
-    const char* bytes = reinterpret_cast<const char*>(input);
-    int outputLength = MultiByteToWideChar(
-        CP_UTF8, MB_ERR_INVALID_CHARS, bytes, byteLength, nullptr, 0);
-    if (outputLength <= 0)
-        return false;
-
-    output.resize(static_cast<size_t>(outputLength));
-    return MultiByteToWideChar(
-        CP_UTF8, MB_ERR_INVALID_CHARS, bytes, byteLength,
-        output.data(), outputLength) == outputLength;
-}
-
-static bool Utf8ToWide(const std::string& input, std::wstring& output)
-{
-    return Utf8ToWide(
-        reinterpret_cast<const uint8_t*>(input.data()), input.size(), output);
-}
-
 static void TraceSwcFailure(swc_es5_status_t status,
                             const swc_es5_result_t* result)
 {
     std::wstring diagnostic;
-    if (result && Utf8ToWide(
+    if (result && TextEncoding::Utf8ToWide(
             swc_es5_result_error(result),
             swc_es5_result_error_length(result), diagnostic) &&
         !diagnostic.empty()) {
@@ -1591,7 +1535,7 @@ static bool ProcessScriptForJScript(LPCOLESTR input, DWORD flags,
     usedSwc = false;
     try {
         std::string utf8Source;
-        if (!WideToUtf8(input, utf8Source)) {
+        if (!TextEncoding::WideToUtf8(input, utf8Source)) {
             DbgTrace(L"[FlashIE] Script input is not valid UTF-16\n");
             return false;
         }
@@ -1625,7 +1569,7 @@ static bool ProcessScriptForJScript(LPCOLESTR input, DWORD flags,
             }
         }
 
-        if (!Utf8ToWide(processed, output)) {
+        if (!TextEncoding::Utf8ToWide(processed, output)) {
             DbgTrace(L"[FlashIE] Processed script is not valid UTF-8\n");
             return false;
         }

@@ -126,6 +126,7 @@ add_executable(flashie WIN32
     source/flash.cpp
     source/flash_loader.cpp
     source/debug.cpp
+    source/text_encoding.cpp
     source/resource.h
     source/app.manifest
     "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
