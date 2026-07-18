@@ -114,8 +114,8 @@ if(NOT EXISTS "${FLASHIE_ICON_SOURCE}")
 endif()
 
 configure_file(
-    source/version.rc.in
-    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+    source/flashie.rc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/flashie.rc"
     @ONLY
 )
 
@@ -129,7 +129,7 @@ add_executable(flashie WIN32
     source/text_encoding.cpp
     source/resource.h
     source/app.manifest
-    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+    "${CMAKE_CURRENT_BINARY_DIR}/flashie.rc"
 )
 
 set_target_properties(flashie PROPERTIES OUTPUT_NAME "FlashIE")

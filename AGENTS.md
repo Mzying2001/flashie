@@ -79,7 +79,7 @@ Application sources and headers, plus three submodule dependencies:
 
 - **`source/text_encoding.h/.cpp`** — Shared strict UTF-16/UTF-8 conversion used by script preprocessing, SWC diagnostics, and generated SWF wrapper documents.
 
-- **`source/resource.h`** / **`source/version.rc.in`** — Shared Win32 resource identifiers and the generated executable resources. The resource script embeds version metadata and the multi-size application icon.
+- **`source/resource.h`** / **`source/flashie.rc.in`** — Shared Win32 resource identifiers and the generated executable resources. The resource script embeds version metadata and the multi-size application icon.
 
 - **`source/main.cpp`** — Win32 window with a toolbar (Back/Forward/Refresh/Stop/address bar/Go) and a browser area. The first command-line argument is used as the initial address; without one, the browser opens `https://www.bing.com/`. Initialization order: parse command line → `OleInitialize` → `FlashLoader::Activate()` → create window → `FlashLoader::InstallHooks()` (force-loads mshtml/urlmon/ieframe and atomically installs COM/registry/file/host-identity/WLDP/TypeLib hooks) → `BrowserHost::Initialize()` (initializes the URLMon SWF manager and creates the browser) → navigate. If hook installation fails, it warns the user and deactivates the loader before continuing without Flash support for that session. Shutdown destroys `BrowserHost` and its temporary URLMon registrations before `FlashLoader::Deactivate()` and `OleUninitialize()`.
 
