@@ -1142,9 +1142,12 @@ void MaybeHookFlashQI(IUnknown* pObj)
 // restored during deactivation.
 // =====================================================================
 
-// Saved references for deferred re-activation (handles display:none iframes).
-// A 200ms repeating timer calls DoVerb until the iframe becomes visible,
-// up to 50 retries (10 seconds total).
+// Forward declaration: runs the initial coalesced activation attempts.
+void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR, DWORD);
+
+// References retained only for activation attempts that cannot yet complete.
+// A 200ms timer retries unavailable sites, windows, or rectangles and failed
+// DoVerb calls, removing each object as soon as no further retry is needed.
 bool IsActivationThread()
 {
     return g_loader.ownerThreadId != 0 &&
@@ -1225,8 +1228,6 @@ bool HasQueuedActivation(
     }
     return false;
 }
-
-void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
 bool QueuePendingActivation(IOleObject* pObj, IOleClientSite* pSite)
 {
@@ -1372,7 +1373,7 @@ void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
         }
     }
 
-    // Retry only objects that did not yet have a usable activation context.
+    // Retry only objects with an unavailable activation context or failed DoVerb.
     if (g_loader.activation.deferredCount > 0 &&
         !g_loader.activation.deferredTimer) {
         g_loader.activation.deferredRetries = 0;
