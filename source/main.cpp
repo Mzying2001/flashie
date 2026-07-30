@@ -173,6 +173,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_ACTIVATE:
+        if (g_pBrowser) {
+            g_pBrowser->OnFrameWindowActivate(
+                LOWORD(wParam) != WA_INACTIVE);
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
         case IDC_BACK:    if (g_pBrowser) g_pBrowser->GoBack();    break;
@@ -274,16 +281,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
                 continue;
             }
         }
-        // Let WebBrowser handle keyboard input only when focus is in browser area
-        if (g_pBrowser) {
-            HWND hwndFocus = GetFocus();
-            HWND hwndBrowser = g_pBrowser->GetBrowserWindow();
-            if (hwndFocus && hwndBrowser &&
-                (hwndFocus == hwndBrowser || IsChild(hwndBrowser, hwndFocus))) {
-                if (g_pBrowser->TranslateAccelerator(&msg))
-                    continue;
-            }
-        }
+        // The browser host validates whether this keyboard message belongs
+        // to its current window hierarchy before offering it to OLE.
+        if (g_pBrowser && g_pBrowser->TranslateAccelerator(&msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

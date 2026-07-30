@@ -66,6 +66,7 @@ private:
 class COleInPlaceFrame : public IOleInPlaceFrame {
 public:
     explicit COleInPlaceFrame(COleSite* pSite) : m_pSite(pSite) {}
+    ~COleInPlaceFrame();
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override;
     STDMETHODIMP_(ULONG) AddRef() override;
     STDMETHODIMP_(ULONG) Release() override;
@@ -74,15 +75,17 @@ public:
     STDMETHODIMP GetBorder(LPRECT) override { return INPLACE_E_NOTOOLSPACE; }
     STDMETHODIMP RequestBorderSpace(LPCBORDERWIDTHS) override { return INPLACE_E_NOTOOLSPACE; }
     STDMETHODIMP SetBorderSpace(LPCBORDERWIDTHS) override { return S_OK; }
-    STDMETHODIMP SetActiveObject(IOleInPlaceActiveObject*, LPCOLESTR) override { return S_OK; }
+    STDMETHODIMP SetActiveObject(IOleInPlaceActiveObject*, LPCOLESTR) override;
     STDMETHODIMP InsertMenus(HMENU, LPOLEMENUGROUPWIDTHS) override { return S_OK; }
     STDMETHODIMP SetMenu(HMENU, HOLEMENU, HWND) override { return S_OK; }
     STDMETHODIMP RemoveMenus(HMENU) override { return S_OK; }
     STDMETHODIMP SetStatusText(LPCOLESTR) override { return S_OK; }
     STDMETHODIMP EnableModeless(BOOL) override { return S_OK; }
     STDMETHODIMP TranslateAccelerator(LPMSG, WORD) override { return S_FALSE; }
+    IOleInPlaceActiveObject* AcquireActiveObject();
 private:
     COleSite* m_pSite;
+    IOleInPlaceActiveObject* m_pActiveObject = nullptr;
     ULONG m_ref = 0;
 };
 
@@ -190,6 +193,7 @@ public:
     void Stop();
     void Resize(const RECT& rc);
     bool TranslateAccelerator(MSG* msg);
+    void OnFrameWindowActivate(bool active);
     void Destroy();
 
     void SetNavigateCompleteCallback(NavigateCompleteCallback cb, void* ctx) {
@@ -228,4 +232,7 @@ private:
 
     void ConnectEvents();
     void DisconnectEvents();
+    IOleInPlaceActiveObject* AcquireActiveObject();
+    bool IsBrowserInputWindow(HWND hwnd);
+    void RefreshBrowserWindow();
 };

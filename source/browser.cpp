@@ -66,6 +66,10 @@ STDMETHODIMP COleInPlaceSite::GetWindow(HWND* phwnd)
 
 STDMETHODIMP COleInPlaceSite::OnInPlaceActivate()
 {
+    if (m_pSite->m_lpInPlaceObject) {
+        m_pSite->m_lpInPlaceObject->Release();
+        m_pSite->m_lpInPlaceObject = nullptr;
+    }
     if (m_pSite->m_lpOleObject) {
         m_pSite->m_lpOleObject->QueryInterface(IID_IOleInPlaceObject,
             reinterpret_cast<void**>(&m_pSite->m_lpInPlaceObject));
@@ -108,6 +112,14 @@ STDMETHODIMP COleInPlaceSite::OnInPlaceDeactivate()
 // COleInPlaceFrame
 // ===============================================================
 
+COleInPlaceFrame::~COleInPlaceFrame()
+{
+    if (m_pActiveObject) {
+        m_pActiveObject->Release();
+        m_pActiveObject = nullptr;
+    }
+}
+
 STDMETHODIMP COleInPlaceFrame::QueryInterface(REFIID riid, void** ppv)
 {
     if (riid == IID_IUnknown || riid == IID_IOleWindow || riid == IID_IOleInPlaceUIWindow || riid == IID_IOleInPlaceFrame) {
@@ -126,6 +138,24 @@ STDMETHODIMP COleInPlaceFrame::GetWindow(HWND* phwnd)
 {
     *phwnd = m_pSite->m_hWnd;
     return S_OK;
+}
+
+STDMETHODIMP COleInPlaceFrame::SetActiveObject(
+    IOleInPlaceActiveObject* activeObject, LPCOLESTR)
+{
+    if (activeObject)
+        activeObject->AddRef();
+    if (m_pActiveObject)
+        m_pActiveObject->Release();
+    m_pActiveObject = activeObject;
+    return S_OK;
+}
+
+IOleInPlaceActiveObject* COleInPlaceFrame::AcquireActiveObject()
+{
+    if (m_pActiveObject)
+        m_pActiveObject->AddRef();
+    return m_pActiveObject;
 }
 
 // ===============================================================
@@ -495,17 +525,7 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
     m_pWebBrowser->QueryInterface(IID_IOleInPlaceActiveObject,
                                   reinterpret_cast<void**>(&m_pIPActiveObj));
 
-    HWND hwndActive = nullptr;
-    if (m_pIPActiveObj && SUCCEEDED(m_pIPActiveObj->GetWindow(&hwndActive))) {
-        while (hwndActive) {
-            HWND hwndParentWindow = GetParent(hwndActive);
-            if (hwndParentWindow == hwndParent) {
-                m_hwndBrowser = hwndActive;
-                break;
-            }
-            hwndActive = hwndParentWindow;
-        }
-    }
+    RefreshBrowserWindow();
 
     ConnectEvents();
 
@@ -586,9 +606,86 @@ void BrowserHost::Resize(const RECT& rc)
 
 bool BrowserHost::TranslateAccelerator(MSG* msg)
 {
-    if (m_pIPActiveObj)
-        return m_pIPActiveObj->TranslateAccelerator(msg) == S_OK;
-    return false;
+    if (!msg || msg->message < WM_KEYFIRST || msg->message > WM_KEYLAST)
+        return false;
+
+    HWND inputWindow = msg->hwnd ? msg->hwnd : GetFocus();
+    if (!IsBrowserInputWindow(inputWindow))
+        return false;
+
+    IOleInPlaceActiveObject* activeObject = AcquireActiveObject();
+    if (!activeObject)
+        return false;
+
+    HRESULT hr = activeObject->TranslateAccelerator(msg);
+    activeObject->Release();
+    return hr == S_OK;
+}
+
+void BrowserHost::OnFrameWindowActivate(bool active)
+{
+    IOleInPlaceActiveObject* activeObject = AcquireActiveObject();
+    if (!activeObject)
+        return;
+
+    activeObject->OnFrameWindowActivate(active ? TRUE : FALSE);
+    activeObject->Release();
+}
+
+IOleInPlaceActiveObject* BrowserHost::AcquireActiveObject()
+{
+    IOleInPlaceActiveObject* activeObject = nullptr;
+    if (m_pSite && m_pSite->m_pInPlaceFrame)
+        activeObject = m_pSite->m_pInPlaceFrame->AcquireActiveObject();
+    if (!activeObject && m_pIPActiveObj) {
+        m_pIPActiveObj->AddRef();
+        activeObject = m_pIPActiveObj;
+    }
+    return activeObject;
+}
+
+void BrowserHost::RefreshBrowserWindow()
+{
+    m_hwndBrowser = nullptr;
+
+    HWND activeWindow = nullptr;
+    if (!m_pIPActiveObj ||
+        FAILED(m_pIPActiveObj->GetWindow(&activeWindow)) || !activeWindow) {
+        return;
+    }
+
+    HWND hostWindow = m_pSite ? m_pSite->m_hWnd : nullptr;
+    while (activeWindow && activeWindow != hostWindow) {
+        HWND parentWindow = GetParent(activeWindow);
+        if (parentWindow == hostWindow) {
+            m_hwndBrowser = activeWindow;
+            return;
+        }
+        activeWindow = parentWindow;
+    }
+}
+
+bool BrowserHost::IsBrowserInputWindow(HWND hwnd)
+{
+    if (!hwnd || !m_pSite)
+        return false;
+
+    // Windowless controls can leave keyboard focus on the container HWND.
+    if (hwnd == m_pSite->m_hWnd)
+        return true;
+
+    if (!m_hwndBrowser || !IsWindow(m_hwndBrowser))
+        RefreshBrowserWindow();
+
+    if (m_hwndBrowser &&
+        (hwnd == m_hwndBrowser || IsChild(m_hwndBrowser, hwnd))) {
+        return true;
+    }
+
+    // The WebBrowser can replace its direct child window while navigating.
+    RefreshBrowserWindow();
+    return m_hwndBrowser &&
+           (hwnd == m_hwndBrowser || IsChild(m_hwndBrowser, hwnd));
 }
 
 void BrowserHost::ConnectEvents()
