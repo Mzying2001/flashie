@@ -1,5 +1,543 @@
 #include "browser.h"
 #include "swf_mime_filter.h"
+#include <mshtml.h>
+#include <mshtmdid.h>
+#include <cwchar>
+#include <new>
+
+enum class FocusTargetKind {
+    None = -1,
+    Background = 0,
+    Text = 1,
+    Interactive = 2,
+};
+
+class FlashFocusState {
+public:
+    ULONG AddRef()
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG Release()
+    {
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (!ref)
+            delete this;
+        return ref;
+    }
+
+    void RecordPointerDown(FocusTargetKind kind)
+    {
+        m_targetKind = kind;
+        m_messageTime = static_cast<DWORD>(GetMessageTime());
+    }
+
+    void ClearPointer()
+    {
+        m_targetKind = FocusTargetKind::None;
+        m_messageTime = 0;
+    }
+
+    bool ShouldCancelBackgroundDeactivate() const
+    {
+        return m_targetKind == FocusTargetKind::Background &&
+               m_messageTime == static_cast<DWORD>(GetMessageTime()) &&
+               (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+    }
+
+private:
+    LONG m_ref = 1;
+    FocusTargetKind m_targetKind = FocusTargetKind::None;
+    DWORD m_messageTime = 0;
+};
+
+static IUnknown* GetVariantObject(const VARIANT& value)
+{
+    if (value.vt == VT_DISPATCH)
+        return value.pdispVal;
+    if (value.vt == VT_UNKNOWN)
+        return value.punkVal;
+    if (value.vt == (VT_DISPATCH | VT_BYREF) && value.ppdispVal)
+        return *value.ppdispVal;
+    if (value.vt == (VT_UNKNOWN | VT_BYREF) && value.ppunkVal)
+        return *value.ppunkVal;
+    return nullptr;
+}
+
+static IHTMLEventObj* GetHtmlEvent(DISPPARAMS* params)
+{
+    if (!params || params->cArgs < 1 || !params->rgvarg)
+        return nullptr;
+
+    IUnknown* object = GetVariantObject(params->rgvarg[0]);
+    IHTMLEventObj* event = nullptr;
+    if (object) {
+        object->QueryInterface(
+            IID_IHTMLEventObj, reinterpret_cast<void**>(&event));
+    }
+    return event;
+}
+
+static bool GetSpecifiedAttribute(
+    IHTMLElement* element, const wchar_t* name, VARIANT* value)
+{
+    if (!element || !name || !value)
+        return false;
+    VariantInit(value);
+
+    IHTMLDOMNode* node = nullptr;
+    IDispatch* attributesDispatch = nullptr;
+    IHTMLAttributeCollection* attributes = nullptr;
+    IDispatch* attributeDispatch = nullptr;
+    IHTMLDOMAttribute* attribute = nullptr;
+    bool found = false;
+
+    if (SUCCEEDED(element->QueryInterface(
+            IID_IHTMLDOMNode, reinterpret_cast<void**>(&node))) && node &&
+        SUCCEEDED(node->get_attributes(&attributesDispatch)) &&
+        attributesDispatch &&
+        SUCCEEDED(attributesDispatch->QueryInterface(
+            IID_IHTMLAttributeCollection,
+            reinterpret_cast<void**>(&attributes))) && attributes) {
+        VARIANT attributeName;
+        VariantInit(&attributeName);
+        attributeName.vt = VT_BSTR;
+        attributeName.bstrVal = SysAllocString(name);
+        if (attributeName.bstrVal &&
+            SUCCEEDED(attributes->item(
+                &attributeName, &attributeDispatch)) &&
+            attributeDispatch &&
+            SUCCEEDED(attributeDispatch->QueryInterface(
+                IID_IHTMLDOMAttribute,
+                reinterpret_cast<void**>(&attribute))) && attribute) {
+            VARIANT_BOOL specified = VARIANT_FALSE;
+            if (SUCCEEDED(attribute->get_specified(&specified)) &&
+                specified == VARIANT_TRUE &&
+                SUCCEEDED(attribute->get_nodeValue(value))) {
+                found = true;
+            }
+        }
+        VariantClear(&attributeName);
+    }
+
+    if (attribute) attribute->Release();
+    if (attributeDispatch) attributeDispatch->Release();
+    if (attributes) attributes->Release();
+    if (attributesDispatch) attributesDispatch->Release();
+    if (node) node->Release();
+    if (!found) {
+        VariantClear(value);
+        VariantInit(value);
+    }
+    return found;
+}
+
+static bool VariantToLong(const VARIANT& value, long* number)
+{
+    if (!number)
+        return false;
+
+    VARIANT converted;
+    VariantInit(&converted);
+    HRESULT hr = VariantChangeType(
+        &converted, const_cast<VARIANT*>(&value), 0, VT_I4);
+    if (SUCCEEDED(hr))
+        *number = converted.lVal;
+    VariantClear(&converted);
+    return SUCCEEDED(hr);
+}
+
+static bool ContainsInsensitive(BSTR value, const wchar_t* needle)
+{
+    if (!value || !needle)
+        return false;
+
+    const size_t valueLength = SysStringLen(value);
+    const size_t needleLength = wcslen(needle);
+    if (!needleLength || needleLength > valueLength)
+        return false;
+
+    for (size_t i = 0; i + needleLength <= valueLength; ++i) {
+        if (_wcsnicmp(value + i, needle, needleLength) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool AttributeContains(
+    IHTMLElement* element, const wchar_t* name, const wchar_t* needle)
+{
+    VARIANT value;
+    if (!GetSpecifiedAttribute(element, name, &value))
+        return false;
+
+    VARIANT text;
+    VariantInit(&text);
+    HRESULT hr = VariantChangeType(&text, &value, 0, VT_BSTR);
+    bool matches = SUCCEEDED(hr) && ContainsInsensitive(text.bstrVal, needle);
+    VariantClear(&text);
+    VariantClear(&value);
+    return matches;
+}
+
+static bool IsFlashElement(IHTMLElement* element)
+{
+    if (!element)
+        return false;
+
+    BSTR tag = nullptr;
+    element->get_tagName(&tag);
+    bool isObject = tag && _wcsicmp(tag, L"OBJECT") == 0;
+    bool isEmbed = tag && _wcsicmp(tag, L"EMBED") == 0;
+    SysFreeString(tag);
+    if (!isObject && !isEmbed)
+        return false;
+
+    static const wchar_t flashClsid[] =
+        L"D27CDB6E-AE6D-11CF-96B8-444553540000";
+    static const wchar_t flashMime[] =
+        L"application/x-shockwave-flash";
+
+    if (AttributeContains(element, L"classid", flashClsid) ||
+        AttributeContains(element, L"type", flashMime)) {
+        return true;
+    }
+
+    if (isObject) {
+        IHTMLObjectElement* object = nullptr;
+        if (SUCCEEDED(element->QueryInterface(
+                IID_IHTMLObjectElement,
+                reinterpret_cast<void**>(&object))) && object) {
+            BSTR classid = nullptr;
+            BSTR type = nullptr;
+            object->get_classid(&classid);
+            object->get_type(&type);
+            bool isFlash = ContainsInsensitive(classid, flashClsid) ||
+                           ContainsInsensitive(type, flashMime);
+            SysFreeString(type);
+            SysFreeString(classid);
+            object->Release();
+            return isFlash;
+        }
+    }
+    return false;
+}
+
+static bool IsInteractiveTag(BSTR tag)
+{
+    if (!tag)
+        return false;
+
+    static const wchar_t* const tags[] = {
+        L"A", L"AREA", L"INPUT", L"TEXTAREA", L"SELECT", L"BUTTON",
+        L"OPTION", L"LABEL", L"IFRAME", L"FRAME", L"OBJECT", L"EMBED"
+    };
+    for (const wchar_t* candidate : tags) {
+        if (_wcsicmp(tag, candidate) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool IsContentEditable(IHTMLElement* element)
+{
+    IHTMLElement3* element3 = nullptr;
+    if (FAILED(element->QueryInterface(
+            IID_IHTMLElement3, reinterpret_cast<void**>(&element3))) ||
+        !element3) {
+        return false;
+    }
+
+    VARIANT_BOOL editable = VARIANT_FALSE;
+    element3->get_isContentEditable(&editable);
+    element3->Release();
+    return editable == VARIANT_TRUE;
+}
+
+static bool HasExplicitTabIndex(IHTMLElement* element)
+{
+    VARIANT value;
+    if (!GetSpecifiedAttribute(element, L"tabIndex", &value))
+        return false;
+
+    long tabIndex = -1;
+    bool focusable = VariantToLong(value, &tabIndex) && tabIndex >= 0;
+    VariantClear(&value);
+    return focusable;
+}
+
+static bool HasInteractiveAncestor(IHTMLElement* element)
+{
+    IHTMLElement* current = element;
+    current->AddRef();
+
+    while (current) {
+        BSTR tag = nullptr;
+        current->get_tagName(&tag);
+        bool interactive = IsInteractiveTag(tag) ||
+                           IsContentEditable(current) ||
+                           HasExplicitTabIndex(current);
+        SysFreeString(tag);
+
+        IHTMLElement* parent = nullptr;
+        if (!interactive)
+            current->get_parentElement(&parent);
+        current->Release();
+        if (interactive) {
+            if (parent) parent->Release();
+            return true;
+        }
+        current = parent;
+    }
+    return false;
+}
+
+static bool PointIntersectsElementText(
+    IHTMLElement* element, long clientX, long clientY)
+{
+    IDispatch* documentDispatch = nullptr;
+    IHTMLDocument2* document = nullptr;
+    IHTMLElement* body = nullptr;
+    IHTMLBodyElement* bodyElement = nullptr;
+    IHTMLTxtRange* range = nullptr;
+    IHTMLTextRangeMetrics2* metrics = nullptr;
+    IHTMLRectCollection* rects = nullptr;
+    bool hit = false;
+
+    if (SUCCEEDED(element->get_document(&documentDispatch)) &&
+        documentDispatch &&
+        SUCCEEDED(documentDispatch->QueryInterface(
+            IID_IHTMLDocument2, reinterpret_cast<void**>(&document))) &&
+        document && SUCCEEDED(document->get_body(&body)) && body &&
+        SUCCEEDED(body->QueryInterface(
+            IID_IHTMLBodyElement,
+            reinterpret_cast<void**>(&bodyElement))) && bodyElement &&
+        SUCCEEDED(bodyElement->createTextRange(&range)) && range &&
+        SUCCEEDED(range->moveToElementText(element)) &&
+        SUCCEEDED(range->QueryInterface(
+            IID_IHTMLTextRangeMetrics2,
+            reinterpret_cast<void**>(&metrics))) && metrics &&
+        SUCCEEDED(metrics->getClientRects(&rects)) && rects) {
+        long count = 0;
+        if (SUCCEEDED(rects->get_length(&count))) {
+            for (long i = 0; i < count && !hit; ++i) {
+                VARIANT index;
+                VARIANT value;
+                VariantInit(&index);
+                VariantInit(&value);
+                index.vt = VT_I4;
+                index.lVal = i;
+                if (SUCCEEDED(rects->item(&index, &value))) {
+                    IUnknown* object = GetVariantObject(value);
+                    IHTMLRect* rect = nullptr;
+                    if (object && SUCCEEDED(object->QueryInterface(
+                            IID_IHTMLRect,
+                            reinterpret_cast<void**>(&rect))) && rect) {
+                        long left = 0;
+                        long top = 0;
+                        long right = 0;
+                        long bottom = 0;
+                        if (SUCCEEDED(rect->get_left(&left)) &&
+                            SUCCEEDED(rect->get_top(&top)) &&
+                            SUCCEEDED(rect->get_right(&right)) &&
+                            SUCCEEDED(rect->get_bottom(&bottom))) {
+                            hit = clientX >= left && clientX <= right &&
+                                  clientY >= top && clientY <= bottom;
+                        }
+                        rect->Release();
+                    }
+                }
+                VariantClear(&value);
+            }
+        }
+    }
+
+    if (rects) rects->Release();
+    if (metrics) metrics->Release();
+    if (range) range->Release();
+    if (bodyElement) bodyElement->Release();
+    if (body) body->Release();
+    if (document) document->Release();
+    if (documentDispatch) documentDispatch->Release();
+    return hit;
+}
+
+static FocusTargetKind ClassifyPointerTarget(IHTMLEventObj* event)
+{
+    IHTMLElement* source = nullptr;
+    if (!event || FAILED(event->get_srcElement(&source)) || !source)
+        return FocusTargetKind::None;
+
+    if (HasInteractiveAncestor(source)) {
+        source->Release();
+        return FocusTargetKind::Interactive;
+    }
+
+    long clientX = 0;
+    long clientY = 0;
+    bool hasPoint = SUCCEEDED(event->get_clientX(&clientX)) &&
+                    SUCCEEDED(event->get_clientY(&clientY));
+    bool hitsText = hasPoint &&
+                    PointIntersectsElementText(source, clientX, clientY);
+    source->Release();
+    return hitsText ? FocusTargetKind::Text : FocusTargetKind::Background;
+}
+
+class HtmlDocumentEventSink final : public IDispatch {
+public:
+    explicit HtmlDocumentEventSink(FlashFocusState* state) : m_state(state)
+    {
+        m_state->AddRef();
+    }
+
+    ~HtmlDocumentEventSink()
+    {
+        m_state->Release();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv)
+            return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDispatch ||
+            riid == DIID_HTMLDocumentEvents2) {
+            *ppv = static_cast<IDispatch*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (!ref)
+            delete this;
+        return ref;
+    }
+
+    STDMETHODIMP GetTypeInfoCount(UINT* count) override
+    {
+        if (!count)
+            return E_POINTER;
+        *count = 0;
+        return S_OK;
+    }
+
+    STDMETHODIMP GetTypeInfo(UINT, LCID, ITypeInfo**) override
+    {
+        return E_NOTIMPL;
+    }
+
+    STDMETHODIMP GetIDsOfNames(
+        REFIID, OLECHAR**, UINT, LCID, DISPID*) override
+    {
+        return DISP_E_UNKNOWNNAME;
+    }
+
+    STDMETHODIMP Invoke(
+        DISPID dispid, REFIID, LCID, WORD, DISPPARAMS* params,
+        VARIANT* result, EXCEPINFO*, UINT*) override
+    {
+        if (dispid == DISPID_HTMLDOCUMENTEVENTS2_ONMOUSEUP) {
+            m_state->ClearPointer();
+            return S_OK;
+        }
+
+        IHTMLEventObj* event = GetHtmlEvent(params);
+        if (dispid == DISPID_HTMLDOCUMENTEVENTS2_ONMOUSEDOWN) {
+            long button = 0;
+            if (event && SUCCEEDED(event->get_button(&button)) && button == 1)
+                m_state->RecordPointerDown(ClassifyPointerTarget(event));
+            else
+                m_state->ClearPointer();
+            if (event) event->Release();
+            return S_OK;
+        }
+
+        if (dispid == DISPID_HTMLDOCUMENTEVENTS2_ONBEFOREDEACTIVATE) {
+            bool cancel = false;
+            IHTMLElement* source = nullptr;
+            if (event && SUCCEEDED(event->get_srcElement(&source)) && source) {
+                cancel = IsFlashElement(source) &&
+                         m_state->ShouldCancelBackgroundDeactivate();
+                source->Release();
+            }
+
+            if (result) {
+                VariantInit(result);
+                result->vt = VT_BOOL;
+                result->boolVal = cancel ? VARIANT_FALSE : VARIANT_TRUE;
+            }
+            if (cancel && event) {
+                VARIANT returnValue;
+                VariantInit(&returnValue);
+                returnValue.vt = VT_BOOL;
+                returnValue.boolVal = VARIANT_FALSE;
+                event->put_returnValue(returnValue);
+            }
+            if (event) event->Release();
+            return S_OK;
+        }
+
+        if (event) event->Release();
+        return S_OK;
+    }
+
+private:
+    LONG m_ref = 1;
+    FlashFocusState* m_state;
+};
+
+static void ConnectDocumentFocusEvents(
+    IDispatch* browserDispatch, FlashFocusState* state)
+{
+    if (!browserDispatch || !state)
+        return;
+
+    IWebBrowser2* frameBrowser = nullptr;
+    IDispatch* documentDispatch = nullptr;
+    IHTMLDocument2* document = nullptr;
+    IConnectionPointContainer* container = nullptr;
+    IConnectionPoint* connection = nullptr;
+
+    if (SUCCEEDED(browserDispatch->QueryInterface(
+            IID_IWebBrowser2, reinterpret_cast<void**>(&frameBrowser))) &&
+        frameBrowser &&
+        SUCCEEDED(frameBrowser->get_Document(&documentDispatch)) &&
+        documentDispatch &&
+        SUCCEEDED(documentDispatch->QueryInterface(
+            IID_IHTMLDocument2, reinterpret_cast<void**>(&document))) &&
+        document &&
+        SUCCEEDED(document->QueryInterface(
+            IID_IConnectionPointContainer,
+            reinterpret_cast<void**>(&container))) && container &&
+        SUCCEEDED(container->FindConnectionPoint(
+            DIID_HTMLDocumentEvents2, &connection)) && connection) {
+        HtmlDocumentEventSink* sink =
+            new (std::nothrow) HtmlDocumentEventSink(state);
+        if (sink) {
+            DWORD cookie = 0;
+            connection->Advise(static_cast<IDispatch*>(sink), &cookie);
+            // The document owns the advised sink. The sink intentionally does
+            // not retain the document or connection point, avoiding a cycle.
+            sink->Release();
+        }
+    }
+
+    if (connection) connection->Release();
+    if (container) container->Release();
+    if (document) document->Release();
+    if (documentDispatch) documentDispatch->Release();
+    if (frameBrowser) frameBrowser->Release();
+}
 
 static bool IsTopLevelBrowserEvent(
     IDispatch* eventDispatch, IWebBrowser2* browser)
@@ -66,6 +604,10 @@ STDMETHODIMP COleInPlaceSite::GetWindow(HWND* phwnd)
 
 STDMETHODIMP COleInPlaceSite::OnInPlaceActivate()
 {
+    if (m_pSite->m_lpInPlaceObject) {
+        m_pSite->m_lpInPlaceObject->Release();
+        m_pSite->m_lpInPlaceObject = nullptr;
+    }
     if (m_pSite->m_lpOleObject) {
         m_pSite->m_lpOleObject->QueryInterface(IID_IOleInPlaceObject,
             reinterpret_cast<void**>(&m_pSite->m_lpInPlaceObject));
@@ -108,6 +650,14 @@ STDMETHODIMP COleInPlaceSite::OnInPlaceDeactivate()
 // COleInPlaceFrame
 // ===============================================================
 
+COleInPlaceFrame::~COleInPlaceFrame()
+{
+    if (m_pActiveObject) {
+        m_pActiveObject->Release();
+        m_pActiveObject = nullptr;
+    }
+}
+
 STDMETHODIMP COleInPlaceFrame::QueryInterface(REFIID riid, void** ppv)
 {
     if (riid == IID_IUnknown || riid == IID_IOleWindow || riid == IID_IOleInPlaceUIWindow || riid == IID_IOleInPlaceFrame) {
@@ -126,6 +676,24 @@ STDMETHODIMP COleInPlaceFrame::GetWindow(HWND* phwnd)
 {
     *phwnd = m_pSite->m_hWnd;
     return S_OK;
+}
+
+STDMETHODIMP COleInPlaceFrame::SetActiveObject(
+    IOleInPlaceActiveObject* activeObject, LPCOLESTR)
+{
+    if (activeObject)
+        activeObject->AddRef();
+    if (m_pActiveObject)
+        m_pActiveObject->Release();
+    m_pActiveObject = activeObject;
+    return S_OK;
+}
+
+IOleInPlaceActiveObject* COleInPlaceFrame::AcquireActiveObject()
+{
+    if (m_pActiveObject)
+        m_pActiveObject->AddRef();
+    return m_pActiveObject;
 }
 
 // ===============================================================
@@ -369,6 +937,25 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
         return S_OK;
     }
 
+    case DISPID_DOCUMENTCOMPLETE:
+        // Subscribe natively in every completed frame. A shared input state is
+        // required because Flash commonly lives in a cross-origin iframe while
+        // the background click arrives through its parent document.
+        if (pDispParams->cArgs >= 2 && m_pBrowserHost &&
+            m_pBrowserHost->m_pFlashFocusState) {
+            IUnknown* frame = GetVariantObject(pDispParams->rgvarg[1]);
+            IDispatch* frameDispatch = nullptr;
+            if (frame && SUCCEEDED(frame->QueryInterface(
+                    IID_IDispatch,
+                    reinterpret_cast<void**>(&frameDispatch))) &&
+                frameDispatch) {
+                ConnectDocumentFocusEvents(
+                    frameDispatch, m_pBrowserHost->m_pFlashFocusState);
+                frameDispatch->Release();
+            }
+        }
+        return S_OK;
+
     case DISPID_NAVIGATEERROR: {
         // Params (reverse): Cancel=[0], StatusCode=[1], Frame=[2],
         // URL=[3], pDisp=[4]. A failed top-level navigation must not leave
@@ -464,6 +1051,8 @@ STDMETHODIMP COleSite::Invoke(DISPID dispid, REFIID, LCID, WORD wFlags, DISPPARA
 bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
 {
     m_swfMimeFilterInitialized = SwfMimeFilter::Initialize();
+    if (!m_pFlashFocusState)
+        m_pFlashFocusState = new (std::nothrow) FlashFocusState();
 
     m_pSite = new COleSite();
     m_pSite->m_hWnd = hwndParent;
@@ -495,17 +1084,7 @@ bool BrowserHost::Initialize(HWND hwndParent, const RECT& rc)
     m_pWebBrowser->QueryInterface(IID_IOleInPlaceActiveObject,
                                   reinterpret_cast<void**>(&m_pIPActiveObj));
 
-    HWND hwndActive = nullptr;
-    if (m_pIPActiveObj && SUCCEEDED(m_pIPActiveObj->GetWindow(&hwndActive))) {
-        while (hwndActive) {
-            HWND hwndParentWindow = GetParent(hwndActive);
-            if (hwndParentWindow == hwndParent) {
-                m_hwndBrowser = hwndActive;
-                break;
-            }
-            hwndActive = hwndParentWindow;
-        }
-    }
+    RefreshBrowserWindow();
 
     ConnectEvents();
 
@@ -586,9 +1165,86 @@ void BrowserHost::Resize(const RECT& rc)
 
 bool BrowserHost::TranslateAccelerator(MSG* msg)
 {
-    if (m_pIPActiveObj)
-        return m_pIPActiveObj->TranslateAccelerator(msg) == S_OK;
-    return false;
+    if (!msg || msg->message < WM_KEYFIRST || msg->message > WM_KEYLAST)
+        return false;
+
+    HWND inputWindow = msg->hwnd ? msg->hwnd : GetFocus();
+    if (!IsBrowserInputWindow(inputWindow))
+        return false;
+
+    IOleInPlaceActiveObject* activeObject = AcquireActiveObject();
+    if (!activeObject)
+        return false;
+
+    HRESULT hr = activeObject->TranslateAccelerator(msg);
+    activeObject->Release();
+    return hr == S_OK;
+}
+
+void BrowserHost::OnFrameWindowActivate(bool active)
+{
+    IOleInPlaceActiveObject* activeObject = AcquireActiveObject();
+    if (!activeObject)
+        return;
+
+    activeObject->OnFrameWindowActivate(active ? TRUE : FALSE);
+    activeObject->Release();
+}
+
+IOleInPlaceActiveObject* BrowserHost::AcquireActiveObject()
+{
+    IOleInPlaceActiveObject* activeObject = nullptr;
+    if (m_pSite && m_pSite->m_pInPlaceFrame)
+        activeObject = m_pSite->m_pInPlaceFrame->AcquireActiveObject();
+    if (!activeObject && m_pIPActiveObj) {
+        m_pIPActiveObj->AddRef();
+        activeObject = m_pIPActiveObj;
+    }
+    return activeObject;
+}
+
+void BrowserHost::RefreshBrowserWindow()
+{
+    m_hwndBrowser = nullptr;
+
+    HWND activeWindow = nullptr;
+    if (!m_pIPActiveObj ||
+        FAILED(m_pIPActiveObj->GetWindow(&activeWindow)) || !activeWindow) {
+        return;
+    }
+
+    HWND hostWindow = m_pSite ? m_pSite->m_hWnd : nullptr;
+    while (activeWindow && activeWindow != hostWindow) {
+        HWND parentWindow = GetParent(activeWindow);
+        if (parentWindow == hostWindow) {
+            m_hwndBrowser = activeWindow;
+            return;
+        }
+        activeWindow = parentWindow;
+    }
+}
+
+bool BrowserHost::IsBrowserInputWindow(HWND hwnd)
+{
+    if (!hwnd || !m_pSite)
+        return false;
+
+    // Windowless controls can leave keyboard focus on the container HWND.
+    if (hwnd == m_pSite->m_hWnd)
+        return true;
+
+    if (!m_hwndBrowser || !IsWindow(m_hwndBrowser))
+        RefreshBrowserWindow();
+
+    if (m_hwndBrowser &&
+        (hwnd == m_hwndBrowser || IsChild(m_hwndBrowser, hwnd))) {
+        return true;
+    }
+
+    // The WebBrowser can replace its direct child window while navigating.
+    RefreshBrowserWindow();
+    return m_hwndBrowser &&
+           (hwnd == m_hwndBrowser || IsChild(m_hwndBrowser, hwnd));
 }
 
 void BrowserHost::ConnectEvents()
@@ -658,5 +1314,10 @@ void BrowserHost::Destroy()
     if (m_swfMimeFilterInitialized) {
         SwfMimeFilter::Shutdown();
         m_swfMimeFilterInitialized = false;
+    }
+
+    if (m_pFlashFocusState) {
+        m_pFlashFocusState->Release();
+        m_pFlashFocusState = nullptr;
     }
 }
