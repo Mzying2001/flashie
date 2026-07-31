@@ -1142,27 +1142,38 @@ void MaybeHookFlashQI(IUnknown* pObj)
 // restored during deactivation.
 // =====================================================================
 
-// Saved references for deferred re-activation (handles display:none iframes).
-// A 200ms repeating timer calls DoVerb until the iframe becomes visible,
-// up to 50 retries (10 seconds total).
+// Forward declaration: runs the initial coalesced activation attempts.
+void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR, DWORD);
+
+// References retained only for activation attempts that cannot yet complete.
+// A 200ms timer retries unavailable sites, windows, or rectangles and failed
+// DoVerb calls, removing each object as soon as no further retry is needed.
 bool IsActivationThread()
 {
     return g_loader.ownerThreadId != 0 &&
            g_loader.ownerThreadId == GetCurrentThreadId();
 }
 
-HRESULT ActivateInPlace(IOleObject* pObj, IOleClientSite* pSite)
+HRESULT ActivateInPlace(
+    IOleObject* pObj, IOleClientSite* pSite, bool* retryNeeded)
 {
+    if (retryNeeded)
+        *retryNeeded = false;
+
     IOleInPlaceSite* inPlaceSite = nullptr;
     HRESULT hr = pSite->QueryInterface(
         IID_IOleInPlaceSite, reinterpret_cast<void**>(&inPlaceSite));
-    if (FAILED(hr) || !inPlaceSite)
+    if (FAILED(hr) || !inPlaceSite) {
+        if (retryNeeded)
+            *retryNeeded = true;
         return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
 
     HWND parent = nullptr;
     hr = inPlaceSite->GetWindow(&parent);
 
     RECT posRect = {};
+    bool hasSiteRect = false;
     if (SUCCEEDED(hr) && parent) {
         IOleInPlaceFrame* frame = nullptr;
         IOleInPlaceUIWindow* doc = nullptr;
@@ -1175,34 +1186,133 @@ HRESULT ActivateInPlace(IOleObject* pObj, IOleClientSite* pSite)
         if (frame) frame->Release();
         if (doc) doc->Release();
 
-        if (FAILED(contextHr) && !GetClientRect(parent, &posRect))
+        if (SUCCEEDED(contextHr)) {
+            hasSiteRect = true;
+        } else if (!GetClientRect(parent, &posRect)) {
             hr = HRESULT_FROM_WIN32(GetLastError());
+        }
     } else if (SUCCEEDED(hr)) {
         hr = E_HANDLE;
     }
 
     inPlaceSite->Release();
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+        if (retryNeeded)
+            *retryNeeded = true;
         return hr;
+    }
 
-    return pObj->DoVerb(
+    // A display:none iframe can expose a client site before it has a usable
+    // window or position. Do not disturb controls that are already active.
+    if (!IsWindow(parent) || !IsWindowVisible(parent) ||
+        (hasSiteRect && (posRect.right <= posRect.left ||
+                         posRect.bottom <= posRect.top))) {
+        if (retryNeeded)
+            *retryNeeded = true;
+        return S_FALSE;
+    }
+
+    hr = pObj->DoVerb(
         OLEIVERB_INPLACEACTIVATE, nullptr, pSite, 0, parent, &posRect);
+    if (FAILED(hr) && retryNeeded)
+        *retryNeeded = true;
+    return hr;
+}
+
+bool HasQueuedActivation(
+    const PendingActivation* entries, int count, IOleObject* pObj)
+{
+    for (int i = 0; i < count; i++) {
+        if (entries[i].pObj == pObj)
+            return true;
+    }
+    return false;
+}
+
+bool QueuePendingActivation(IOleObject* pObj, IOleClientSite* pSite)
+{
+    if (!pObj || !pSite ||
+        HasQueuedActivation(
+            g_loader.activation.pending,
+            g_loader.activation.pendingCount, pObj) ||
+        HasQueuedActivation(
+            g_loader.activation.deferred,
+            g_loader.activation.deferredCount, pObj)) {
+        return false;
+    }
+
+    if (g_loader.activation.pendingCount >= MAX_PENDING)
+        return false;
+
+    pObj->AddRef();
+    pSite->AddRef();
+    int index = g_loader.activation.pendingCount++;
+    g_loader.activation.pending[index].pObj = pObj;
+    g_loader.activation.pending[index].pSite = pSite;
+
+    if (!g_loader.activation.activateTimer) {
+        g_loader.activation.activateTimer =
+            SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
+        if (!g_loader.activation.activateTimer) {
+            g_loader.activation.pending[--g_loader.activation.pendingCount] = {};
+            pSite->Release();
+            pObj->Release();
+            return false;
+        }
+    }
+    return true;
+}
+
+void RemovePendingActivation(IOleObject* pObj)
+{
+    for (int i = 0; i < g_loader.activation.pendingCount; i++) {
+        PendingActivation& entry = g_loader.activation.pending[i];
+        if (entry.pObj != pObj)
+            continue;
+
+        if (entry.pSite) entry.pSite->Release();
+        if (entry.pObj) entry.pObj->Release();
+        entry = g_loader.activation.pending[--g_loader.activation.pendingCount];
+        g_loader.activation.pending[g_loader.activation.pendingCount] = {};
+        break;
+    }
+
+    if (g_loader.activation.pendingCount == 0 &&
+        g_loader.activation.activateTimer) {
+        KillTimer(nullptr, g_loader.activation.activateTimer);
+        g_loader.activation.activateTimer = 0;
+    }
 }
 
 void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
     g_loader.activation.deferredRetries++;
 
-    for (int i = 0; i < g_loader.activation.deferredCount; i++) {
-        IOleObject* pObj = g_loader.activation.deferred[i].pObj;
-        IOleClientSite* pSite = g_loader.activation.deferred[i].pSite;
-        if (pObj && pSite) {
-            ActivateInPlace(pObj, pSite);
+    int index = 0;
+    while (index < g_loader.activation.deferredCount) {
+        IOleObject* pObj = g_loader.activation.deferred[index].pObj;
+        IOleClientSite* pSite = g_loader.activation.deferred[index].pSite;
+        bool retryNeeded = false;
+        HRESULT hr = (pObj && pSite)
+            ? ActivateInPlace(pObj, pSite, &retryNeeded)
+            : E_POINTER;
+
+        if (retryNeeded) {
+            index++;
+            continue;
         }
+
+        DbgTrace(L"[FlashIE] DeferredActivate completed -> hr=0x%08X\n", hr);
+        if (pSite) pSite->Release();
+        if (pObj) pObj->Release();
+        g_loader.activation.deferred[index] =
+            g_loader.activation.deferred[--g_loader.activation.deferredCount];
+        g_loader.activation.deferred[g_loader.activation.deferredCount] = {};
     }
 
     // Stop after max retries — release references and kill timer
-    if (g_loader.activation.deferredRetries >= MAX_DEFERRED_RETRIES) {
+    if (g_loader.activation.deferredCount == 0 ||
+        g_loader.activation.deferredRetries >= MAX_DEFERRED_RETRIES) {
         KillTimer(nullptr, idTimer);
         g_loader.activation.deferredTimer = 0;
         for (int i = 0; i < g_loader.activation.deferredCount; i++) {
@@ -1220,18 +1330,37 @@ void CALLBACK DeferredActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
 {
     KillTimer(nullptr, idTimer);
-    g_loader.activation.activateTimer = 0;
+    if (g_loader.activation.activateTimer == idTimer)
+        g_loader.activation.activateTimer = 0;
 
-    for (int i = 0; i < g_loader.activation.pendingCount; i++) {
-        IOleObject* pObj = g_loader.activation.pending[i].pObj;
-        IOleClientSite* pSite = g_loader.activation.pending[i].pSite;
+    PendingActivation pending[MAX_PENDING] = {};
+    int pendingCount = g_loader.activation.pendingCount;
+    for (int i = 0; i < pendingCount; i++) {
+        pending[i] = g_loader.activation.pending[i];
+        g_loader.activation.pending[i] = {};
+    }
+    g_loader.activation.pendingCount = 0;
+
+    for (int i = 0; i < pendingCount; i++) {
+        IOleObject* pObj = pending[i].pObj;
+        IOleClientSite* pSite = pending[i].pSite;
         if (pObj && pSite) {
-            HRESULT hr = ActivateInPlace(pObj, pSite);
+            bool retryNeeded = false;
+            HRESULT hr = ActivateInPlace(pObj, pSite, &retryNeeded);
             DbgTrace(L"[FlashIE] ForceActivate DoVerb -> hr=0x%08X\n", hr);
 
-            // Save for deferred re-activation: Flash in display:none iframes
-            // may need re-activation when the iframe becomes visible.
-            if (g_loader.activation.deferredCount < MAX_DEFERRED) {
+            // DoVerb may re-enter SetClientSite. The current attempt already
+            // accounts for that object, so discard the duplicate queue entry.
+            RemovePendingActivation(pObj);
+
+            if (retryNeeded &&
+                g_loader.activation.deferredCount < MAX_DEFERRED &&
+                !HasQueuedActivation(
+                    g_loader.activation.pending,
+                    g_loader.activation.pendingCount, pObj) &&
+                !HasQueuedActivation(
+                    g_loader.activation.deferred,
+                    g_loader.activation.deferredCount, pObj)) {
                 pObj->AddRef();
                 pSite->AddRef();
                 int index = g_loader.activation.deferredCount++;
@@ -1243,14 +1372,23 @@ void CALLBACK ForceActivateTimerProc(HWND, UINT, UINT_PTR idTimer, DWORD)
             pObj->Release();
         }
     }
-    g_loader.activation.pendingCount = 0;
 
-    // Schedule repeating re-activation every 200ms for display:none iframes
+    // Retry only objects with an unavailable activation context or failed DoVerb.
     if (g_loader.activation.deferredCount > 0 &&
         !g_loader.activation.deferredTimer) {
         g_loader.activation.deferredRetries = 0;
         g_loader.activation.deferredTimer =
             SetTimer(nullptr, 0, 200, DeferredActivateTimerProc);
+        if (!g_loader.activation.deferredTimer) {
+            for (int i = 0; i < g_loader.activation.deferredCount; i++) {
+                if (g_loader.activation.deferred[i].pSite)
+                    g_loader.activation.deferred[i].pSite->Release();
+                if (g_loader.activation.deferred[i].pObj)
+                    g_loader.activation.deferred[i].pObj->Release();
+                g_loader.activation.deferred[i] = {};
+            }
+            g_loader.activation.deferredCount = 0;
+        }
     }
 }
 
@@ -1288,19 +1426,9 @@ HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
     HRESULT hr = g_loader.flashHooks.setClientSite(pThis, pClientSite);
 
     // When MSHTML sets a non-null client site, queue forced activation
-    if (SUCCEEDED(hr) && pClientSite && IsActivationThread() &&
-        g_loader.activation.pendingCount < MAX_PENDING) {
-        pThis->AddRef();
-        pClientSite->AddRef();
-        int index = g_loader.activation.pendingCount++;
-        g_loader.activation.pending[index].pObj = pThis;
-        g_loader.activation.pending[index].pSite = pClientSite;
-        // Coalesce: restart the timer so one callback handles all pending objects
-        if (g_loader.activation.activateTimer)
-            KillTimer(nullptr, g_loader.activation.activateTimer);
-        g_loader.activation.activateTimer =
-            SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
-        DbgTrace(L"[FlashIE] SetClientSite -> queued forced activation\n");
+    if (SUCCEEDED(hr) && pClientSite && IsActivationThread()) {
+        if (QueuePendingActivation(pThis, pClientSite))
+            DbgTrace(L"[FlashIE] SetClientSite -> queued forced activation\n");
     }
 
     return hr;
@@ -1348,24 +1476,15 @@ HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
         pThis, pQAContainer, pQAControl);
 
     if (SUCCEEDED(hr) && pQAContainer && pQAContainer->pClientSite &&
-        IsActivationThread() &&
-        g_loader.activation.pendingCount < MAX_PENDING) {
+        IsActivationThread()) {
         // Get IOleObject from the Flash control to call DoVerb later
         IOleObject* pOle = nullptr;
         pThis->QueryInterface(IID_IOleObject, reinterpret_cast<void**>(&pOle));
         if (pOle) {
             IOleClientSite* pSite = pQAContainer->pClientSite;
-            pOle->AddRef();
-            pSite->AddRef();
-            int index = g_loader.activation.pendingCount++;
-            g_loader.activation.pending[index].pObj = pOle;
-            g_loader.activation.pending[index].pSite = pSite;
-            if (g_loader.activation.activateTimer)
-                KillTimer(nullptr, g_loader.activation.activateTimer);
-            g_loader.activation.activateTimer =
-                SetTimer(nullptr, 0, 100, ForceActivateTimerProc);
-            DbgTrace(L"[FlashIE] QuickActivate -> queued forced activation\n");
-            pOle->Release(); // balance the QI AddRef (pending still holds a ref from AddRef above)
+            if (QueuePendingActivation(pOle, pSite))
+                DbgTrace(L"[FlashIE] QuickActivate -> queued forced activation\n");
+            pOle->Release();
         }
     }
 
