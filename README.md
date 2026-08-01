@@ -9,6 +9,7 @@ A standalone Windows application that runs Adobe Flash content without requiring
 - **No Installation Required** — Bundles Flash.ocx locally; no `regsvr32`, no system-wide Flash installation needed
 - **Zero Registry Pollution** — All API hooks are process-scoped and removed on shutdown; no registry or system-wide COM registration changes are made
 - **Auto-Activation** — Automatically activates Flash content without user clicks, including Flash embedded in iframes
+- **Windows 11 Rendering Compatibility** — Falls back from the broken SurfacePresenter path so windowless Flash draws, scrolls, and receives input at its actual page position
 - **Direct SWF Navigation** — Opens top-level HTTP(S) `.swf` URLs and local `.swf` files from DOS, UNC, or `file:///` paths directly in the browser
 - **Modern JavaScript Syntax Compatibility** — Expands JScript conditional compilation and transpiles modern syntax such as arrow functions, `let`/`const`, classes, and destructuring to ES5 for both JScript engines
 
@@ -20,8 +21,9 @@ FlashIE uses inline function hooking (detours) to intercept Windows API calls at
 2. **Registry Hooks** — Fake Flash registry entries (CLSID, InprocServer32, TypeLib, ProgID, MIME types) entirely in memory — nothing is written to the actual registry
 3. **Security Hooks** — Approve only the Flash CLSID and bundled Flash.ocx image through `WldpIsClassInApprovedList` and `WldpQueryDynamicCodeTrust`
 4. **Activation Hooks** — Hook `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables to force Flash in-place activation via a coalesced timer
-5. **Script Hook** — Hooks `IActiveScriptParse::ParseScriptText` and preprocesses JavaScript code through `JScriptCC` and `swc-es5-c-api` in sequence
-6. **Direct SWF URLMon Handling** — Uses temporary, process-local URLMon handlers to display top-level HTTP(S) and local SWF navigations as full-window Flash content without changing the original navigation URL
+5. **Windowless Rendering Hooks** — On affected systems, hide broken SurfacePresenter interfaces from Flash and normalize `IViewObject::Draw` to local control coordinates
+6. **Script Hook** — Hooks `IActiveScriptParse::ParseScriptText` and preprocesses JavaScript code through `JScriptCC` and `swc-es5-c-api` in sequence
+7. **Direct SWF URLMon Handling** — Uses temporary, process-local URLMon handlers to display top-level HTTP(S) and local SWF navigations as full-window Flash content without changing the original navigation URL
 
 The SWC integration performs syntax transpilation only; it does not provide runtime polyfills such as `Promise` or `Symbol.iterator`, and it does not support JavaScript modules.
 
@@ -60,7 +62,7 @@ cmake --build build-win7-x64 --config Release
 
 The FlashIE build invokes Cargo automatically, builds `swc-es5-c-api` for the matching Win7-baseline MSVC target, and links its C static API into `FlashIE.exe`. The first build may download the pinned Rust toolchain and locked Cargo dependencies.
 
-`FLASHIE_WINDOWS_TARGET` accepts `WIN7` and `WIN8` (default). `WIN7` packages the control compatible with Windows 7 and earlier; `WIN8` packages the control for Windows 8 and later. Do not use the `WIN7` control on newer Windows versions because it has rendering problems there. The build also sets the corresponding Windows API and PE subsystem target, then copies the selected control to the output directory as `Flash.ocx`.
+`FLASHIE_WINDOWS_TARGET` accepts `WIN7` and `WIN8` (default). `WIN7` packages the control compatible with Windows 7 and earlier; `WIN8` packages the control for Windows 8 and later. The Win7 control automatically uses the legacy windowless-rendering fallback when run on newer Windows, while the default control uses it on Windows 11. The build also sets the corresponding Windows API and PE subsystem target, then copies the selected control to the output directory as `Flash.ocx`.
 
 ## Usage
 

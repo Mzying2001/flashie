@@ -41,8 +41,19 @@ constexpr CLSID CLSID_JScript =
 constexpr CLSID CLSID_JScript9 =
     {0x16D51579, 0xA30B, 0x4C8B, {0xA2, 0x76, 0x0F, 0xF4, 0xDC, 0x41, 0xE7, 0x55}};
 
+constexpr IID IID_ViewObjectPresentSite =
+    {0x305106E1, 0x98B5, 0x11CF, {0xBB, 0x82, 0x00, 0xAA, 0x00, 0xBD, 0xCE, 0x0B}};
+constexpr IID IID_ViewObjectPresentNotifySite =
+    {0x305107FA, 0x98B5, 0x11CF, {0xBB, 0x82, 0x00, 0xAA, 0x00, 0xBD, 0xCE, 0x0B}};
+constexpr IID IID_ViewObjectPresentFlipSite =
+    {0x30510846, 0x98B5, 0x11CF, {0xBB, 0x82, 0x00, 0xAA, 0x00, 0xBD, 0xCE, 0x0B}};
+constexpr IID IID_ViewObjectPresentFlipSite2 =
+    {0xAAD0CBF1, 0xE7FD, 0x4F12, {0x89, 0x02, 0xC7, 0x81, 0x32, 0xA8, 0xE0, 0x1D}};
+
 // Bounded hook tables, activation queues, and deferred retry count.
 constexpr int MAX_SCRIPT_HOOKS = 4;
+constexpr int MAX_FLASH_VIEW_HOOKS = 3;
+constexpr int MAX_CLIENT_SITE_HOOKS = 4;
 constexpr int MAX_PENDING = 16;
 constexpr int MAX_DEFERRED = 16;
 constexpr int MAX_DEFERRED_RETRIES = 50;
@@ -133,6 +144,14 @@ typedef HRESULT (STDMETHODCALLTYPE *FN_OleSetClientSite)(
 typedef HRESULT (STDMETHODCALLTYPE *FN_QuickActivate)(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl);
 
+typedef BOOL (STDMETHODCALLTYPE *FN_ViewContinue)(ULONG_PTR dwContinue);
+
+typedef HRESULT (STDMETHODCALLTYPE *FN_ViewObjectDraw)(
+    IViewObject* pThis, DWORD dwDrawAspect, LONG lindex, void* pvAspect,
+    DVTARGETDEVICE* ptd, HDC hdcTargetDev, HDC hdcDraw,
+    LPCRECTL lprcBounds, LPCRECTL lprcWBounds,
+    FN_ViewContinue pfnContinue, ULONG_PTR dwContinue);
+
 // =====================================================================
 // Section 3: Process-Wide State
 // =====================================================================
@@ -174,6 +193,16 @@ struct FakeKeyEntry {
 struct ScriptVtableHook {
     void**             vtable;
     FN_ParseScriptText original;
+};
+
+struct ViewObjectVtableHook {
+    void**            vtable;
+    FN_ViewObjectDraw original;
+};
+
+struct ClientSiteVtableHook {
+    void**                 vtable;
+    FN_FlashQueryInterface original;
 };
 
 struct PendingActivation {
@@ -221,6 +250,10 @@ struct FlashHookState {
     void**                 oleVtable = nullptr;
     FN_QuickActivate       quickActivate = nullptr;
     void**                 quickVtable = nullptr;
+    ViewObjectVtableHook   viewHooks[MAX_FLASH_VIEW_HOOKS] = {};
+    int                    viewHookCount = 0;
+    ClientSiteVtableHook   clientSiteHooks[MAX_CLIENT_SITE_HOOKS] = {};
+    int                    clientSiteHookCount = 0;
 };
 
 struct ScriptHookState {
@@ -246,6 +279,7 @@ struct LoaderState {
     HMODULE           ocxModule = nullptr;
     wchar_t           ocxPath[MAX_PATH] = {};
     wchar_t           exeName[MAX_PATH] = {};
+    bool              forceLegacyWindowlessRendering = false;
     ApiHookState      api;
     FactoryState      factory;
     FakeRegistryState registry;
@@ -374,8 +408,14 @@ void MaybeHookFlashQI(IUnknown* pObj);
 void MaybeHookFlashSetClientSite(IUnknown* pObj);
 // Forward declaration: installs QuickActivate hook for iframe forced activation
 void MaybeHookFlashQuickActivate(IUnknown* pObj);
+// Forward declaration: normalizes windowless Flash drawing coordinates
+void MaybeHookFlashViewObject(IUnknown* pObj);
+// Forward declaration: installs the Flash-scoped client-site QI hook
+void MaybeHookFlashClientSite(IOleClientSite* pClientSite);
 // Forward declaration: hooks ParseScriptText for JScriptCC and SWC processing
 void MaybeHookScriptParseText(REFCLSID rclsid, IUnknown* pObj);
+// Forward declaration: scopes compatibility behavior to calls from Flash.ocx
+bool IsFlashCaller(void* returnAddress);
 
 class LoggingClassFactory : public IClassFactory {
     IClassFactory* m_real;
@@ -437,6 +477,8 @@ public:
             MaybeHookFlashSetClientSite(pObj);
             // Hook Flash's QuickActivate for iframe activation
             MaybeHookFlashQuickActivate(pObj);
+            // Normalize windowless drawing to the object's local coordinates
+            MaybeHookFlashViewObject(pObj);
         }
         return hr;
     }
@@ -1131,15 +1173,17 @@ void MaybeHookFlashQI(IUnknown* pObj)
 }
 
 // =====================================================================
-// Section 7e: Flash Forced In-Place Activation
+// Section 7e: Flash Activation and Windowless Drawing
 //
 // MSHTML creates Flash objects but defers DoVerb(INPLACEACTIVATE)
 // until a user click (Windows 10 Flash phase-out behavior).
 // We hook Flash's IOleObject::SetClientSite; once MSHTML sets the site,
 // we schedule an owning-STA timer to obtain the in-place site's HWND/RECT
 // and call DoVerb(OLEIVERB_INPLACEACTIVATE), forcing the control to activate
-// without user interaction. SetClientSite and QuickActivate vtable slots are
-// restored during deactivation.
+// without user interaction. On affected systems, the client-site hook also
+// makes Flash use legacy IViewObject drawing instead of the mispositioned
+// SurfacePresenter path; the Draw hook then supplies local coordinates. Every
+// patched vtable slot is restored during deactivation.
 // =====================================================================
 
 // Forward declaration: runs the initial coalesced activation attempts.
@@ -1420,9 +1464,109 @@ void FlushPendingActivations()
     g_loader.activation.deferredRetries = 0;
 }
 
+// SurfacePresenter-backed Flash visuals lose their DOM offset on Windows 11.
+// The Win7 OCX has the same incompatibility on post-Win7 systems, which also
+// gives us a local proxy for validating the fallback path.
+bool RequiresLegacyWindowlessRendering()
+{
+    using FN_RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return false;
+    auto rtlGetVersion = reinterpret_cast<FN_RtlGetVersion>(
+        GetProcAddress(ntdll, "RtlGetVersion"));
+
+    OSVERSIONINFOW version = {};
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (!rtlGetVersion || rtlGetVersion(&version) != 0)
+        return false;
+
+    const bool isWindows11OrLater =
+        version.dwMajorVersion > 10 ||
+        (version.dwMajorVersion == 10 && version.dwBuildNumber >= 22000);
+#if FLASHIE_LEGACY_OCX
+    const bool isNewerThanWindows7 =
+        version.dwMajorVersion > 6 ||
+        (version.dwMajorVersion == 6 && version.dwMinorVersion > 1);
+    return isWindows11OrLater || isNewerThanWindows7;
+#else
+    return isWindows11OrLater;
+#endif
+}
+
+bool IsFlashPresentationSite(REFIID riid)
+{
+    return IsEqualIID(riid, IID_ViewObjectPresentSite) ||
+           IsEqualIID(riid, IID_ViewObjectPresentNotifySite) ||
+           IsEqualIID(riid, IID_ViewObjectPresentFlipSite) ||
+           IsEqualIID(riid, IID_ViewObjectPresentFlipSite2);
+}
+
+HRESULT STDMETHODCALLTYPE Hooked_FlashClientSiteQueryInterface(
+    void* pThis, REFIID riid, void** ppv)
+{
+    FN_FlashQueryInterface original = nullptr;
+    void** vtable = *reinterpret_cast<void***>(pThis);
+    for (int i = 0; i < g_loader.flashHooks.clientSiteHookCount; i++) {
+        const ClientSiteVtableHook& hook =
+            g_loader.flashHooks.clientSiteHooks[i];
+        if (hook.vtable == vtable) {
+            original = hook.original;
+            break;
+        }
+    }
+    if (!original)
+        return E_UNEXPECTED;
+
+    if (IsFlashCaller(_ReturnAddress()) && IsFlashPresentationSite(riid)) {
+        if (ppv)
+            *ppv = nullptr;
+        DbgTrace(
+            L"[FlashIE] Flash presentation site {%08X-...} -> legacy drawing\n",
+            riid.Data1);
+        return E_NOINTERFACE;
+    }
+
+    return original(pThis, riid, ppv);
+}
+
+void MaybeHookFlashClientSite(IOleClientSite* pClientSite)
+{
+    if (!pClientSite || !g_loader.forceLegacyWindowlessRendering)
+        return;
+
+    void** vtable = *reinterpret_cast<void***>(pClientSite);
+    AcquireSRWLockExclusive(&g_loader.flashHooks.lock);
+    for (int i = 0; i < g_loader.flashHooks.clientSiteHookCount; i++) {
+        if (g_loader.flashHooks.clientSiteHooks[i].vtable == vtable) {
+            ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
+            return;
+        }
+    }
+
+    if (g_loader.flashHooks.clientSiteHookCount < MAX_CLIENT_SITE_HOOKS) {
+        FN_FlashQueryInterface original =
+            reinterpret_cast<FN_FlashQueryInterface>(vtable[0]);
+        DWORD oldProtect;
+        if (VirtualProtect(
+                &vtable[0], sizeof(void*), PAGE_EXECUTE_READWRITE,
+                &oldProtect)) {
+            int index = g_loader.flashHooks.clientSiteHookCount++;
+            g_loader.flashHooks.clientSiteHooks[index].vtable = vtable;
+            g_loader.flashHooks.clientSiteHooks[index].original = original;
+            vtable[0] =
+                reinterpret_cast<void*>(Hooked_FlashClientSiteQueryInterface);
+            VirtualProtect(
+                &vtable[0], sizeof(void*), oldProtect, &oldProtect);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
+}
+
 HRESULT STDMETHODCALLTYPE Hooked_OleSetClientSite(
     IOleObject* pThis, IOleClientSite* pClientSite)
 {
+    MaybeHookFlashClientSite(pClientSite);
     HRESULT hr = g_loader.flashHooks.setClientSite(pThis, pClientSite);
 
     // When MSHTML sets a non-null client site, queue forced activation
@@ -1472,6 +1616,8 @@ void MaybeHookFlashSetClientSite(IUnknown* pObj)
 HRESULT STDMETHODCALLTYPE Hooked_QuickActivate(
     IQuickActivate* pThis, QACONTAINER* pQAContainer, QACONTROL* pQAControl)
 {
+    if (pQAContainer)
+        MaybeHookFlashClientSite(pQAContainer->pClientSite);
     HRESULT hr = g_loader.flashHooks.quickActivate(
         pThis, pQAContainer, pQAControl);
 
@@ -1521,20 +1667,141 @@ void MaybeHookFlashQuickActivate(IUnknown* pObj)
     pQA->Release();
 }
 
+// MSHTML supplies one drawing DC for the document and locates each windowless
+// control through lprcBounds. Some Flash builds instead treat the DC origin as
+// the control origin, which pins the pixels to the document's top-left while
+// input remains at the correct DOM position. Present Flash with an equivalent
+// local coordinate system so both interpretations produce the same pixels.
+HRESULT STDMETHODCALLTYPE Hooked_ViewObjectDraw(
+    IViewObject* pThis, DWORD dwDrawAspect, LONG lindex, void* pvAspect,
+    DVTARGETDEVICE* ptd, HDC hdcTargetDev, HDC hdcDraw,
+    LPCRECTL lprcBounds, LPCRECTL lprcWBounds,
+    FN_ViewContinue pfnContinue, ULONG_PTR dwContinue)
+{
+    FN_ViewObjectDraw original = nullptr;
+    void** vtable = *reinterpret_cast<void***>(pThis);
+    for (int i = 0; i < g_loader.flashHooks.viewHookCount; i++) {
+        const ViewObjectVtableHook& hook = g_loader.flashHooks.viewHooks[i];
+        if (hook.vtable == vtable) {
+            original = hook.original;
+            break;
+        }
+    }
+    if (!original)
+        return E_UNEXPECTED;
+
+    if (!hdcDraw || !lprcBounds ||
+        (lprcBounds->left == 0 && lprcBounds->top == 0)) {
+        return original(
+            pThis, dwDrawAspect, lindex, pvAspect, ptd,
+            hdcTargetDev, hdcDraw, lprcBounds, lprcWBounds,
+            pfnContinue, dwContinue);
+    }
+
+    const int savedDc = SaveDC(hdcDraw);
+    if (!savedDc) {
+        return original(
+            pThis, dwDrawAspect, lindex, pvAspect, ptd,
+            hdcTargetDev, hdcDraw, lprcBounds, lprcWBounds,
+            pfnContinue, dwContinue);
+    }
+
+    POINT logicalPoints[2] = {
+        { 0, 0 },
+        { lprcBounds->left, lprcBounds->top },
+    };
+    POINT viewportOrigin = {};
+    if (!LPtoDP(hdcDraw, logicalPoints, _countof(logicalPoints)) ||
+        !GetViewportOrgEx(hdcDraw, &viewportOrigin) ||
+        !SetViewportOrgEx(
+            hdcDraw,
+            viewportOrigin.x + logicalPoints[1].x - logicalPoints[0].x,
+            viewportOrigin.y + logicalPoints[1].y - logicalPoints[0].y,
+            nullptr)) {
+        RestoreDC(hdcDraw, savedDc);
+        return original(
+            pThis, dwDrawAspect, lindex, pvAspect, ptd,
+            hdcTargetDev, hdcDraw, lprcBounds, lprcWBounds,
+            pfnContinue, dwContinue);
+    }
+
+    const RECTL localBounds = {
+        0,
+        0,
+        lprcBounds->right - lprcBounds->left,
+        lprcBounds->bottom - lprcBounds->top,
+    };
+    HRESULT hr = original(
+        pThis, dwDrawAspect, lindex, pvAspect, ptd,
+        hdcTargetDev, hdcDraw, &localBounds, lprcWBounds,
+        pfnContinue, dwContinue);
+    RestoreDC(hdcDraw, savedDc);
+    return hr;
+}
+
+void HookFlashViewVtable(IUnknown* pObj, REFIID iid, const wchar_t* name)
+{
+    IUnknown* pView = nullptr;
+    pObj->QueryInterface(iid, reinterpret_cast<void**>(&pView));
+    if (!pView)
+        return;
+
+    AcquireSRWLockExclusive(&g_loader.flashHooks.lock);
+    void** vtable = *reinterpret_cast<void***>(pView);
+    for (int i = 0; i < g_loader.flashHooks.viewHookCount; i++) {
+        if (g_loader.flashHooks.viewHooks[i].vtable == vtable) {
+            ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
+            pView->Release();
+            return;
+        }
+    }
+
+    if (g_loader.flashHooks.viewHookCount < MAX_FLASH_VIEW_HOOKS) {
+        // Draw remains slot 3 on IViewObject2 and IViewObjectEx.
+        FN_ViewObjectDraw original =
+            reinterpret_cast<FN_ViewObjectDraw>(vtable[3]);
+
+        DWORD oldProtect;
+        if (VirtualProtect(
+                &vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE,
+                &oldProtect)) {
+            int index = g_loader.flashHooks.viewHookCount++;
+            g_loader.flashHooks.viewHooks[index].vtable = vtable;
+            g_loader.flashHooks.viewHooks[index].original = original;
+            vtable[3] = reinterpret_cast<void*>(Hooked_ViewObjectDraw);
+            VirtualProtect(
+                &vtable[3], sizeof(void*), oldProtect, &oldProtect);
+            DbgTrace(L"[FlashIE] Hook Flash %s::Draw: OK\n", name);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
+
+    pView->Release();
+}
+
+void MaybeHookFlashViewObject(IUnknown* pObj)
+{
+    HookFlashViewVtable(pObj, IID_IViewObject, L"IViewObject");
+    HookFlashViewVtable(pObj, IID_IViewObject2, L"IViewObject2");
+    HookFlashViewVtable(pObj, IID_IViewObjectEx, L"IViewObjectEx");
+}
+
 bool RestoreFlashVtableSlot(
-    void** vtable, void* hook, void* original)
+    void** vtable, size_t slot, void* hook, void* original)
 {
     if (!vtable || !original)
         return true;
 
     DWORD oldProtect;
-    if (!VirtualProtect(&vtable[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+    if (!VirtualProtect(
+            &vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE,
+            &oldProtect))
         return false;
 
-    if (vtable[3] == hook)
-        vtable[3] = original;
+    if (vtable[slot] == hook)
+        vtable[slot] = original;
     return VirtualProtect(
-        &vtable[3], sizeof(void*), oldProtect, &oldProtect) != FALSE;
+        &vtable[slot], sizeof(void*), oldProtect, &oldProtect) != FALSE;
 }
 
 // =====================================================================
@@ -2080,6 +2347,11 @@ bool Activate()
     g_loader.ocxModule = ocxModule;
     wcscpy_s(g_loader.ocxPath, ocxPath);
     wcscpy_s(g_loader.exeName, PathFindFileNameW(exePath));
+    g_loader.forceLegacyWindowlessRendering =
+        RequiresLegacyWindowlessRendering();
+    if (g_loader.forceLegacyWindowlessRendering) {
+        DbgTrace(L"[FlashIE] Flash windowless rendering: legacy fallback enabled\n");
+    }
     g_loader.factory.real = realFactory;
     g_loader.factory.wrapper = loggingFactory;
     g_loader.factory.cookie = cookie;
@@ -2242,12 +2514,41 @@ void Deactivate()
 
     bool restoredOle = RestoreFlashVtableSlot(
         g_loader.flashHooks.oleVtable,
+        3,
         reinterpret_cast<void*>(Hooked_OleSetClientSite),
         reinterpret_cast<void*>(g_loader.flashHooks.setClientSite));
     bool restoredQuick = RestoreFlashVtableSlot(
         g_loader.flashHooks.quickVtable,
+        3,
         reinterpret_cast<void*>(Hooked_QuickActivate),
         reinterpret_cast<void*>(g_loader.flashHooks.quickActivate));
+    bool restoredViews = true;
+    for (int i = 0; i < g_loader.flashHooks.viewHookCount; i++) {
+        ViewObjectVtableHook& hook = g_loader.flashHooks.viewHooks[i];
+        bool restored = RestoreFlashVtableSlot(
+            hook.vtable,
+            3,
+            reinterpret_cast<void*>(Hooked_ViewObjectDraw),
+            reinterpret_cast<void*>(hook.original));
+        if (restored)
+            hook = {};
+        else
+            restoredViews = false;
+    }
+    bool restoredClientSites = true;
+    for (int i = 0; i < g_loader.flashHooks.clientSiteHookCount; i++) {
+        ClientSiteVtableHook& hook =
+            g_loader.flashHooks.clientSiteHooks[i];
+        bool restored = RestoreFlashVtableSlot(
+            hook.vtable,
+            0,
+            reinterpret_cast<void*>(Hooked_FlashClientSiteQueryInterface),
+            reinterpret_cast<void*>(hook.original));
+        if (restored)
+            hook = {};
+        else
+            restoredClientSites = false;
+    }
 
     if (restoredOle) {
         g_loader.flashHooks.oleVtable = nullptr;
@@ -2257,8 +2558,13 @@ void Deactivate()
         g_loader.flashHooks.quickVtable = nullptr;
         g_loader.flashHooks.quickActivate = nullptr;
     }
-    if (!restoredOle || !restoredQuick) {
-        DbgTrace(L"[FlashIE] Failed to restore a Flash activation vtable\n");
+    if (restoredViews)
+        g_loader.flashHooks.viewHookCount = 0;
+    if (restoredClientSites)
+        g_loader.flashHooks.clientSiteHookCount = 0;
+    if (!restoredOle || !restoredQuick || !restoredViews ||
+        !restoredClientSites) {
+        DbgTrace(L"[FlashIE] Failed to restore a Flash vtable\n");
         ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
         return;
     }
@@ -2363,6 +2669,7 @@ void Deactivate()
 
     g_loader.ocxPath[0] = L'\0';
     g_loader.exeName[0] = L'\0';
+    g_loader.forceLegacyWindowlessRendering = false;
     g_loader.ownerThreadId = 0;
     g_loader.phase = LoaderPhase::Inactive;
     ReleaseSRWLockExclusive(&g_loader.flashHooks.lock);
