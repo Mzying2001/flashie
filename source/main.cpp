@@ -9,12 +9,13 @@
 #include "browser.h"
 #include "resource.h"
 
-static constexpr int TOOLBAR_HEIGHT = 32;
-static constexpr int BUTTON_WIDTH   = 60;
-static constexpr int BUTTON_HEIGHT  = 24;
-static constexpr int MARGIN         = 4;
-static constexpr int WINDOW_MIN_CX  = 500;
-static constexpr int WINDOW_MIN_CY  = 350;
+static constexpr UINT BASE_DPI           = 96;
+static constexpr int  TOOLBAR_HEIGHT_DIP = 32;
+static constexpr int  BUTTON_WIDTH_DIP   = 60;
+static constexpr int  BUTTON_HEIGHT_DIP  = 24;
+static constexpr int  MARGIN_DIP         = 4;
+static constexpr int  WINDOW_MIN_CX_DIP  = 500;
+static constexpr int  WINDOW_MIN_CY_DIP  = 350;
 
 enum ControlID {
     IDC_BACK = 1001,
@@ -36,8 +37,127 @@ static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
 static HWND         g_hwndStatus      = nullptr;
+static HFONT        g_controlFont     = nullptr;
 static bool         g_isClosing       = false;
+static UINT         g_dpi             = BASE_DPI;
 static std::wstring g_initialAddress  = L"https://www.bing.com/";
+
+static UINT GetWindowDpi(HWND hwnd)
+{
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    static const auto getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+
+    if (getDpiForWindow) {
+        UINT dpi = getDpiForWindow(hwnd);
+        if (dpi != 0)
+            return dpi;
+    }
+
+    // GetDpiForWindow is unavailable before Windows 10. GetDpiForMonitor
+    // preserves per-monitor behavior on Windows 8.1 and is absent on Win7/8.
+    using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    static const auto getDpiForMonitor = []() -> GetDpiForMonitorFn {
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        return shcore ? reinterpret_cast<GetDpiForMonitorFn>(
+                            GetProcAddress(shcore, "GetDpiForMonitor"))
+                      : nullptr;
+    }();
+
+    if (getDpiForMonitor) {
+        UINT dpiX = 0;
+        UINT dpiY = 0;
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (SUCCEEDED(getDpiForMonitor(monitor, 0, &dpiX, &dpiY)) && dpiX != 0)
+            return dpiX;
+    }
+
+    HDC dc = GetDC(hwnd);
+    if (!dc)
+        return BASE_DPI;
+
+    int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(hwnd, dc);
+    return dpi > 0 ? static_cast<UINT>(dpi) : BASE_DPI;
+}
+
+static int ScaleForDpi(int value)
+{
+    return MulDiv(value, static_cast<int>(g_dpi), BASE_DPI);
+}
+
+static UINT GetSystemDpi()
+{
+    HDC dc = GetDC(nullptr);
+    if (!dc)
+        return BASE_DPI;
+
+    int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(nullptr, dc);
+    return dpi > 0 ? static_cast<UINT>(dpi) : BASE_DPI;
+}
+
+static HFONT CreateControlFont(UINT dpi)
+{
+    NONCLIENTMETRICSW metrics = {};
+    metrics.cbSize = sizeof(metrics);
+
+    using SystemParametersInfoForDpiFn = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+    static const auto systemParametersInfoForDpi =
+        reinterpret_cast<SystemParametersInfoForDpiFn>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+
+    if (systemParametersInfoForDpi) {
+        if (!systemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS,
+                                        sizeof(metrics), &metrics, 0, dpi)) {
+            return nullptr;
+        }
+    } else {
+        if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS,
+                                   sizeof(metrics), &metrics, 0)) {
+            return nullptr;
+        }
+
+        // Win7/8.1 expose only the system-DPI metrics API. Scale its font
+        // when a per-monitor-aware window is on a different-DPI monitor.
+        UINT systemDpi = GetSystemDpi();
+        if (dpi != systemDpi) {
+            metrics.lfMessageFont.lfHeight = MulDiv(
+                metrics.lfMessageFont.lfHeight, static_cast<int>(dpi), systemDpi);
+            metrics.lfMessageFont.lfWidth = MulDiv(
+                metrics.lfMessageFont.lfWidth, static_cast<int>(dpi), systemDpi);
+        }
+    }
+
+    return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+static void UpdateControlFont()
+{
+    HFONT newFont = CreateControlFont(g_dpi);
+    if (!newFont)
+        return;
+
+    const HWND controls[] = {
+        g_hwndBack,
+        g_hwndForward,
+        g_hwndRefresh,
+        g_hwndStop,
+        g_hwndAddress,
+        g_hwndGo,
+        g_hwndStatus,
+    };
+
+    for (HWND control : controls) {
+        if (control)
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
+    }
+
+    HFONT oldFont = g_controlFont;
+    g_controlFont = newFont;
+    if (oldFont)
+        DeleteObject(oldFont);
+}
 
 static HICON LoadApplicationIcon(HINSTANCE hInstance, int width, int height)
 {
@@ -52,10 +172,16 @@ static HICON LoadApplicationIcon(HINSTANCE hInstance, int width, int height)
 
 static void DoNavigate()
 {
-    wchar_t url[2048];
-    GetWindowTextW(g_hwndAddress, url, _countof(url));
-    if (url[0] && g_pBrowser)
-        g_pBrowser->Navigate(url);
+    int length = GetWindowTextLengthW(g_hwndAddress);
+    if (length <= 0 || !g_pBrowser)
+        return;
+
+    std::wstring url(static_cast<size_t>(length) + 1, L'\0');
+    int copied = GetWindowTextW(g_hwndAddress, url.data(), length + 1);
+    if (copied > 0) {
+        url.resize(static_cast<size_t>(copied));
+        g_pBrowser->Navigate(url.c_str());
+    }
 }
 
 static void OnNavigateComplete(const wchar_t* url, void*)
@@ -65,9 +191,9 @@ static void OnNavigateComplete(const wchar_t* url, void*)
 
 static void OnTitleChange(const wchar_t* title, void*)
 {
-    wchar_t buf[512];
-    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s - FlashIE", title);
-    SetWindowTextW(g_hwndMain, buf);
+    std::wstring windowTitle = title;
+    windowTitle += L" - FlashIE";
+    SetWindowTextW(g_hwndMain, windowTitle.c_str());
 }
 
 static void OnStatusTextChange(const wchar_t* text, void*)
@@ -91,7 +217,13 @@ static void OnLoadingStateChange(bool isLoading, void*)
 
 static void LayoutControls(int cx, int cy)
 {
+    const int toolbarHeight = ScaleForDpi(TOOLBAR_HEIGHT_DIP);
+    const int buttonWidth = ScaleForDpi(BUTTON_WIDTH_DIP);
+    const int buttonHeight = ScaleForDpi(BUTTON_HEIGHT_DIP);
+    const int margin = ScaleForDpi(MARGIN_DIP);
+
     int statusHeight = 0;
+
     if (g_hwndStatus) {
         SendMessageW(g_hwndStatus, WM_SIZE, 0, 0);
         RECT rcStatus;
@@ -99,21 +231,26 @@ static void LayoutControls(int cx, int cy)
             statusHeight = rcStatus.bottom - rcStatus.top;
     }
 
-    int x = MARGIN;
-    int y = (TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
-    MoveWindow(g_hwndBack,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
-    MoveWindow(g_hwndForward, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
-    MoveWindow(g_hwndRefresh, x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
-    MoveWindow(g_hwndStop,    x, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE); x += BUTTON_WIDTH + MARGIN;
+    int x = margin;
+    int y = (toolbarHeight - buttonHeight) / 2;
 
-    int goX = cx - MARGIN - BUTTON_WIDTH;
-    int addrWidth = goX - MARGIN - x;
-    if (addrWidth < 50) addrWidth = 50;
-    MoveWindow(g_hwndAddress, x, y, addrWidth, BUTTON_HEIGHT, TRUE);
-    MoveWindow(g_hwndGo, goX, y, BUTTON_WIDTH, BUTTON_HEIGHT, TRUE);
+    MoveWindow(g_hwndBack,    x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
+    MoveWindow(g_hwndForward, x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
+    MoveWindow(g_hwndRefresh, x, y, buttonWidth, buttonHeight, TRUE);
+    MoveWindow(g_hwndStop,    x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
+
+    int goX = cx - margin - buttonWidth;
+    int addrWidth = goX - margin - x;
+
+    if (addrWidth < ScaleForDpi(50)) {
+        addrWidth = ScaleForDpi(50);
+    }
+
+    MoveWindow(g_hwndAddress, x, y, addrWidth, buttonHeight, TRUE);
+    MoveWindow(g_hwndGo, goX, y, buttonWidth, buttonHeight, TRUE);
 
     if (g_pBrowser) {
-        RECT rc = {0, TOOLBAR_HEIGHT, cx, cy - statusHeight};
+        RECT rc = {0, toolbarHeight, cx, cy - statusHeight};
         g_pBrowser->Resize(rc);
     }
 }
@@ -123,6 +260,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_CREATE: {
         HINSTANCE hInst = reinterpret_cast<LPCREATESTRUCT>(lParam)->hInstance;
+        g_dpi = GetWindowDpi(hwnd);
         RECT rc;
         GetClientRect(hwnd, &rc);
 
@@ -130,10 +268,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwndForward = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FORWARD), hInst, nullptr);
         g_hwndRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH), hInst, nullptr);
         g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STOP),    hInst, nullptr);
-        g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
         g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GO),      hInst, nullptr);
         g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), hInst, nullptr);
+        g_hwndAddress = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
 
+        UpdateControlFont();
         OnLoadingStateChange(false, nullptr);
 
         // Install hooks BEFORE browser creation so COM/registry/security
@@ -148,7 +287,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         g_pBrowser = new BrowserHost();
-        RECT rcBrowser = {0, TOOLBAR_HEIGHT, rc.right, rc.bottom};
+        RECT rcBrowser = {0, ScaleForDpi(TOOLBAR_HEIGHT_DIP), rc.right, rc.bottom};
         if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
@@ -163,8 +302,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = WINDOW_MIN_CX;
-        mmi->ptMinTrackSize.y = WINDOW_MIN_CY;
+        mmi->ptMinTrackSize.x = ScaleForDpi(WINDOW_MIN_CX_DIP);
+        mmi->ptMinTrackSize.y = ScaleForDpi(WINDOW_MIN_CY_DIP);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        UINT newDpi = HIWORD(wParam);
+        g_dpi = newDpi != 0 ? newDpi : BASE_DPI;
+        UpdateControlFont();
+
+        const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(hwnd, nullptr,
+                     suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+
+        RECT rc;
+        if (GetClientRect(hwnd, &rc))
+            LayoutControls(rc.right, rc.bottom);
         return 0;
     }
 
@@ -287,6 +444,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
             continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    if (g_controlFont) {
+        DeleteObject(g_controlFont);
+        g_controlFont = nullptr;
     }
 
     // Deactivate Flash BEFORE OleUninitialize

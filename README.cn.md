@@ -9,6 +9,7 @@
 - **无需安装** — 本地附带 Flash.ocx，无需 `regsvr32`，无需系统级 Flash 安装
 - **零注册表污染** — 所有 API 钩子仅作用于当前进程，程序退出时自动移除；不修改注册表，也不进行系统级 COM 注册
 - **自动激活** — 自动激活 Flash 内容，无需用户点击，包括 iframe 中嵌入的 Flash
+- **Windows 11 渲染兼容** — 避开有问题的 SurfacePresenter 路径，使无窗口 Flash 在页面实际位置绘制、滚动并接收输入
 - **直接导航到 SWF** — 在浏览器中直接打开顶层 HTTP(S) `.swf` URL 和通过 DOS、UNC 或 `file:///` 路径指定的本地 `.swf` 文件
 - **现代 JavaScript 语法兼容** — 展开 JScript 条件编译，并为两个 JScript 引擎将箭头函数、`let`/`const`、类、解构等现代语法转译为 ES5
 
@@ -20,8 +21,9 @@ FlashIE 使用内联函数钩子（Detour）在进程级别拦截 Windows API �
 2. **注册表钩子** — 在内存中伪造 Flash 注册表项（CLSID、InprocServer32、TypeLib、ProgID、MIME 类型）——**不会向实际注册表写入任何内容**
 3. **安全钩子** — 通过 `WldpIsClassInApprovedList` 和 `WldpQueryDynamicCodeTrust`，仅批准 Flash CLSID 和程序附带的 Flash.ocx 映像
 4. **激活钩子** — 钩子 `IOleObject::SetClientSite` 和 `IQuickActivate::QuickActivate` 虚表，通过合并定时器强制 Flash 就地激活
-5. **脚本钩子** — 钩取 `IActiveScriptParse::ParseScriptText`，并依次使用 `JScriptCC` 和 `swc-es5-c-api` 预处理 JavaScript 代码
-6. **直接 SWF URLMon 处理** — 使用临时的进程内 URLMon 处理器，将顶层 HTTP(S) 和本地 SWF 导航显示为全窗口 Flash 内容，同时保持原始导航 URL 不变
+5. **无窗口渲染钩子** — 在受影响的系统上向 Flash 隐藏有问题的 SurfacePresenter 接口，并将 `IViewObject::Draw` 规范化为控件局部坐标
+6. **脚本钩子** — 钩取 `IActiveScriptParse::ParseScriptText`，并依次使用 `JScriptCC` 和 `swc-es5-c-api` 预处理 JavaScript 代码
+7. **直接 SWF URLMon 处理** — 使用临时的进程内 URLMon 处理器，将顶层 HTTP(S) 和本地 SWF 导航显示为全窗口 Flash 内容，同时保持原始导航 URL 不变
 
 SWC 集成只负责语法转译，不提供 `Promise`、`Symbol.iterator` 等运行时 polyfill，也不支持 JavaScript 模块。
 
@@ -60,7 +62,7 @@ cmake --build build-win7-x64 --config Release
 
 FlashIE 构建过程会自动调用 Cargo，针对匹配的 Win7 基线 MSVC 目标构建 `swc-es5-c-api`，并将其 C 风格静态 API 链接到 `FlashIE.exe`。首次构建可能会下载固定版本的 Rust 工具链和 `Cargo.lock` 中锁定的依赖。
 
-`FLASHIE_WINDOWS_TARGET` 支持 `WIN7` 和 `WIN8`（默认值）。`WIN7` 会打包兼容 Windows 7 及更早系统的控件，`WIN8` 会打包适用于 Windows 8 及更新系统的控件。Win7 控件在新版 Windows 上存在渲染问题，请勿在新版系统中使用。构建过程还会设置相应的 Windows API 和 PE 子系统目标，并将选中的控件以 `Flash.ocx` 文件名复制到可执行文件同目录下。
+`FLASHIE_WINDOWS_TARGET` 支持 `WIN7` 和 `WIN8`（默认值）。`WIN7` 会打包兼容 Windows 7 及更早系统的控件，`WIN8` 会打包适用于 Windows 8 及更新系统的控件。Win7 控件在新版 Windows 上运行时会自动使用旧式无窗口渲染回退，默认控件则在 Windows 11 上使用该回退。构建过程还会设置相应的 Windows API 和 PE 子系统目标，并将选中的控件以 `Flash.ocx` 文件名复制到可执行文件同目录下。
 
 ## 使用方法
 
