@@ -37,6 +37,7 @@ static HWND         g_hwndStop        = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
 static HWND         g_hwndStatus      = nullptr;
+static HFONT        g_controlFont     = nullptr;
 static bool         g_isClosing       = false;
 static UINT         g_dpi             = BASE_DPI;
 static std::wstring g_initialAddress  = L"https://www.bing.com/";
@@ -83,6 +84,79 @@ static UINT GetWindowDpi(HWND hwnd)
 static int ScaleForDpi(int value)
 {
     return MulDiv(value, static_cast<int>(g_dpi), BASE_DPI);
+}
+
+static UINT GetSystemDpi()
+{
+    HDC dc = GetDC(nullptr);
+    if (!dc)
+        return BASE_DPI;
+
+    int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(nullptr, dc);
+    return dpi > 0 ? static_cast<UINT>(dpi) : BASE_DPI;
+}
+
+static HFONT CreateControlFont(UINT dpi)
+{
+    NONCLIENTMETRICSW metrics = {};
+    metrics.cbSize = sizeof(metrics);
+
+    using SystemParametersInfoForDpiFn = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+    static const auto systemParametersInfoForDpi =
+        reinterpret_cast<SystemParametersInfoForDpiFn>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+
+    if (systemParametersInfoForDpi) {
+        if (!systemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS,
+                                        sizeof(metrics), &metrics, 0, dpi)) {
+            return nullptr;
+        }
+    } else {
+        if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS,
+                                   sizeof(metrics), &metrics, 0)) {
+            return nullptr;
+        }
+
+        // Win7/8.1 expose only the system-DPI metrics API. Scale its font
+        // when a per-monitor-aware window is on a different-DPI monitor.
+        UINT systemDpi = GetSystemDpi();
+        if (dpi != systemDpi) {
+            metrics.lfMessageFont.lfHeight = MulDiv(
+                metrics.lfMessageFont.lfHeight, static_cast<int>(dpi), systemDpi);
+            metrics.lfMessageFont.lfWidth = MulDiv(
+                metrics.lfMessageFont.lfWidth, static_cast<int>(dpi), systemDpi);
+        }
+    }
+
+    return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+static void UpdateControlFont()
+{
+    HFONT newFont = CreateControlFont(g_dpi);
+    if (!newFont)
+        return;
+
+    const HWND controls[] = {
+        g_hwndBack,
+        g_hwndForward,
+        g_hwndRefresh,
+        g_hwndStop,
+        g_hwndAddress,
+        g_hwndGo,
+        g_hwndStatus,
+    };
+
+    for (HWND control : controls) {
+        if (control)
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
+    }
+
+    HFONT oldFont = g_controlFont;
+    g_controlFont = newFont;
+    if (oldFont)
+        DeleteObject(oldFont);
 }
 
 static HICON LoadApplicationIcon(HINSTANCE hInstance, int width, int height)
@@ -188,10 +262,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hwndForward = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FORWARD), hInst, nullptr);
         g_hwndRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH), hInst, nullptr);
         g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STOP),    hInst, nullptr);
-        g_hwndAddress = CreateWindowW(L"EDIT",   L"",        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
         g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GO),      hInst, nullptr);
         g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), hInst, nullptr);
+        g_hwndAddress = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
 
+        UpdateControlFont();
         OnLoadingStateChange(false, nullptr);
 
         // Install hooks BEFORE browser creation so COM/registry/security
@@ -229,6 +304,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DPICHANGED: {
         UINT newDpi = HIWORD(wParam);
         g_dpi = newDpi != 0 ? newDpi : BASE_DPI;
+        UpdateControlFont();
 
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr,
@@ -362,6 +438,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
             continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    if (g_controlFont) {
+        DeleteObject(g_controlFont);
+        g_controlFont = nullptr;
     }
 
     // Deactivate Flash BEFORE OleUninitialize
