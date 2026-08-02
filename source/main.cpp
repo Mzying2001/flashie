@@ -172,10 +172,16 @@ static HICON LoadApplicationIcon(HINSTANCE hInstance, int width, int height)
 
 static void DoNavigate()
 {
-    wchar_t url[2048];
-    GetWindowTextW(g_hwndAddress, url, _countof(url));
-    if (url[0] && g_pBrowser)
-        g_pBrowser->Navigate(url);
+    int length = GetWindowTextLengthW(g_hwndAddress);
+    if (length <= 0 || !g_pBrowser)
+        return;
+
+    std::wstring url(static_cast<size_t>(length) + 1, L'\0');
+    int copied = GetWindowTextW(g_hwndAddress, url.data(), length + 1);
+    if (copied > 0) {
+        url.resize(static_cast<size_t>(copied));
+        g_pBrowser->Navigate(url.c_str());
+    }
 }
 
 static void OnNavigateComplete(const wchar_t* url, void*)
@@ -185,9 +191,9 @@ static void OnNavigateComplete(const wchar_t* url, void*)
 
 static void OnTitleChange(const wchar_t* title, void*)
 {
-    wchar_t buf[512];
-    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s - FlashIE", title);
-    SetWindowTextW(g_hwndMain, buf);
+    std::wstring windowTitle = title;
+    windowTitle += L" - FlashIE";
+    SetWindowTextW(g_hwndMain, windowTitle.c_str());
 }
 
 static void OnStatusTextChange(const wchar_t* text, void*)
