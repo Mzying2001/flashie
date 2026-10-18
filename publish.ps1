@@ -29,14 +29,14 @@ $buildMatrix = @(
         Platform = 'Win32'
         WindowsTarget = 'WIN7'
         BuildDirectory = 'build-win7-x86'
-        PackageSuffix = '_Win7'
+        PackageSuffix = '_win7'
     }
     [pscustomobject]@{
         Architecture = 'x64'
         Platform = 'x64'
         WindowsTarget = 'WIN7'
         BuildDirectory = 'build-win7-x64'
-        PackageSuffix = '_Win7'
+        PackageSuffix = '_win7'
     }
 )
 
@@ -112,7 +112,7 @@ $publishDirectory = Join-Path $publishRoot $versions[0]
 New-Item -ItemType Directory -Path $publishDirectory -Force | Out-Null
 
 foreach ($output in $outputs) {
-    $archiveName = "FlashIE_$($output.Architecture)_$($output.Version)$($output.PackageSuffix).zip"
+    $archiveName = "FlashIE_$($output.Architecture)_v$($output.Version)$($output.PackageSuffix).zip"
     $archivePath = Join-Path $publishDirectory $archiveName
 
     if (Test-Path -LiteralPath $archivePath) {
