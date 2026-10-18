@@ -17,16 +17,6 @@ static constexpr int  MARGIN_DIP         = 4;
 static constexpr int  WINDOW_MIN_CX_DIP  = 500;
 static constexpr int  WINDOW_MIN_CY_DIP  = 350;
 
-enum ControlID {
-    IDC_BACK = 1001,
-    IDC_FORWARD,
-    IDC_REFRESH,
-    IDC_STOP,
-    IDC_ADDRESS,
-    IDC_GO,
-    IDC_STATUS,
-};
-
 static bool         g_flashActivated  = false;
 static BrowserHost* g_pBrowser        = nullptr;
 static HWND         g_hwndMain        = nullptr;
