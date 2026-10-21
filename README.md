@@ -40,6 +40,8 @@ API hooks are installed after process initialization and removed on shutdown. Te
 
 ### Build Steps
 
+The Git submodules are located at `deps/Detours`, `deps/JScriptCC`, and `deps/swc-es5-c-api`. Initialize them from the repository root before building:
+
 ```bash
 git submodule update --init --recursive
 

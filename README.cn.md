@@ -40,6 +40,8 @@ API 钩子在进程初始化后安装，并在程序退出时移除。临时 URL
 
 ### 构建步骤
 
+三个 Git 子模块分别位于 `deps/Detours`、`deps/JScriptCC` 和 `deps/swc-es5-c-api`。构建前，请在仓库根目录初始化：
+
 ```bash
 git submodule update --init --recursive
 

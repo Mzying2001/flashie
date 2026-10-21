@@ -32,11 +32,11 @@ Output binary: `<build-directory>/<Config>/FlashIE.exe`. Post-build steps automa
 
 ### Source Files
 
-Application sources and headers, plus three submodule dependencies:
+Application sources and headers, plus three submodule dependencies under `deps/`:
 
-- **`Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, file, host identity, WLDP, TypeLib).
-- **`JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
-- **`swc-es5-c-api/`** — [swc-es5-c-api](https://github.com/Mzying2001/swc-es5-c-api.git) submodule. A Rust static library exposing a C ABI for transpiling classic JavaScript to ES5. CMake builds its architecture-matched Win7 MSVC target through Cargo and links it as `swc_es5`. The `ParseScriptText` hook invokes it after JScriptCC for both classic JScript and JScript9 engines; expression-mode calls bypass SWC because its input contract is a complete script.
+- **`deps/Detours/`** — [Microsoft Detours](https://github.com/microsoft/Detours.git) submodule. A library for intercepting Win32 API function calls. Built as a static library (`detours`) in CMake and linked into flashie. Used for all API-level inline hooks (COM, registry, file, host identity, WLDP, TypeLib).
+- **`deps/JScriptCC/`** — [JScriptCC](https://github.com/Mzying2001/JScriptCC.git) submodule. A C++ library for JScript Conditional Compilation preprocessing (`@cc_on`, `@if`, `@set`, `@end`). Built as a static library (`jscriptcc`) and linked into flashie. Used by the `ParseScriptText` hook to expand CC blocks before script execution.
+- **`deps/swc-es5-c-api/`** — [swc-es5-c-api](https://github.com/Mzying2001/swc-es5-c-api.git) submodule. A Rust static library exposing a C ABI for transpiling classic JavaScript to ES5. CMake builds its architecture-matched Win7 MSVC target through Cargo and links it as `swc_es5`. The `ParseScriptText` hook invokes it after JScriptCC for both classic JScript and JScript9 engines; expression-mode calls bypass SWC because its input contract is a complete script.
 - **`source/flash_loader.h/.cpp`** — Process-wide `FlashLoader` namespace. The core hooking engine is exposed through `Activate`, `InstallHooks`, and `Deactivate`, and is organized into 8 sections:
   - **Section 1-2**: Includes, constants, function pointer typedefs for all hooked APIs.
   - **Section 3**: Process-wide state — one `LoaderState` owns the lifecycle phase, activation STA, module/factory/COM cookie, API Detours pointers, fake keys, Flash hooks, script hooks, windowless-rendering fallback mode, and activation timers. Independent SRW locks protect lifecycle transitions and the factory, fake-key, Flash-hook, and script-hook domains.
