@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(flashie VERSION 1.0.3 LANGUAGES CXX RC)
+project(flashie VERSION 1.0.4 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,14 +30,14 @@ endif()
 # Use /MT (static CRT) for Release builds
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_subdirectory(JScriptCC)
+add_subdirectory(deps/JScriptCC)
 # Force JScriptCC to use the same CRT as flashie (its cmake_minimum_required resets CMP0091)
 set_target_properties(jscriptcc PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 target_compile_options(jscriptcc PRIVATE /utf-8)
 
 # Build the Rust SWC wrapper for the current MSVC architecture and expose its
 # C ABI as a normal CMake static-library target.
-set(SWC_ES5_SOURCE_DIR "${CMAKE_SOURCE_DIR}/swc-es5-c-api")
+set(SWC_ES5_SOURCE_DIR "${CMAKE_SOURCE_DIR}/deps/swc-es5-c-api")
 if(NOT EXISTS "${SWC_ES5_SOURCE_DIR}/Cargo.toml")
     message(FATAL_ERROR
         "swc-es5-c-api is not initialized. Run: git submodule update --init --recursive")
@@ -95,18 +95,18 @@ target_link_libraries(swc_es5 INTERFACE
 )
 # Microsoft Detours — function hooking library (no CMake support, build manually)
 add_library(detours STATIC
-    Detours/src/detours.cpp
-    Detours/src/disasm.cpp
-    Detours/src/modules.cpp
-    Detours/src/image.cpp
-    Detours/src/creatwth.cpp
-    Detours/src/disolx86.cpp
-    Detours/src/disolx64.cpp
-    Detours/src/disolia64.cpp
-    Detours/src/disolarm.cpp
-    Detours/src/disolarm64.cpp
+    deps/Detours/src/detours.cpp
+    deps/Detours/src/disasm.cpp
+    deps/Detours/src/modules.cpp
+    deps/Detours/src/image.cpp
+    deps/Detours/src/creatwth.cpp
+    deps/Detours/src/disolx86.cpp
+    deps/Detours/src/disolx64.cpp
+    deps/Detours/src/disolia64.cpp
+    deps/Detours/src/disolarm.cpp
+    deps/Detours/src/disolarm64.cpp
 )
-target_include_directories(detours PUBLIC Detours/src)
+target_include_directories(detours PUBLIC deps/Detours/src)
 target_compile_options(detours PRIVATE /W0)
 set_target_properties(detours PROPERTIES MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 
@@ -123,6 +123,8 @@ configure_file(
 
 add_executable(flashie WIN32
     source/main.cpp
+    source/window_theme.cpp
+    source/window_theme.h
     source/browser.cpp
     source/swf_mime_filter.cpp
     source/flash.cpp
