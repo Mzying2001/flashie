@@ -2,12 +2,12 @@
 
 **English** | [中文](README.cn.md)
 
-A standalone Windows application that runs Adobe Flash content without requiring Flash to be installed on the system. FlashIE embeds an Internet Explorer WebBrowser control and loads a bundled Flash.ocx through API hooking — no registry modifications, completely portable.
+A standalone Windows application for running Adobe Flash content without a system-wide Flash installation. FlashIE embeds Internet Explorer's WebBrowser control and loads a bundled `Flash.ocx` through process-local hooks.
 
 ## Features
 
-- **No Installation Required** — Bundles Flash.ocx locally; no `regsvr32`, no system-wide Flash installation needed
-- **Zero Registry Pollution** — All API hooks are process-scoped and removed on shutdown; no registry or system-wide COM registration changes are made
+- **Portable** — Bundles `Flash.ocx`; no `regsvr32` or system-wide Flash installation required
+- **Process-Local** — Hooks are removed on shutdown; no registry writes or system-wide COM registration
 - **Auto-Activation** — Automatically activates Flash content without user clicks, including Flash embedded in iframes
 - **Windows 11 Rendering Compatibility** — Falls back from the broken SurfacePresenter path so windowless Flash draws, scrolls, and receives input at its actual page position
 - **Direct SWF Navigation** — Opens top-level HTTP(S) `.swf` URLs and local `.swf` files from DOS, UNC, or `file:///` paths directly in the browser
@@ -15,19 +15,15 @@ A standalone Windows application that runs Adobe Flash content without requiring
 
 ## How It Works
 
-FlashIE uses inline function hooking (detours) to intercept Windows API calls at the process level:
+FlashIE uses process-local API and vtable hooks to:
 
-1. **COM Hooks** — Intercept `CoGetClassObject`, `CoCreateInstance`, etc. to redirect Flash CLSID requests to the bundled Flash.ocx
-2. **Registry Hooks** — Fake Flash registry entries (CLSID, InprocServer32, TypeLib, ProgID, MIME types) entirely in memory — nothing is written to the actual registry
-3. **Security Hooks** — Approve only the Flash CLSID and bundled Flash.ocx image through `WldpIsClassInApprovedList` and `WldpQueryDynamicCodeTrust`
-4. **Activation Hooks** — Hook `IOleObject::SetClientSite` and `IQuickActivate::QuickActivate` vtables to force Flash in-place activation via a coalesced timer
-5. **Windowless Rendering Hooks** — On affected systems, hide broken SurfacePresenter interfaces from Flash and normalize `IViewObject::Draw` to local control coordinates
-6. **Script Hook** — Hooks `IActiveScriptParse::ParseScriptText` and preprocesses JavaScript code through `JScriptCC` and `swc-es5-c-api` in sequence
-7. **Direct SWF URLMon Handling** — Uses temporary, process-local URLMon handlers to display top-level HTTP(S) and local SWF navigations as full-window Flash content without changing the original navigation URL
+1. Redirect Flash COM requests to the bundled control and provide its expected registry values in memory.
+2. Permit the bundled Flash CLSID and image through scoped security hooks.
+3. Activate Flash automatically and apply a windowless-rendering fallback on affected systems.
+4. Preprocess JScript with `JScriptCC` and transpile it to ES5 with `swc-es5-c-api`.
+5. Use temporary URLMon handlers to display direct top-level SWF navigations without changing their URLs.
 
-The SWC integration performs syntax transpilation only; it does not provide runtime polyfills such as `Promise` or `Symbol.iterator`, and it does not support JavaScript modules.
-
-API hooks are installed after process initialization and removed on shutdown. Temporary URLMon handlers are removed as soon as their one navigation is claimed or abandoned, with shutdown cleanup as a final safeguard. **No persistent changes are made to the registry.**
+`swc-es5-c-api` transpiles syntax only. It does not provide runtime polyfills such as `Promise` or `Symbol.iterator`, and does not support JavaScript modules. Hooks and temporary URLMon handlers are cleaned up during shutdown.
 
 ## Build
 
@@ -39,8 +35,6 @@ API hooks are installed after process initialization and removed on shutdown. Te
 - rustup (the pinned Rust nightly and `rust-src` component are selected by the `swc-es5-c-api` submodule)
 
 ### Build Steps
-
-The Git submodules are located at `deps/Detours`, `deps/JScriptCC`, and `deps/swc-es5-c-api`. Initialize them from the repository root before building:
 
 ```bash
 git submodule update --init --recursive
@@ -62,16 +56,14 @@ cmake -S . -B build-win7-x64 -A x64 -DFLASHIE_WINDOWS_TARGET=WIN7
 cmake --build build-win7-x64 --config Release
 ```
 
-The FlashIE build invokes Cargo automatically, builds `swc-es5-c-api` for the matching Win7-baseline MSVC target, and links its C static API into `FlashIE.exe`. The first build may download the pinned Rust toolchain and locked Cargo dependencies.
+The build invokes Cargo to compile `swc-es5-c-api` for the matching Win7-baseline MSVC target and links it into `FlashIE.exe`. The first build may download the pinned Rust toolchain and dependencies.
 
-`FLASHIE_WINDOWS_TARGET` accepts `WIN7` and `WIN8` (default). `WIN7` packages the control compatible with Windows 7 and earlier; `WIN8` packages the control for Windows 8 and later. The Win7 control automatically uses the legacy windowless-rendering fallback when run on newer Windows, while the default control uses it on Windows 11. The build also sets the corresponding Windows API and PE subsystem target, then copies the selected control to the output directory as `Flash.ocx`.
+`FLASHIE_WINDOWS_TARGET` accepts `WIN7` or `WIN8` (default). It selects the matching OCX and Windows API/PE subsystem target; the build copies the OCX beside `FlashIE.exe` as `Flash.ocx`. The Win7 OCX uses the legacy windowless-rendering fallback on newer Windows; the default OCX uses it on Windows 11.
 
 ## Usage
 
-1. Build or download `FlashIE.exe`
-2. Ensure `Flash.ocx` is alongside the executable
-3. Run `FlashIE.exe`
-4. Enter a URL or local file path containing Flash content in the address bar
+1. Build or download `FlashIE.exe` with its matching `Flash.ocx` alongside it
+2. Run `FlashIE.exe` and enter a URL or local file path containing Flash content
 
 To load an address at startup, pass the URL or local file path as the first argument:
 
@@ -82,7 +74,7 @@ FlashIE.exe "C:\Games\Flash\movie.swf"
 FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 ```
 
-Direct local navigation accepts existing `.swf` files specified as absolute DOS paths, UNC paths, or `file:///` URLs. For direct HTTP(S) SWF navigation, the initially requested URL path must end in `.swf` and the server's final response must return `application/x-shockwave-flash`; HTTP redirects remain supported, while responses advertised as unrelated download MIME types retain IE's native download behavior. Direct conversion applies only to the top-level navigation and does not override how web pages configure their embedded Flash objects.
+Direct local navigation accepts existing `.swf` files specified by absolute DOS paths, UNC paths, or `file:///` URLs. For HTTP(S), the requested path must end in `.swf` and the final response must use the `application/x-shockwave-flash` MIME type. Redirects are supported; other download MIME types retain IE's native behavior. Conversion applies only to top-level navigation and does not change how pages configure embedded Flash objects.
 
 ## License
 

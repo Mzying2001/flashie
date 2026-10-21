@@ -2,12 +2,12 @@
 
 [English](README.md) | **中文**
 
-一个独立运行的 Windows 应用程序，无需在系统中安装 Flash 即可运行 Adobe Flash 内容。FlashIE 内嵌 Internet Explorer WebBrowser 控件，通过 API 钩子加载本地附带的 Flash.ocx——不修改注册表，完全绿色便携。
+一个独立运行的 Windows 应用程序，无需系统级安装 Flash 即可运行 Adobe Flash 内容。FlashIE 内嵌 Internet Explorer 的 WebBrowser 控件，通过进程内钩子加载随程序附带的 `Flash.ocx`。
 
 ## 特性
 
-- **无需安装** — 本地附带 Flash.ocx，无需 `regsvr32`，无需系统级 Flash 安装
-- **零注册表污染** — 所有 API 钩子仅作用于当前进程，程序退出时自动移除；不修改注册表，也不进行系统级 COM 注册
+- **便携运行** — 随程序附带 `Flash.ocx`，无需 `regsvr32` 或系统级 Flash 安装
+- **进程内运行** — 钩子仅作用于当前进程，并在退出时移除；不写入注册表或进行系统级 COM 注册
 - **自动激活** — 自动激活 Flash 内容，无需用户点击，包括 iframe 中嵌入的 Flash
 - **Windows 11 渲染兼容** — 避开有问题的 SurfacePresenter 路径，使无窗口 Flash 在页面实际位置绘制、滚动并接收输入
 - **直接导航到 SWF** — 在浏览器中直接打开顶层 HTTP(S) `.swf` URL 和通过 DOS、UNC 或 `file:///` 路径指定的本地 `.swf` 文件
@@ -15,19 +15,15 @@
 
 ## 工作原理
 
-FlashIE 使用内联函数钩子（Detour）在进程级别拦截 Windows API 调用：
+FlashIE 使用进程内 API 和虚表钩子来：
 
-1. **COM 钩子** — 拦截 `CoGetClassObject`、`CoCreateInstance` 等函数，将 Flash CLSID 请求重定向到本地附带的 Flash.ocx
-2. **注册表钩子** — 在内存中伪造 Flash 注册表项（CLSID、InprocServer32、TypeLib、ProgID、MIME 类型）——**不会向实际注册表写入任何内容**
-3. **安全钩子** — 通过 `WldpIsClassInApprovedList` 和 `WldpQueryDynamicCodeTrust`，仅批准 Flash CLSID 和程序附带的 Flash.ocx 映像
-4. **激活钩子** — 钩子 `IOleObject::SetClientSite` 和 `IQuickActivate::QuickActivate` 虚表，通过合并定时器强制 Flash 就地激活
-5. **无窗口渲染钩子** — 在受影响的系统上向 Flash 隐藏有问题的 SurfacePresenter 接口，并将 `IViewObject::Draw` 规范化为控件局部坐标
-6. **脚本钩子** — 钩取 `IActiveScriptParse::ParseScriptText`，并依次使用 `JScriptCC` 和 `swc-es5-c-api` 预处理 JavaScript 代码
-7. **直接 SWF URLMon 处理** — 使用临时的进程内 URLMon 处理器，将顶层 HTTP(S) 和本地 SWF 导航显示为全窗口 Flash 内容，同时保持原始导航 URL 不变
+1. 将 Flash COM 请求转到本地控件，并在内存中提供所需的注册表项。
+2. 通过限定范围的安全钩子放行 Flash CLSID 和随程序附带的控件映像。
+3. 自动激活 Flash，并在受影响的系统上启用无窗口渲染回退。
+4. 使用 `JScriptCC` 预处理 JScript，再通过 `swc-es5-c-api` 转译为 ES5。
+5. 通过临时 URLMon 处理器显示顶层 SWF 导航，同时保持原始 URL 不变。
 
-SWC 集成只负责语法转译，不提供 `Promise`、`Symbol.iterator` 等运行时 polyfill，也不支持 JavaScript 模块。
-
-API 钩子在进程初始化后安装，并在程序退出时移除。临时 URLMon 处理器会在一次导航被接管或放弃后立即移除，程序退出时还会执行最终清理。**不会对注册表产生任何持久性更改。**
+`swc-es5-c-api` 只转译语法，不提供 `Promise`、`Symbol.iterator` 等运行时 polyfill，也不支持 JavaScript 模块。程序退出时会清理钩子和临时 URLMon 处理器。
 
 ## 构建
 
@@ -39,8 +35,6 @@ API 钩子在进程初始化后安装，并在程序退出时移除。临时 URL
 - rustup（`swc-es5-c-api` 子模块会选择固定的 Rust nightly 工具链及 `rust-src` 组件）
 
 ### 构建步骤
-
-三个 Git 子模块分别位于 `deps/Detours`、`deps/JScriptCC` 和 `deps/swc-es5-c-api`。构建前，请在仓库根目录初始化：
 
 ```bash
 git submodule update --init --recursive
@@ -62,16 +56,14 @@ cmake -S . -B build-win7-x64 -A x64 -DFLASHIE_WINDOWS_TARGET=WIN7
 cmake --build build-win7-x64 --config Release
 ```
 
-FlashIE 构建过程会自动调用 Cargo，针对匹配的 Win7 基线 MSVC 目标构建 `swc-es5-c-api`，并将其 C 风格静态 API 链接到 `FlashIE.exe`。首次构建可能会下载固定版本的 Rust 工具链和 `Cargo.lock` 中锁定的依赖。
+构建过程会自动调用 Cargo，为匹配的 Win7 基线 MSVC 目标编译 `swc-es5-c-api` 并链接到 `FlashIE.exe`。首次构建可能会下载固定版本的 Rust 工具链和依赖。
 
-`FLASHIE_WINDOWS_TARGET` 支持 `WIN7` 和 `WIN8`（默认值）。`WIN7` 会打包兼容 Windows 7 及更早系统的控件，`WIN8` 会打包适用于 Windows 8 及更新系统的控件。Win7 控件在新版 Windows 上运行时会自动使用旧式无窗口渲染回退，默认控件则在 Windows 11 上使用该回退。构建过程还会设置相应的 Windows API 和 PE 子系统目标，并将选中的控件以 `Flash.ocx` 文件名复制到可执行文件同目录下。
+`FLASHIE_WINDOWS_TARGET` 支持 `WIN7` 和 `WIN8`（默认值），用于选择对应控件及 Windows API/PE 子系统目标。构建会将控件以 `Flash.ocx` 文件名复制到 `FlashIE.exe` 同目录。Win7 控件在较新 Windows 上使用旧式无窗口渲染回退；默认控件则在 Windows 11 上使用该回退。
 
 ## 使用方法
 
-1. 构建或下载 `FlashIE.exe`
-2. 确保 `Flash.ocx` 与可执行文件位于同一目录
-3. 运行 `FlashIE.exe`
-4. 在地址栏中输入包含 Flash 内容的 URL 或本地文件路径
+1. 构建或下载 `FlashIE.exe`，并将对应的 `Flash.ocx` 放在同一目录
+2. 运行程序，在地址栏输入包含 Flash 内容的 URL 或本地文件路径
 
 若要在启动时直接加载地址，请将 URL 或本地文件路径作为第一个参数传入：
 
@@ -82,7 +74,7 @@ FlashIE.exe "C:\Games\Flash\movie.swf"
 FlashIE.exe "file:///C:/Games/Flash/movie.swf"
 ```
 
-直接本地导航支持以绝对 DOS 路径、UNC 路径或 `file:///` URL 指定的现有 `.swf` 文件。对于直接 HTTP(S) SWF 导航，初始请求的 URL 路径必须以 `.swf` 结尾，并且服务器最终响应的 MIME 类型必须为 `application/x-shockwave-flash`；支持 HTTP 重定向，而以其他下载 MIME 类型返回的响应仍采用 IE 原生下载行为。直接转换仅应用于顶层导航，不会覆盖网页对其嵌入 Flash 对象的配置。
+本地导航支持通过绝对 DOS 路径、UNC 路径或 `file:///` URL 指定的现有 `.swf` 文件。HTTP(S) 导航要求请求路径以 `.swf` 结尾，且最终响应的 MIME 类型为 `application/x-shockwave-flash`。支持重定向；其他下载 MIME 类型仍采用 IE 原生行为。转换仅适用于顶层导航，不会改变网页对嵌入式 Flash 对象的配置。
 
 ## 许可证
 
