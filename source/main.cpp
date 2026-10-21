@@ -8,6 +8,7 @@
 #include "flash_loader.h"
 #include "browser.h"
 #include "resource.h"
+#include "window_theme.h"
 
 static constexpr UINT BASE_DPI           = 96;
 static constexpr int  TOOLBAR_HEIGHT_DIP = 32;
@@ -241,6 +242,11 @@ static void LayoutControls(int cx, int cy)
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    LRESULT themeResult = 0;
+
+    if (WindowTheme::HandleMessage(hwnd, msg, wParam, lParam, themeResult))
+        return themeResult;
+
     switch (msg) {
     case WM_CREATE: {
         HINSTANCE hInst = reinterpret_cast<LPCREATESTRUCT>(lParam)->hInstance;
@@ -257,6 +263,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         UpdateControlFont();
         OnLoadingStateChange(false, nullptr);
+
+        WindowTheme::Controls themeControls = {
+            hwnd, g_hwndAddress, g_hwndStatus,
+            {g_hwndBack, g_hwndForward, g_hwndRefreshStop, g_hwndGo}
+        };
+        WindowTheme::Attach(themeControls, g_dpi);
 
         // Install hooks BEFORE browser creation so COM/registry/security
         // hooks are in place when mshtml.dll initializes.
@@ -294,6 +306,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DPICHANGED: {
         UINT newDpi = HIWORD(wParam);
         g_dpi = newDpi != 0 ? newDpi : BASE_DPI;
+
+        WindowTheme::SetDpi(g_dpi);
         UpdateControlFont();
 
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
@@ -392,6 +406,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
+    WindowTheme::Initialize();
 
     // Register Flash.ocx class factory into this process's COM table.
     // Must be after OleInitialize (COM needs to be initialized).
@@ -451,6 +466,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         DeleteObject(g_controlFont);
         g_controlFont = nullptr;
     }
+
+    WindowTheme::Shutdown();
 
     // Deactivate Flash BEFORE OleUninitialize
     FlashLoader::Deactivate();

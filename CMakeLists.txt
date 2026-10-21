@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(flashie VERSION 1.0.3 LANGUAGES CXX RC)
+project(flashie VERSION 1.0.4 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -123,6 +123,8 @@ configure_file(
 
 add_executable(flashie WIN32
     source/main.cpp
+    source/window_theme.cpp
+    source/window_theme.h
     source/browser.cpp
     source/swf_mime_filter.cpp
     source/flash.cpp
