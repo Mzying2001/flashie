@@ -22,13 +22,13 @@ static BrowserHost* g_pBrowser        = nullptr;
 static HWND         g_hwndMain        = nullptr;
 static HWND         g_hwndBack        = nullptr;
 static HWND         g_hwndForward     = nullptr;
-static HWND         g_hwndRefresh     = nullptr;
-static HWND         g_hwndStop        = nullptr;
+static HWND         g_hwndRefreshStop = nullptr;
 static HWND         g_hwndAddress     = nullptr;
 static HWND         g_hwndGo          = nullptr;
 static HWND         g_hwndStatus      = nullptr;
 static HFONT        g_controlFont     = nullptr;
 static bool         g_isClosing       = false;
+static bool         g_isLoading       = false;
 static UINT         g_dpi             = BASE_DPI;
 static std::wstring g_initialAddress  = L"https://www.bing.com/";
 
@@ -131,8 +131,7 @@ static void UpdateControlFont()
     const HWND controls[] = {
         g_hwndBack,
         g_hwndForward,
-        g_hwndRefresh,
-        g_hwndStop,
+        g_hwndRefreshStop,
         g_hwndAddress,
         g_hwndGo,
         g_hwndStatus,
@@ -194,14 +193,10 @@ static void OnStatusTextChange(const wchar_t* text, void*)
 
 static void OnLoadingStateChange(bool isLoading, void*)
 {
-    if (g_hwndRefresh == nullptr || g_hwndStop == nullptr)
-        return;
-    if (isLoading) {
-        ShowWindow(g_hwndStop, SW_SHOW);
-        ShowWindow(g_hwndRefresh, SW_HIDE);
-    } else {
-        ShowWindow(g_hwndRefresh, SW_SHOW);
-        ShowWindow(g_hwndStop, SW_HIDE);
+    g_isLoading = isLoading;
+
+    if (g_hwndRefreshStop != nullptr) {
+        SetWindowTextW(g_hwndRefreshStop, isLoading ? L"Stop" : L"Refresh");
     }
 }
 
@@ -226,8 +221,7 @@ static void LayoutControls(int cx, int cy)
 
     MoveWindow(g_hwndBack,    x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
     MoveWindow(g_hwndForward, x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
-    MoveWindow(g_hwndRefresh, x, y, buttonWidth, buttonHeight, TRUE);
-    MoveWindow(g_hwndStop,    x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
+    MoveWindow(g_hwndRefreshStop, x, y, buttonWidth, buttonHeight, TRUE); x += buttonWidth + margin;
 
     int goX = cx - margin - buttonWidth;
     int addrWidth = goX - margin - x;
@@ -254,13 +248,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RECT rc;
         GetClientRect(hwnd, &rc);
 
-        g_hwndBack    = CreateWindowW(L"BUTTON", L"Back",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BACK),    hInst, nullptr);
-        g_hwndForward = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FORWARD), hInst, nullptr);
-        g_hwndRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH), hInst, nullptr);
-        g_hwndStop    = CreateWindowW(L"BUTTON", L"Stop",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STOP),    hInst, nullptr);
-        g_hwndGo      = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GO),      hInst, nullptr);
-        g_hwndStatus  = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), hInst, nullptr);
-        g_hwndAddress = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
+        g_hwndBack        = CreateWindowW(L"BUTTON", L"Back",    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_BACK),    hInst, nullptr);
+        g_hwndForward     = CreateWindowW(L"BUTTON", L"Forward", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FORWARD), hInst, nullptr);
+        g_hwndRefreshStop = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH), hInst, nullptr);
+        g_hwndGo          = CreateWindowW(L"BUTTON", L"Go",      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GO),      hInst, nullptr);
+        g_hwndStatus      = CreateWindowW(STATUSCLASSNAMEW, L"Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), hInst, nullptr);
+        g_hwndAddress     = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_ADDRESS), hInst, nullptr);
 
         UpdateControlFont();
         OnLoadingStateChange(false, nullptr);
@@ -278,6 +271,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_pBrowser = new BrowserHost();
         RECT rcBrowser = {0, ScaleForDpi(TOOLBAR_HEIGHT_DIP), rc.right, rc.bottom};
+
         if (g_pBrowser->Initialize(hwnd, rcBrowser)) {
             g_pBrowser->SetNavigateCompleteCallback(OnNavigateComplete, nullptr);
             g_pBrowser->SetTitleChangeCallback(OnTitleChange, nullptr);
@@ -329,11 +323,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
-        case IDC_BACK:    if (g_pBrowser) g_pBrowser->GoBack();    break;
-        case IDC_FORWARD: if (g_pBrowser) g_pBrowser->GoForward(); break;
-        case IDC_REFRESH: if (g_pBrowser) g_pBrowser->Refresh();   break;
-        case IDC_STOP:    if (g_pBrowser) g_pBrowser->Stop();      break;
-        case IDC_GO:      DoNavigate(); break;
+        case IDC_BACK:
+            if (g_pBrowser)
+                g_pBrowser->GoBack();
+            break;
+
+        case IDC_FORWARD:
+            if (g_pBrowser)
+                g_pBrowser->GoForward();
+            break;
+
+        case IDC_REFRESH:
+            if (g_pBrowser) {
+                if (g_isLoading)
+                    g_pBrowser->Stop();
+                else
+                    g_pBrowser->Refresh();
+            }
+            break;
+
+        case IDC_GO:
+            DoNavigate();
+            break;
         }
         return 0;
     }
